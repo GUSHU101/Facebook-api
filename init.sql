@@ -1,5 +1,8 @@
--- CAPI SaaS Pro - PostgreSQL initialization script
--- Run this file once before starting the API and worker.
+-- CAPI SaaS Pro - unified PostgreSQL schema
+-- Safe for both first install and existing database upgrades.
+-- Re-run this file after pulling new code; it does not delete business data.
+
+BEGIN;
 
 CREATE TABLE IF NOT EXISTS shops (
     id SERIAL PRIMARY KEY,
@@ -41,6 +44,49 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     status VARCHAR(30) DEFAULT 'FAILED_PERMANENT'
 );
 
+-- Existing database reconciliation. These statements are intentionally
+-- idempotent so this one file can replace incremental migration files.
+DROP TABLE IF EXISTS schema_migrations;
+
+ALTER TABLE shops
+    ADD COLUMN IF NOT EXISTS app_secret TEXT,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active',
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+ALTER TABLE shops
+    ALTER COLUMN app_secret TYPE TEXT,
+    ALTER COLUMN status SET DEFAULT 'active';
+
+ALTER TABLE pixels
+    ADD COLUMN IF NOT EXISTS platform VARCHAR(50) DEFAULT 'facebook',
+    ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+UPDATE pixels
+SET platform = 'facebook'
+WHERE platform IS NULL OR platform = '';
+
+ALTER TABLE pixels
+    ALTER COLUMN platform SET DEFAULT 'facebook';
+
+ALTER TABLE event_store
+    ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(30) DEFAULT 'PENDING',
+    ADD COLUMN IF NOT EXISTS emq_estimate NUMERIC(3,1),
+    ADD COLUMN IF NOT EXISTS request_payload JSONB,
+    ADD COLUMN IF NOT EXISTS fb_response JSONB;
+
+ALTER TABLE event_store
+    ALTER COLUMN status SET DEFAULT 'PENDING';
+
+ALTER TABLE dead_letters
+    ADD COLUMN IF NOT EXISTS failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS error_reason TEXT,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(30) DEFAULT 'FAILED_PERMANENT';
+
+ALTER TABLE dead_letters
+    ALTER COLUMN status SET DEFAULT 'FAILED_PERMANENT';
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_event_dedupe
     ON event_store(shop_id, event_name, md5(event_id));
 
@@ -64,3 +110,5 @@ CREATE INDEX IF NOT EXISTS idx_event_store_id_desc
 
 CREATE INDEX IF NOT EXISTS idx_dead_letters_status_id
     ON dead_letters(status, id DESC);
+
+COMMIT;

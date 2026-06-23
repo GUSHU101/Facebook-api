@@ -54,16 +54,12 @@ cp .env.example .env
 在宝塔 PostgreSQL 中创建数据库和用户，然后执行：
 
 ```bash
-psql "$DATABASE_URL" -f init.sql
-```
-
-如果宝塔终端没有 `psql`，也可以在 PostgreSQL 管理工具里导入 `init.sql`。
-
-已有旧版本数据库时，更新代码后执行迁移：
-
-```bash
 npm run migrate
 ```
+
+`npm run migrate` 会执行统一数据库文件 `init.sql`。它既能初始化新数据库，也能升级旧数据库，不会清空已有店铺、Pixel 或事件数据。
+
+如果宝塔终端不能运行 npm，也可以在 PostgreSQL 管理工具里导入 `init.sql`。
 
 启动前运行自检：
 

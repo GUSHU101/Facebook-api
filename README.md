@@ -79,17 +79,13 @@ TikTok event mapping:
    npm install
    ```
 
-2. Create PostgreSQL tables:
-
-   ```bash
-   psql "$DATABASE_URL" -f init.sql
-   ```
-
-   For an existing installation, run migrations after pulling new code:
+2. Create or update PostgreSQL tables:
 
    ```bash
    npm run migrate
    ```
+
+   `npm run migrate` applies the unified `init.sql` schema. It is safe to run on both a fresh database and an existing database; it does not delete business data.
 
 3. Configure `.env`:
 

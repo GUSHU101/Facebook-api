@@ -66,7 +66,7 @@ If you provide `DB_PASSWORD`, use only letters, numbers, `.`, `_`, `~`, or `-`, 
 8. Creates PostgreSQL database and user.
 9. Generates `.env` with strong secrets when not provided.
 10. Runs `npm install --omit=dev`.
-11. Runs `npm run check`, `init.sql`, `npm run migrate`, and `npm run doctor`.
+11. Runs `npm run check`, unified schema migration through `npm run migrate`, and `npm run doctor`.
 12. Starts API and worker with PM2.
 13. Optionally issues SSL certificates with acme.sh DNS-01.
 14. Writes a non-443 Nginx HTTPS config example, or enables it automatically when certificate paths are available.
