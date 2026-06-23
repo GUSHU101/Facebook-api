@@ -6,7 +6,7 @@ const axios = require('axios');
 const config = require('./config');
 const pool = require('./utils/db');
 const redis = require('./utils/redis');
-const { decryptToken } = require('./utils/crypto');
+const { decryptTokenIfPossible } = require('./utils/crypto');
 const { stripPrivateFields } = require('./events/common');
 const { eventHasSuccessfulDelivery } = require('./platforms/delivery');
 const { buildTikTokPayload } = require('./platforms/tiktok');
@@ -74,8 +74,39 @@ async function insertDeadLetter(shopId, dbEvents, reason) {
     );
 }
 
+function eventIds(dbEvents) {
+    return dbEvents.map(event => event.request_payload?.event_id).filter(Boolean);
+}
+
+function mergeDeliveriesFromEvents(dbEvents) {
+    const merged = [];
+    const seen = new Set();
+    for (const event of dbEvents) {
+        const deliveries = event.fb_response?.deliveries || [];
+        for (const delivery of deliveries) {
+            const key = JSON.stringify([
+                delivery.platform,
+                delivery.pixel_id,
+                delivery.status,
+                delivery.reason,
+                delivery.code,
+                delivery.message,
+                delivery.event_ids,
+            ]);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            merged.push(delivery);
+        }
+    }
+    return merged;
+}
+
+function finalStatusForDeliveries(deliveries) {
+    return deliveries.some(delivery => delivery.status === 'SUCCESS') ? 'PARTIAL_FAILED' : 'FAILED';
+}
+
 async function sendToFacebookPixel(pixel, dbEvents) {
-    const token = decryptToken(pixel.access_token);
+    const token = decryptTokenIfPossible(pixel.access_token);
     const finalEvents = dbEvents.map(event => stripPrivateFields({ ...event.request_payload }));
     const requestBody = { data: finalEvents };
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
@@ -103,7 +134,7 @@ async function sendToFacebookPixel(pixel, dbEvents) {
 }
 
 async function sendToTikTokPixel(pixel, dbEvents) {
-    const token = decryptToken(pixel.access_token);
+    const token = decryptTokenIfPossible(pixel.access_token);
     const url = 'https://business-api.tiktok.com/open_api/v1.3/pixel/track/';
     const results = [];
 
@@ -180,7 +211,7 @@ const worker = new Worker('capi-events', async job => {
                 status: 'SUCCESS',
                 skipped: true,
                 reason: 'SKIPPED_ALREADY_SUCCESS',
-                event_ids: alreadySuccessfulEvents.map(event => event.request_payload.event_id),
+                event_ids: eventIds(alreadySuccessfulEvents),
             });
         }
         if (pixelDbEvents.length === 0) {
@@ -192,7 +223,7 @@ const worker = new Worker('capi-events', async job => {
             deliveries.push({
                 ...result,
                 status: 'SUCCESS',
-                event_ids: pixelDbEvents.map(event => event.request_payload.event_id),
+                event_ids: eventIds(pixelDbEvents),
             });
         } catch (error) {
             const classification = pixel.platform === 'tiktok' ? classifyTikTokError(error) : classifyFacebookError(error);
@@ -203,12 +234,12 @@ const worker = new Worker('capi-events', async job => {
                 status: classification.retryable ? 'RETRYABLE_FAILED' : 'FAILED',
                 code: classification.code,
                 message: classification.message,
+                event_ids: eventIds(pixelDbEvents),
             };
 
             if (classification.retryable) {
-                if (deliveries.length > 0) {
-                    await updateEvents(idsToUpdate, 'PENDING', { deliveries });
-                }
+                deliveries.push(failure);
+                await updateEvents(idsToUpdate, 'PENDING', { deliveries });
                 throw new RetryableError(`${pixel.platform} retryable error (${classification.code || 'network'}): ${classification.message}`);
             }
 
@@ -244,8 +275,28 @@ worker.on('failed', async (job, err) => {
 
     const attemptsExhausted = job.attemptsMade >= (job.opts.attempts || 1);
     if (attemptsExhausted) {
-        console.error(`Job ${job.id} moved to DLQ: ${err.message}`);
-        await insertDeadLetter(job.data.shopId, job.data.dbEvents, err.message);
+        try {
+            console.error(`Job ${job.id} moved to DLQ: ${err.message}`);
+            const freshDbEvents = await refreshDbEvents(job.data.dbEvents || []);
+            const failedEvents = freshDbEvents.filter(event => event.status !== 'SUCCESS');
+            if (failedEvents.length === 0) return;
+
+            const deliveries = mergeDeliveriesFromEvents(failedEvents);
+            const fbResponse = {
+                deliveries,
+                error: err.message,
+                attempts_exhausted: true,
+            };
+            const status = finalStatusForDeliveries(deliveries);
+            await updateEvents(failedEvents.map(event => event.id), status, fbResponse);
+            await insertDeadLetter(
+                job.data.shopId,
+                failedEvents.map(event => ({ ...event, fb_response: fbResponse })),
+                err.message,
+            );
+        } catch (error) {
+            console.error(`Failed to persist DLQ state for job ${job.id}:`, error);
+        }
     }
 });
 
