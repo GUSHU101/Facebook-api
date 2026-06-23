@@ -204,6 +204,8 @@ const FB_PIXEL_ID = "${this.currentPixelId}";
 const TIKTOK_PIXEL_ID = "${this.currentTikTokPixelId}";
 
 const PIXEL_GLOBAL = typeof window !== 'undefined' ? window : globalThis;
+const RECENT_EVENT_TTL_MS = 5000;
+const recentEvents = {};
 
 if (typeof document !== 'undefined') {
     !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
@@ -344,6 +346,17 @@ function trackTikTokPixel(eventName, customData, eventId) {
     } catch (error) {}
 }
 
+function shouldSendRecentEvent(eventName, eventId) {
+    const now = Date.now();
+    const key = eventName + ':' + eventId;
+    Object.keys(recentEvents).forEach(item => {
+        if (recentEvents[item] <= now) delete recentEvents[item];
+    });
+    if (recentEvents[key] && recentEvents[key] > now) return false;
+    recentEvents[key] = now + RECENT_EVENT_TTL_MS;
+    return true;
+}
+
 function eventIdFrom(value) {
     const normalized = normalizeShopifyId(value);
     return normalized ? String(normalized) : undefined;
@@ -435,6 +448,8 @@ function mapTikTokProperties(customData) {
 
 async function sendDualChannelEvent(metaEventName, event, customData = {}, forcedEventId = undefined) {
     const eventId = String(eventIdFrom(forcedEventId) || event.id || metaEventName + '_' + Date.now());
+    if (!shouldSendRecentEvent(metaEventName, eventId)) return;
+
     const context = event.context || {};
     const documentInfo = context.document || {};
     const navigatorInfo = context.navigator || {};

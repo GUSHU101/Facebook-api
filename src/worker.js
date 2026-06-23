@@ -8,7 +8,7 @@ const pool = require('./utils/db');
 const redis = require('./utils/redis');
 const { decryptToken } = require('./utils/crypto');
 const { stripPrivateFields } = require('./events/common');
-const { shouldSkipPixel, successfulDeliveryKeys } = require('./platforms/delivery');
+const { eventHasSuccessfulDelivery } = require('./platforms/delivery');
 const { buildTikTokPayload } = require('./platforms/tiktok');
 
 class RetryableError extends Error {
@@ -151,7 +151,10 @@ const worker = new Worker('capi-events', async job => {
     }
 
     const freshDbEvents = await refreshDbEvents(dbEvents);
-    const idsToUpdate = freshDbEvents.map(event => event.id);
+    const sendableDbEvents = freshDbEvents.filter(event => event.status !== 'SUCCESS');
+    if (sendableDbEvents.length === 0) return;
+
+    const idsToUpdate = sendableDbEvents.map(event => event.id);
     const { rows: pixels } = await pool.query(
         'SELECT id, platform, name, pixel_id, access_token, test_event_code FROM pixels WHERE shop_id = $1 ORDER BY id ASC',
         [shopId],
@@ -166,22 +169,31 @@ const worker = new Worker('capi-events', async job => {
 
     const deliveries = [];
     const permanentFailures = [];
-    const successfulKeys = successfulDeliveryKeys(freshDbEvents);
-
     for (const pixel of pixels) {
-        if (shouldSkipPixel(pixel, successfulKeys)) {
+        const alreadySuccessfulEvents = sendableDbEvents.filter(event => eventHasSuccessfulDelivery(event, pixel));
+        const pixelDbEvents = sendableDbEvents.filter(event => !eventHasSuccessfulDelivery(event, pixel));
+        if (alreadySuccessfulEvents.length > 0) {
             deliveries.push({
                 platform: pixel.platform,
                 pixel_id: pixel.pixel_id,
                 name: pixel.name,
-                status: 'SKIPPED_ALREADY_SUCCESS',
+                status: 'SUCCESS',
+                skipped: true,
+                reason: 'SKIPPED_ALREADY_SUCCESS',
+                event_ids: alreadySuccessfulEvents.map(event => event.request_payload.event_id),
             });
+        }
+        if (pixelDbEvents.length === 0) {
             continue;
         }
 
         try {
-            const result = await sendToPlatform(pixel, freshDbEvents);
-            deliveries.push({ ...result, status: 'SUCCESS' });
+            const result = await sendToPlatform(pixel, pixelDbEvents);
+            deliveries.push({
+                ...result,
+                status: 'SUCCESS',
+                event_ids: pixelDbEvents.map(event => event.request_payload.event_id),
+            });
         } catch (error) {
             const classification = pixel.platform === 'tiktok' ? classifyTikTokError(error) : classifyFacebookError(error);
             const failure = {
@@ -215,7 +227,7 @@ const worker = new Worker('capi-events', async job => {
     await updateEvents(idsToUpdate, status, fbResponse);
     await insertDeadLetter(
         shopId,
-        freshDbEvents.map(event => ({ ...event, fb_response: fbResponse })),
+        sendableDbEvents.map(event => ({ ...event, fb_response: fbResponse })),
         `Permanent pixel failures: ${permanentFailures.map(item => item.pixel_id).join(', ')}`,
     );
 }, {

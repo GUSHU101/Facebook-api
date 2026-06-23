@@ -60,6 +60,8 @@ const adminLimiter = rateLimit({
 
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const DEDUPE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const PURCHASE_DEDUPE_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -116,6 +118,45 @@ function cleanKeyPart(value) {
 function firstScalar(value) {
     if (Array.isArray(value)) return value.find(item => item !== undefined && item !== null && item !== '');
     return value;
+}
+
+function normalizeEventId(value) {
+    const normalized = normalizeShopifyId(value);
+    return normalized ? String(normalized).trim().slice(0, 255) : undefined;
+}
+
+function dedupeAliasKeys(shopId, eventName, eventId, payload) {
+    const candidates = [['id', eventId]];
+    if (eventName === 'Purchase') {
+        candidates.push(
+            ['checkout', payload.checkout_token],
+            ['order', payload.order_id],
+            ['cart', payload.cart_token],
+        );
+    }
+
+    const keys = [];
+    const seen = new Set();
+    for (const [type, rawValue] of candidates) {
+        const value = cleanKeyPart(normalizeEventId(rawValue) || rawValue);
+        if (!value) continue;
+        const key = `dedup-alias:${shopId}:${eventName}:${type}:${value}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            keys.push(key);
+        }
+    }
+    return keys;
+}
+
+async function resolveCanonicalEventId(shopId, eventName, proposedEventId, payload, ttlSeconds) {
+    const aliasKeys = dedupeAliasKeys(shopId, eventName, proposedEventId, payload);
+    if (aliasKeys.length === 0) return proposedEventId;
+
+    const existing = (await redis.mget(aliasKeys)).find(Boolean);
+    const canonicalEventId = existing || proposedEventId;
+    await Promise.all(aliasKeys.map(key => redis.set(key, canonicalEventId, 'EX', ttlSeconds, 'NX')));
+    return canonicalEventId;
 }
 
 function attributionKeys(shopId, payload) {
@@ -383,11 +424,12 @@ function resolveEventTime(payload) {
 
 async function queueForOutbox(req, res, payload, shopId) {
     const eventName = requireString(payload.event_name, 'event_name');
-    const eventId = String(normalizeShopifyId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`).trim();
+    const proposedEventId = normalizeEventId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`;
     const attribution = await loadAttributionSnapshot(shopId, payload);
     const enrichedPayload = { ...attribution, ...payload };
+    const ttlSeconds = eventName === 'Purchase' ? PURCHASE_DEDUPE_TTL_SECONDS : DEDUPE_TTL_SECONDS;
+    const eventId = await resolveCanonicalEventId(shopId, eventName, proposedEventId, enrichedPayload, ttlSeconds);
     const dedupKey = `dedup:${shopId}:${eventName}:${eventId}`;
-    const ttlSeconds = eventName === 'Purchase' ? 30 * 24 * 60 * 60 : 7 * 24 * 60 * 60;
 
     const isNew = await redis.set(dedupKey, '1', 'EX', ttlSeconds, 'NX');
     await saveAttributionSnapshot(shopId, enrichedPayload);
@@ -567,7 +609,8 @@ cron.schedule(config.batchCron, async () => {
 
                 const eventsToSend = validDbEvents.filter(event => event.status !== 'SUCCESS');
                 if (eventsToSend.length > 0) {
-                    await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend });
+                    const jobId = `send:${shop.id}:${eventsToSend.map(event => event.id).sort((left, right) => Number(left) - Number(right)).join(':')}`;
+                    await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend }, { jobId });
                 }
 
                 await redis.del(processingKey);
@@ -678,6 +721,7 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
         redis.del(`lock:watchdog:${shopId}`),
         deleteKeysByPattern(`attr:${shopId}:*`),
         deleteKeysByPattern(`dedup:${shopId}:*`),
+        deleteKeysByPattern(`dedup-alias:${shopId}:*`),
         shopDomain ? deleteKeysByPattern(`shopify:webhook:${shopDomain}:*`) : Promise.resolve(),
     ]);
 

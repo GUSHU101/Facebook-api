@@ -13,7 +13,7 @@ process.env.ADMIN_PASSWORD ||= 'password';
 
 const { stripPrivateFields } = require('../src/events/common');
 const { buildShopifyOrderPurchasePayload } = require('../src/events/shopify');
-const { shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
+const { eventHasSuccessfulDelivery, shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
 const { normalizeForHash } = require('../src/utils/crypto');
@@ -209,6 +209,44 @@ test('successful delivery keys prevent resending already successful pixels', () 
     assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META2' }, keys), false);
 });
 
+test('successful delivery keys only skip a pixel when every event already succeeded', () => {
+    const keys = successfulDeliveryKeys([
+        {
+            fb_response: {
+                deliveries: [
+                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
+                    { platform: 'tiktok', pixel_id: 'TT1', status: 'SUCCESS' },
+                ],
+            },
+        },
+        {
+            fb_response: {
+                deliveries: [
+                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
+                    { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED' },
+                ],
+            },
+        },
+    ]);
+
+    assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META1' }, keys), true);
+    assert.equal(shouldSkipPixel({ platform: 'tiktok', pixel_id: 'TT1' }, keys), false);
+});
+
+test('eventHasSuccessfulDelivery checks success per event and pixel', () => {
+    const event = {
+        fb_response: {
+            deliveries: [
+                { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
+                { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED' },
+            ],
+        },
+    };
+
+    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META1' }), true);
+    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'tiktok', pixel_id: 'TT1' }), false);
+});
+
 test('generated Shopify pixel uses unique checkout stage event IDs while preserving Purchase dedupe ID', async () => {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
     const match = html.match(/generatedCode\(\)\s*{\s*return `([\s\S]*?)`;\s*}\s*,\s*}\s*,\s*methods:/);
@@ -282,6 +320,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     };
 
     callbacks.checkout_contact_info_submitted(event);
+    callbacks.checkout_contact_info_submitted(event);
     callbacks.checkout_address_info_submitted(event);
     callbacks.checkout_shipping_info_submitted(event);
     callbacks.payment_info_submitted(event);
@@ -290,6 +329,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     await new Promise(resolve => setTimeout(resolve, 0));
 
     const ids = Object.fromEntries(bodies.map(body => [body.event_name, body.event_id]));
+    assert.equal(bodies.filter(body => body.event_name === 'CheckoutContactInfoSubmitted').length, 1);
     assert.deepEqual(ids, {
         CheckoutContactInfoSubmitted: 'checkout-token-1:CheckoutContactInfoSubmitted',
         CheckoutAddressInfoSubmitted: 'checkout-token-1:CheckoutAddressInfoSubmitted',
