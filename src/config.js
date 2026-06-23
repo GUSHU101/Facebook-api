@@ -47,4 +47,5 @@ module.exports = {
     workerRateLimitMax: readInt('WORKER_RATE_LIMIT_MAX', 100),
     workerRateLimitDurationMs: readInt('WORKER_RATE_LIMIT_DURATION_MS', 1000),
     purchaseSettleMs: readInt('PURCHASE_SETTLE_MS', 8000),
+    stalePendingMinutes: readInt('STALE_PENDING_MINUTES', 10),
 };

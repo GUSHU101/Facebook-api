@@ -65,6 +65,7 @@ TikTok event mapping:
 - `Purchase` uses a two-layer dedupe strategy: Redis absorbs obvious repeat traffic, while PostgreSQL merges browser pixel and Shopify webhook payloads with the same `event_id` before successful delivery. This lets webhook order data enrich browser events without double-sending already successful events.
 - Partial platform failures preserve delivery history. When replaying or retrying a partially failed event, pixels/platform routes already marked `SUCCESS` are skipped so only failed destinations are retried.
 - Purchase events have a short settle window (`PURCHASE_SETTLE_MS`, default 8000ms) before batching. This gives Shopify `orders/paid` webhook data a chance to merge with browser pixel data before server-side delivery.
+- Stale database events still marked `PENDING` are automatically re-queued after `STALE_PENDING_MINUTES` to recover from queue metadata loss, old-version residue, or interrupted deployments.
 - Browser tracking generates/persists fallback `_fbp`, `_fbc`, `_ttp`, and `ttclid` when official cookies are missing but URL click IDs are present, improving attribution continuity.
 - Shopify `checkout_completed` is emitted once per checkout, usually on the thank-you page; upsell flows can emit it earlier.
 - Shopify may return protected customer data as `null` when the app lacks approved protected scopes. The generated pixel tolerates missing email, phone, name and address data.

@@ -444,6 +444,39 @@ function buildQueueJobId(shopId, dbEvents) {
     return `send-${shopId}-${digest}`;
 }
 
+async function queueStalePendingEvents() {
+    const { rows } = await pool.query(
+        `SELECT e.id, e.shop_id, e.request_payload, e.status, e.fb_response
+         FROM event_store e
+         JOIN shops s ON s.id = e.shop_id
+         WHERE e.status = 'PENDING'
+           AND s.status = 'active'
+           AND e.timestamp < NOW() - ($1::int * INTERVAL '1 minute')
+         ORDER BY e.shop_id ASC, e.id ASC
+         LIMIT $2`,
+        [config.stalePendingMinutes, config.batchSize],
+    );
+    if (rows.length === 0) return 0;
+
+    const byShop = new Map();
+    for (const row of rows) {
+        const events = byShop.get(row.shop_id) || [];
+        events.push(row);
+        byShop.set(row.shop_id, events);
+    }
+
+    let queued = 0;
+    for (const [shopId, dbEvents] of byShop.entries()) {
+        await capiQueue.add(
+            'send-fb-batch',
+            { shopId, dbEvents },
+            { jobId: buildQueueJobId(shopId, dbEvents) },
+        );
+        queued += dbEvents.length;
+    }
+    return queued;
+}
+
 async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
     await pool.query(
         `INSERT INTO dead_letters (shop_id, payload, error_reason)
@@ -727,6 +760,22 @@ cron.schedule(config.watchdogCron, async () => {
         }
     } catch (error) {
         console.error('Watchdog error:', error);
+    }
+});
+
+cron.schedule(config.watchdogCron, async () => {
+    const lockKey = 'lock:stale_pending_rescue';
+    const lockToken = crypto.randomUUID();
+    try {
+        const lock = await redis.set(lockKey, lockToken, 'EX', 50, 'NX');
+        if (!lock) return;
+
+        const queued = await queueStalePendingEvents();
+        if (queued > 0) console.warn(`[Watchdog] re-queued ${queued} stale pending events`);
+    } catch (error) {
+        console.error('Stale pending rescue error:', error);
+    } finally {
+        await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
 });
 

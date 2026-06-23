@@ -86,7 +86,8 @@ async function main() {
     await check('queue config', async () => {
         if (config.workerConcurrency < 1) throw new Error('WORKER_CONCURRENCY must be positive');
         if (config.batchSize < 1) throw new Error('BATCH_SIZE must be positive');
-        return `batch=${config.batchSize}, concurrency=${config.workerConcurrency}`;
+        if (config.stalePendingMinutes < 1) throw new Error('STALE_PENDING_MINUTES must be positive');
+        return `batch=${config.batchSize}, concurrency=${config.workerConcurrency}, stale_pending=${config.stalePendingMinutes}m`;
     });
 
     await redis.quit();
