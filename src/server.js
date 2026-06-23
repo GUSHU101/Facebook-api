@@ -18,7 +18,7 @@ const pool = require('./utils/db');
 const redis = require('./utils/redis');
 const { hashUserData, encryptToken, timingSafeCompare } = require('./utils/crypto');
 const { calculateEMQ, missingMatchSignals } = require('./utils/emq');
-const { compactObject } = require('./events/common');
+const { compactObject, firstPresent } = require('./events/common');
 const { buildShopifyOrderPurchasePayload } = require('./events/shopify');
 
 const app = express();
@@ -59,11 +59,6 @@ const adminLimiter = rateLimit({
 
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-function asArray(value) {
-    if (value === undefined || value === null || value === '') return undefined;
-    return Array.isArray(value) ? value.filter(Boolean) : [value];
-}
-
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 }
@@ -78,33 +73,71 @@ function requireString(value, fieldName) {
     return normalized;
 }
 
+function firstForwardedIp(req) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim()) {
+        return forwarded.split(',')[0].trim();
+    }
+    return req.ip || req.socket?.remoteAddress;
+}
+
+function hashMany(values, type = 'default') {
+    const hashes = [];
+    const seen = new Set();
+    for (const value of values.flat()) {
+        const hash = hashUserData(value, type);
+        if (hash && !seen.has(hash)) {
+            seen.add(hash);
+            hashes.push(hash);
+        }
+    }
+    return hashes.length ? hashes : undefined;
+}
+
 function buildUserData(req, payload) {
+    const email = firstPresent(payload.email, payload.customer_email);
+    const phone = firstPresent(payload.phone, payload.customer_phone);
+    const firstName = firstPresent(payload.firstName, payload.first_name, payload.customer_first_name);
+    const lastName = firstPresent(payload.lastName, payload.last_name, payload.customer_last_name);
+    const city = firstPresent(payload.city, payload.customer_city);
+    const state = firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state);
+    const zip = firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip);
+    const country = firstPresent(payload.country, payload.country_code, payload.customer_country);
+    const externalIds = [
+        payload.external_id,
+        payload.client_id,
+        payload.checkout_token,
+        payload.cart_token,
+        payload.order_id,
+        payload.shopify_y,
+    ];
+
     const hashed = {
-        em: hashUserData(payload.email, 'email'),
-        ph: hashUserData(payload.phone, 'phone'),
-        fn: hashUserData(payload.firstName, 'name'),
-        ln: hashUserData(payload.lastName, 'name'),
-        ct: hashUserData(payload.city, 'city'),
-        st: hashUserData(payload.state, 'state'),
-        zp: hashUserData(payload.zip, 'zip'),
-        country: hashUserData(payload.country, 'country'),
-        external_id: hashUserData(payload.external_id, 'default'),
+        em: hashMany([email], 'email'),
+        ph: hashMany([phone], 'phone'),
+        fn: hashMany([firstName], 'name'),
+        ln: hashMany([lastName], 'name'),
+        ct: hashMany([city], 'city'),
+        st: hashMany([state], 'state'),
+        zp: hashMany([zip], 'zip'),
+        country: hashMany([country], 'country'),
+        external_id: hashMany(externalIds, 'default'),
     };
 
     return compactObject({
-        client_ip_address: req.ip || payload.client_ip,
-        client_user_agent: req.headers['user-agent'] || payload.user_agent,
-        fbc: payload.fbc,
-        fbp: payload.fbp,
-        em: asArray(hashed.em),
-        ph: asArray(hashed.ph),
-        fn: asArray(hashed.fn),
-        ln: asArray(hashed.ln),
-        ct: asArray(hashed.ct),
-        st: asArray(hashed.st),
-        zp: asArray(hashed.zp),
-        country: asArray(hashed.country),
-        external_id: asArray(hashed.external_id),
+        client_ip_address: firstPresent(payload.client_ip, firstForwardedIp(req)),
+        client_user_agent: firstPresent(payload.user_agent, req.headers['user-agent']),
+        fbc: firstPresent(payload.fbc, payload._fbc),
+        fbp: firstPresent(payload.fbp, payload._fbp),
+        em: hashed.em,
+        ph: hashed.ph,
+        fn: hashed.fn,
+        ln: hashed.ln,
+        ct: hashed.ct,
+        st: hashed.st,
+        zp: hashed.zp,
+        country: hashed.country,
+        external_id: hashed.external_id,
     });
 }
 
@@ -118,11 +151,18 @@ function buildPlatformData(payload) {
 }
 
 function buildCustomData(payload) {
+    const contentIds = Array.isArray(payload.content_ids)
+        ? payload.content_ids.filter(Boolean).map(String)
+        : undefined;
+    const contents = Array.isArray(payload.contents)
+        ? payload.contents.filter(Boolean)
+        : undefined;
+
     return compactObject({
         value: payload.value !== undefined && Number.isFinite(Number(payload.value)) ? Number(payload.value) : undefined,
         currency: payload.currency ? String(payload.currency).trim().toUpperCase() : undefined,
-        content_ids: Array.isArray(payload.content_ids) ? payload.content_ids.filter(Boolean) : undefined,
-        contents: Array.isArray(payload.contents) ? payload.contents.filter(Boolean) : undefined,
+        content_ids: contentIds,
+        contents,
         content_type: payload.content_type,
         content_name: payload.content_name,
         content_category: payload.content_category,
@@ -155,7 +195,7 @@ async function queueForOutbox(req, res, payload, shopId) {
         event_time: resolveEventTime(payload),
         action_source: 'website',
         event_id: eventId,
-        event_source_url: payload.source_url,
+        event_source_url: firstPresent(payload.source_url, payload.url, req.headers.referer),
         user_data: userData,
         custom_data: buildCustomData(payload),
         _emq_estimate: calculateEMQ(userData),

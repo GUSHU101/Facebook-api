@@ -56,6 +56,7 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const address = Object.keys(billingAddress).length ? billingAddress : shippingAddress;
     const contents = buildOrderContents(order);
     const sourceUrl = toAbsoluteShopUrl(shopDomain, firstPresent(order.landing_site, order.referring_site, order.order_status_url));
+    const checkoutToken = firstPresent(order.checkout_token, order.cart_token, order.token);
     const fbp = firstPresent(
         readOrderAttribute(order, ['_fbp', 'fbp', 'facebook_browser_id']),
         order.client_details?.fbp,
@@ -65,7 +66,10 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         order.client_details?.fbc,
         buildFbcFromUrl(sourceUrl, options.nowMs),
     );
-    const ttp = readOrderAttribute(order, ['_ttp', 'ttp', 'tiktok_cookie_id']);
+    const ttp = firstPresent(
+        readOrderAttribute(order, ['_ttp', 'ttp', 'tiktok_cookie_id']),
+        order.client_details?.ttp,
+    );
     const ttclid = firstPresent(
         readOrderAttribute(order, ['ttclid', 'tiktok_click_id']),
         (() => {
@@ -76,10 +80,12 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
             }
         })(),
     );
+    const shopifyY = readOrderAttribute(order, ['_shopify_y', 'shopify_y']);
+    const clientId = firstPresent(readOrderAttribute(order, ['client_id', 'shopify_client_id']), shopifyY);
 
     return {
         event_name: 'Purchase',
-        event_id: firstPresent(order.checkout_token, order.cart_token, order.token, order.id, crypto.randomUUID()).toString(),
+        event_id: firstPresent(readOrderAttribute(order, ['event_id', 'capi_event_id']), checkoutToken, order.id, crypto.randomUUID()).toString(),
         email: firstPresent(order.email, order.contact_email, customer.email),
         phone: firstPresent(order.phone, customer.phone, billingAddress.phone, shippingAddress.phone),
         firstName: firstPresent(billingAddress.first_name, shippingAddress.first_name, customer.first_name),
@@ -88,7 +94,17 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         state: address.province_code || address.province,
         zip: address.zip,
         country: address.country_code || address.country,
-        external_id: firstPresent(customer.id, customer.admin_graphql_api_id, order.customer_locale),
+        external_id: [
+            customer.id,
+            customer.admin_graphql_api_id,
+            clientId,
+            checkoutToken,
+            order.id,
+        ].filter(Boolean),
+        client_id: clientId,
+        checkout_token: checkoutToken,
+        cart_token: order.cart_token,
+        shopify_y: shopifyY,
         client_ip: firstPresent(order.browser_ip, order.client_details?.browser_ip),
         user_agent: order.client_details?.user_agent,
         fbp,

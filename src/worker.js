@@ -63,16 +63,14 @@ async function insertDeadLetter(shopId, dbEvents, reason) {
 
 async function sendToFacebookPixel(pixel, dbEvents) {
     const token = decryptToken(pixel.access_token);
-    const finalEvents = dbEvents.map(event => {
-        const payload = stripPrivateFields({ ...event.request_payload });
-        if (pixel.test_event_code) payload.test_event_code = pixel.test_event_code;
-        return payload;
-    });
+    const finalEvents = dbEvents.map(event => stripPrivateFields({ ...event.request_payload }));
+    const requestBody = { data: finalEvents };
+    if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
 
     const url = `https://graph.facebook.com/${config.fbApiVersion}/${pixel.pixel_id}/events`;
     const response = await axios.post(
         url,
-        { data: finalEvents },
+        requestBody,
         {
             timeout: config.fbRequestTimeoutMs,
             headers: {

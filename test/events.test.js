@@ -42,6 +42,7 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
         },
         note_attributes: [
             { name: '_ttp', value: 'ttp-cookie' },
+            { name: '_shopify_y', value: 'shopify-y-cookie' },
         ],
         customer: { id: 12345 },
         line_items: [
@@ -57,6 +58,10 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     assert.equal(payload.fbc, 'fb.1.1234567890.fb-click-1');
     assert.equal(payload.ttp, 'ttp-cookie');
     assert.equal(payload.ttclid, 'tt-click-1');
+    assert.equal(payload.client_id, 'shopify-y-cookie');
+    assert.equal(payload.checkout_token, 'checkout-token-1');
+    assert.equal(payload.shopify_y, 'shopify-y-cookie');
+    assert.deepEqual(payload.external_id, [12345, 'shopify-y-cookie', 'checkout-token-1', 987]);
     assert.deepEqual(payload.content_ids, ['111', '222']);
     assert.deepEqual(payload.contents, [
         { id: '111', quantity: 2, item_price: 8 },

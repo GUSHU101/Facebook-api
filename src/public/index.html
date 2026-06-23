@@ -195,7 +195,7 @@ n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
 t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
 document,'script','https://connect.facebook.net/en_US/fbevents.js');
 
-fbq('init', FB_PIXEL_ID);
+window.fbq('init', FB_PIXEL_ID);
 
 if (TIKTOK_PIXEL_ID) {
     !function (w, d, t) {
@@ -259,9 +259,10 @@ function lineItemToContent(item) {
     const variant = item.variant || item.merchandise || {};
     const product = item.product || variant.product || {};
     const quantity = Number(item.quantity || 1);
-    const price = moneyAmount(variant.price || item.finalLinePrice || item.cost?.totalAmount);
+    const totalPrice = moneyAmount(item.cost?.totalAmount || item.finalLinePrice);
+    const price = moneyAmount(variant.price || item.cost?.amountPerQuantity || (totalPrice && quantity ? totalPrice / quantity : undefined));
     return {
-        id: String(variant.id || product.id || item.id || '').replace('gid://shopify/ProductVariant/', ''),
+        id: String(variant.id || product.id || item.id || '').replace('gid://shopify/ProductVariant/', '').replace('gid://shopify/Product/', ''),
         quantity,
         item_price: price,
     };
@@ -288,13 +289,14 @@ async function getOrCreateFbp() {
 }
 
 async function getOrCreateFbc(href) {
-    const existing = await getCookieValue('_fbc');
-    if (existing) return existing;
     const fbclid = getUrlParam('fbclid', href);
-    if (!fbclid) return undefined;
-    const generated = 'fb.1.' + Date.now() + '.' + fbclid;
-    await setCookieValue('_fbc', generated);
-    return generated;
+    const existing = await getCookieValue('_fbc');
+    if (fbclid && (!existing || !existing.endsWith('.' + fbclid))) {
+        const generated = 'fb.1.' + Date.now() + '.' + fbclid;
+        await setCookieValue('_fbc', generated);
+        return generated;
+    }
+    return existing || undefined;
 }
 
 async function getOrCreateTtp() {
@@ -351,23 +353,31 @@ async function sendDualChannelEvent(metaEventName, event, customData = {}, force
     const locationInfo = documentInfo.location || {};
     const checkout = event.data?.checkout || {};
     const customer = event.data?.customer || checkout.order?.customer || {};
-    const address = checkout.billingAddress || checkout.shippingAddress || customer.defaultAddress || {};
+    const billingAddress = checkout.billingAddress || {};
+    const shippingAddress = checkout.shippingAddress || {};
+    const address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
+    const currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer;
     const fbp = await getOrCreateFbp();
-    const fbc = await getOrCreateFbc(locationInfo.href);
+    const fbc = await getOrCreateFbc(currentUrl);
     const ttp = await getOrCreateTtp();
-    const ttclid = await rememberTtclid(locationInfo.href);
+    const ttclid = await rememberTtclid(currentUrl);
+    const shopifyY = await getCookieValue('_shopify_y');
+    const shopifyS = await getCookieValue('_shopify_s');
+    const checkoutToken = checkout.token || checkout.checkoutToken;
+    const cartToken = event.data?.cart?.id || checkout.cartToken;
+    const orderId = checkout.order?.id || checkout.order?.name;
 
     const standardEvents = new Set([
         'PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase', 'Search',
     ]);
     const pixelMethod = standardEvents.has(metaEventName) ? 'track' : 'trackCustom';
-    fbq(pixelMethod, metaEventName, customData, { eventID: eventId });
+    window.fbq(pixelMethod, metaEventName, customData, { eventID: eventId });
     if (window.ttq) {
         const tiktokEvent = mapTikTokEvent(metaEventName);
         if (tiktokEvent === 'PageView') {
-            ttq.page({ event_id: eventId });
+            window.ttq.page({ event_id: eventId });
         } else {
-            ttq.track(tiktokEvent, mapTikTokProperties(customData), { event_id: eventId });
+            window.ttq.track(tiktokEvent, mapTikTokProperties(customData), { event_id: eventId });
         }
     }
 
@@ -380,12 +390,15 @@ async function sendDualChannelEvent(metaEventName, event, customData = {}, force
             event_name: metaEventName,
             event_id: eventId,
             timestamp: event.timestamp,
-            source_url: locationInfo.href,
+            source_url: currentUrl,
+            referrer: documentInfo.referrer,
             user_agent: navigatorInfo.userAgent,
             fbp,
             fbc,
             ttp,
             ttclid,
+            shopify_y: shopifyY,
+            shopify_s: shopifyS,
             email: customer.email || checkout.email,
             phone: customer.phone || checkout.phone || address.phone,
             firstName: customer.firstName || address.firstName,
@@ -394,7 +407,11 @@ async function sendDualChannelEvent(metaEventName, event, customData = {}, force
             state: address.provinceCode,
             zip: address.zip,
             country: address.countryCode,
-            external_id: event.clientId || customer.id || checkout.order?.customer?.id,
+            client_id: event.clientId || shopifyY,
+            checkout_token: checkoutToken,
+            cart_token: cartToken,
+            order_id: orderId,
+            external_id: event.clientId || customer.id || checkout.order?.customer?.id || shopifyY || checkoutToken,
             ...customData,
         })),
     }).catch(console.error);
