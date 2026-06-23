@@ -128,6 +128,98 @@ location / {
 }
 ```
 
+如果你想直接替换宝塔「网站 -> 配置文件」里的整份 Nginx 配置，可以使用下面这个完整模板。这个模板只监听 `80` 和 `8443`，不会使用 `443`：
+
+```nginx
+server
+{
+    listen 80;
+    server_name nestworks.com.au;
+
+    # 用于 HTTP-01 证书验证；如果你使用 Cloudflare / acme.sh DNS 验证，也可以保留不影响。
+    location /.well-known/acme-challenge/ {
+        root /www/wwwroot/capi-saas;
+        try_files $uri =404;
+    }
+
+    # HTTP 自动跳转到非 443 HTTPS 端口。
+    location / {
+        return 301 https://$host:8443$request_uri;
+    }
+
+    access_log  /www/wwwlogs/capi_saas_80.log;
+    error_log   /www/wwwlogs/capi_saas_80.error.log;
+}
+
+server
+{
+    listen 8443 ssl http2;
+    server_name nestworks.com.au;
+    index index.html index.htm default.htm default.html;
+
+    # 不要添加 listen 443 ssl; 也不要添加 listen 443 quic;
+    # 证书路径按宝塔实际站点证书目录调整。
+    ssl_certificate     /www/server/panel/vhost/cert/capi_saas/fullchain.pem;
+    ssl_certificate_key /www/server/panel/vhost/cert/capi_saas/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size 10m;
+
+    # 禁止访问敏感文件。
+    location ~* (\.user.ini|\.htaccess|\.htpasswd|\.env.*|\.project|\.bashrc|\.bash_profile|\.bash_logout|\.DS_Store|\.gitignore|\.gitattributes|LICENSE|README\.md|CLAUDE\.md|CHANGELOG\.md|CONTRIBUTING\.md|TODO\.md|FAQ\.md|composer\.json|composer\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.swp|\.swo|\.bak|\.old|\.tmp|\.temp|\.log|\.sql(\.gz)?|docker-compose\.yml|Dockerfile)$
+    {
+        return 404;
+    }
+
+    # 禁止访问敏感目录。
+    location ~* /(\.git|\.svn|\.bzr|\.vscode|\.idea|\.ssh|\.github|\.npm|\.yarn|\.pnpm|\.cache|node_modules|runtime|backups)/ {
+        return 404;
+    }
+
+    # 证书验证目录。
+    location /.well-known/ {
+        root /www/wwwroot/capi-saas;
+    }
+
+    # API / Admin 统一反向代理到 Node.js 内部端口。
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Port 8443;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 86400s;
+    }
+
+    access_log  /www/wwwlogs/capi_saas.log;
+    error_log   /www/wwwlogs/capi_saas.error.log;
+}
+```
+
+对应 `.env` 里的端口保持内部端口即可：
+
+```env
+PORT=3000
+TRUST_PROXY_HOPS=1
+```
+
+外部访问、Shopify Custom Pixel API 地址、Shopify webhook 地址都使用：
+
+```text
+https://nestworks.com.au:8443
+```
+
 生产环境必须使用 HTTPS，因为 Shopify Customer Events 和 Meta Pixel 都依赖安全上下文。可以使用非标准 HTTPS 端口，例如：
 
 ```text

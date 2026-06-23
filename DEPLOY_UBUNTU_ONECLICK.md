@@ -127,6 +127,83 @@ nginx -t
 systemctl reload nginx
 ```
 
+Manual Nginx config template, using `8443` for public HTTPS and never binding `443`:
+
+```nginx
+# /etc/nginx/conf.d/capi-saas.conf
+# Replace nestworks.com.au and certificate paths if your domain/project name differs.
+
+server {
+    listen 80;
+    server_name nestworks.com.au;
+
+    # Optional: keep HTTP available only for redirects or certificate checks.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host:8443$request_uri;
+    }
+}
+
+server {
+    listen 8443 ssl http2;
+    server_name nestworks.com.au;
+
+    ssl_certificate     /etc/ssl/capi/fullchain.pem;
+    ssl_certificate_key /etc/ssl/capi/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size 10m;
+
+    location ~* /(\.git|\.svn|\.hg|node_modules|runtime|backups|\.env|\.npm|\.cache)/ {
+        return 404;
+    }
+
+    location ~* (\.env.*|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|docker-compose\.yml|Dockerfile|README\.md|LICENSE|\.sql(\.gz)?|\.log|\.bak|\.old|\.tmp)$ {
+        return 404;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Port 8443;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 86400s;
+    }
+
+    access_log /var/log/nginx/capi-saas.access.log;
+    error_log  /var/log/nginx/capi-saas.error.log;
+}
+```
+
+Matching `.env` port values:
+
+```env
+PORT=3000
+TRUST_PROXY_HOPS=1
+```
+
+`PORT=3000` is only the internal Node.js port. Shopify, Meta, TikTok and the admin panel should use:
+
+```text
+https://nestworks.com.au:8443
+```
+
 Use DNS validation for SSL certificates so certificate issuance does not require port `443`.
 
 When `REDIRECT_HTTP=1`, Nginx also redirects:
