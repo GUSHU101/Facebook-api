@@ -359,6 +359,11 @@ function purchaseEventId(checkout, event) {
     );
 }
 
+function checkoutStageEventId(checkout, event, eventName) {
+    const baseId = firstNonEmpty(checkout.token, checkout.checkoutToken, event.id);
+    return baseId ? String(baseId) + ':' + eventName : undefined;
+}
+
 function checkoutLineItems(checkout) {
     return Array.isArray(checkout.lineItems) ? checkout.lineItems : [];
 }
@@ -580,7 +585,7 @@ analytics.subscribe('checkout_started', event => {
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-    }, checkout.token || event.id);
+    }, checkoutStageEventId(checkout, event, 'InitiateCheckout'));
 });
 
 analytics.subscribe('checkout_contact_info_submitted', event => {
@@ -593,7 +598,7 @@ analytics.subscribe('checkout_contact_info_submitted', event => {
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-    }, checkout.token || event.id);
+    }, checkoutStageEventId(checkout, event, 'CheckoutContactInfoSubmitted'));
 });
 
 analytics.subscribe('checkout_address_info_submitted', event => {
@@ -606,7 +611,7 @@ analytics.subscribe('checkout_address_info_submitted', event => {
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-    }, checkout.token || event.id);
+    }, checkoutStageEventId(checkout, event, 'CheckoutAddressInfoSubmitted'));
 });
 
 analytics.subscribe('checkout_shipping_info_submitted', event => {
@@ -619,7 +624,7 @@ analytics.subscribe('checkout_shipping_info_submitted', event => {
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-    }, checkout.token || event.id);
+    }, checkoutStageEventId(checkout, event, 'CheckoutShippingInfoSubmitted'));
 });
 
 analytics.subscribe('payment_info_submitted', event => {
@@ -632,7 +637,7 @@ analytics.subscribe('payment_info_submitted', event => {
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-    }, checkout.token || event.id);
+    }, checkoutStageEventId(checkout, event, 'AddPaymentInfo'));
 });
 
 analytics.subscribe('checkout_completed', event => {

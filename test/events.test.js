@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 
 process.env.DATABASE_URL ||= 'postgres://user:pass@127.0.0.1:5432/test';
 process.env.REDIS_URL ||= 'redis://127.0.0.1:6379';
@@ -204,4 +207,94 @@ test('successful delivery keys prevent resending already successful pixels', () 
     assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META1' }, keys), true);
     assert.equal(shouldSkipPixel({ platform: 'tiktok', pixel_id: 'TT1' }, keys), false);
     assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META2' }, keys), false);
+});
+
+test('generated Shopify pixel uses unique checkout stage event IDs while preserving Purchase dedupe ID', async () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
+    const match = html.match(/generatedCode\(\)\s*{\s*return `([\s\S]*?)`;\s*}\s*,\s*}\s*,\s*methods:/);
+    assert.ok(match, 'generatedCode template should exist');
+
+    const generated = match[1]
+        .replaceAll('${this.apiDomain}', 'https://nestworks.com.au:8443')
+        .replaceAll('${this.currentShop}', 'demo.myshopify.com')
+        .replaceAll('${this.currentPixelId}', '1234567890')
+        .replaceAll('${this.currentTikTokPixelId}', '');
+
+    const callbacks = {};
+    const bodies = [];
+    const cookies = new Map();
+    const sandbox = {
+        console,
+        URL,
+        Date,
+        Math,
+        globalThis: {},
+        analytics: {
+            subscribe: (name, fn) => {
+                callbacks[name] = fn;
+            },
+        },
+        browser: {
+            cookie: {
+                get: async name => cookies.get(name),
+                set: async value => {
+                    const [pair] = String(value).split(';');
+                    const index = pair.indexOf('=');
+                    cookies.set(pair.slice(0, index), decodeURIComponent(pair.slice(index + 1)));
+                },
+            },
+        },
+        fetch: async (url, options) => {
+            bodies.push(JSON.parse(options.body));
+            return { ok: true };
+        },
+    };
+
+    vm.runInNewContext(generated, sandbox);
+
+    const event = {
+        id: 'shopify-event-1',
+        timestamp: '2026-06-24T00:00:00Z',
+        clientId: 'client-1',
+        context: {
+            document: {
+                location: { href: 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1' },
+                referrer: 'https://facebook.com/',
+            },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {
+            checkout: {
+                token: 'checkout-token-1',
+                totalPrice: { amount: '46.00', currencyCode: 'USD' },
+                order: { id: 'gid://shopify/Order/987' },
+                lineItems: [
+                    {
+                        merchandise: {
+                            id: 'gid://shopify/ProductVariant/111',
+                            price: { amount: '46.00', currencyCode: 'USD' },
+                        },
+                        quantity: 1,
+                    },
+                ],
+            },
+        },
+    };
+
+    callbacks.checkout_contact_info_submitted(event);
+    callbacks.checkout_address_info_submitted(event);
+    callbacks.checkout_shipping_info_submitted(event);
+    callbacks.payment_info_submitted(event);
+    callbacks.checkout_completed(event);
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const ids = Object.fromEntries(bodies.map(body => [body.event_name, body.event_id]));
+    assert.deepEqual(ids, {
+        CheckoutContactInfoSubmitted: 'checkout-token-1:CheckoutContactInfoSubmitted',
+        CheckoutAddressInfoSubmitted: 'checkout-token-1:CheckoutAddressInfoSubmitted',
+        CheckoutShippingInfoSubmitted: 'checkout-token-1:CheckoutShippingInfoSubmitted',
+        AddPaymentInfo: 'checkout-token-1:AddPaymentInfo',
+        Purchase: 'checkout-token-1',
+    });
 });
