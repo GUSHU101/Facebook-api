@@ -444,6 +444,32 @@ function buildQueueJobId(shopId, dbEvents) {
     return `send-${shopId}-${digest}`;
 }
 
+async function restoreReplayableEvents(shopId, dbEvents) {
+    const restored = [];
+    for (const event of dbEvents) {
+        const payload = event.request_payload || event;
+        const eventName = payload.event_name;
+        const eventId = payload.event_id;
+        if (!eventName || !eventId) continue;
+
+        const emqEstimate = event.emq_estimate || payload._emq_estimate || null;
+        const { rows } = await pool.query(
+            `INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload, fb_response)
+             VALUES ($1, $2, $3, 'PENDING', $4, $5::jsonb, NULL)
+             ON CONFLICT (shop_id, event_name, md5(event_id)) DO UPDATE SET
+                 status = 'PENDING',
+                 request_payload = EXCLUDED.request_payload,
+                 emq_estimate = COALESCE(event_store.emq_estimate, EXCLUDED.emq_estimate),
+                 fb_response = NULL
+             WHERE event_store.status <> 'SUCCESS'
+             RETURNING id, request_payload, status, fb_response`,
+            [shopId, eventName, eventId, emqEstimate, JSON.stringify(payload)],
+        );
+        restored.push(...rows);
+    }
+    return restored;
+}
+
 async function queueForOutbox(req, res, payload, shopId) {
     const eventName = requireString(payload.event_name, 'event_name');
     const proposedEventId = normalizeEventId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`;
@@ -903,10 +929,18 @@ app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
 
     let replayed = 0;
     for (const row of rows) {
-        const dbEvents = JSON.parse(row.payload);
-        await capiQueue.add('send-fb-batch', { shopId: row.shop_id, dbEvents });
-        await pool.query("UPDATE dead_letters SET status = 'REPLAYED' WHERE id = $1", [row.id]);
-        replayed += 1;
+        const parsedPayload = JSON.parse(row.payload);
+        const dbEvents = Array.isArray(parsedPayload) ? parsedPayload : [parsedPayload];
+        const replayEvents = await restoreReplayableEvents(row.shop_id, dbEvents);
+        if (replayEvents.length > 0) {
+            await capiQueue.add(
+                'send-fb-batch',
+                { shopId: row.shop_id, dbEvents: replayEvents },
+                { jobId: buildQueueJobId(row.shop_id, replayEvents) },
+            );
+            await pool.query("UPDATE dead_letters SET status = 'REPLAYED' WHERE id = $1", [row.id]);
+            replayed += 1;
+        }
     }
 
     res.json({ success: true, replayed });
