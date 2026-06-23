@@ -444,6 +444,19 @@ function buildQueueJobId(shopId, dbEvents) {
     return `send-${shopId}-${digest}`;
 }
 
+async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
+    await pool.query(
+        `INSERT INTO dead_letters (shop_id, payload, error_reason)
+         VALUES ($1, $2, $3)`,
+        [shopId, JSON.stringify([{ raw_payload: rawPayload }]), reason],
+    );
+}
+
+async function completeProcessingBatch(processingKey, pendingKey, deferredEvents) {
+    const deferredPayloads = deferredEvents.map(event => JSON.stringify(event));
+    await redis.completeProcessing(processingKey, pendingKey, ...deferredPayloads);
+}
+
 async function restoreReplayableEvents(shopId, dbEvents) {
     const restored = [];
     for (const event of dbEvents) {
@@ -479,8 +492,8 @@ async function queueForOutbox(req, res, payload, shopId) {
     const eventId = await resolveCanonicalEventId(shopId, eventName, proposedEventId, enrichedPayload, ttlSeconds);
     const dedupKey = `dedup:${shopId}:${eventName}:${eventId}`;
 
-    const isNew = await redis.set(dedupKey, '1', 'EX', ttlSeconds, 'NX');
     await saveAttributionSnapshot(shopId, enrichedPayload);
+    const isNew = await redis.set(dedupKey, '1', 'EX', ttlSeconds, 'NX');
     if (!isNew && eventName !== 'Purchase') {
         return res.status(200).json({ success: true, deduplicated: true });
     }
@@ -502,7 +515,13 @@ async function queueForOutbox(req, res, payload, shopId) {
         _received_at: Date.now(),
     };
 
-    await redis.rpush(`pending:events:${shopId}`, JSON.stringify(fbEventData));
+    try {
+        await redis.rpush(`pending:events:${shopId}`, JSON.stringify(fbEventData));
+    } catch (error) {
+        if (isNew) await redis.del(dedupKey).catch(() => {});
+        throw error;
+    }
+
     return res.status(202).json({ success: true, queued: true, event_id: eventId, duplicate_candidate: !isNew });
 }
 
@@ -536,8 +555,9 @@ async function handleShopifyPurchaseWebhook(req, res) {
     const generatedHash = crypto.createHmac('sha256', appSecret).update(req.rawBody).digest('base64');
     if (!timingSafeCompare(generatedHash, hmacHeader)) return res.status(401).send('HMAC Failed');
 
+    let deliveryKey;
     if (webhookId) {
-        const deliveryKey = `shopify:webhook:${shopDomain}:${webhookId}`;
+        deliveryKey = `shopify:webhook:${shopDomain}:${webhookId}`;
         const isNewDelivery = await redis.set(deliveryKey, '1', 'EX', 7 * 24 * 60 * 60, 'NX');
         if (!isNewDelivery) return res.status(200).json({ success: true, duplicate_webhook: true });
     }
@@ -545,7 +565,12 @@ async function handleShopifyPurchaseWebhook(req, res) {
     const order = req.body || {};
     const payload = buildShopifyOrderPurchasePayload(order, shopDomain);
 
-    return queueForOutbox(req, res, payload, rows[0].id);
+    try {
+        return await queueForOutbox(req, res, payload, rows[0].id);
+    } catch (error) {
+        if (deliveryKey) await redis.del(deliveryKey).catch(() => {});
+        throw error;
+    }
 }
 
 app.post('/api/webhook/purchase', asyncHandler(handleShopifyPurchaseWebhook));
@@ -585,7 +610,14 @@ cron.schedule(config.batchCron, async () => {
                 if (!itemsToProcess?.length) continue;
 
                 await redis.set(heartbeatKey, '1', 'EX', 30);
-                const parsedEvents = itemsToProcess.map(item => JSON.parse(item));
+                const parsedEvents = [];
+                for (const item of itemsToProcess) {
+                    try {
+                        parsedEvents.push(JSON.parse(item));
+                    } catch (error) {
+                        await insertMalformedQueuedEvent(shop.id, item, `Invalid queued event JSON: ${error.message}`);
+                    }
+                }
                 const now = Date.now();
                 const readyEvents = [];
                 const deferredEvents = [];
@@ -598,14 +630,8 @@ cron.schedule(config.batchCron, async () => {
                     }
                 }
 
-                if (deferredEvents.length > 0) {
-                    for (let index = deferredEvents.length - 1; index >= 0; index -= 1) {
-                        await redis.lpush(pendingKey, JSON.stringify(deferredEvents[index]));
-                    }
-                }
-
                 if (readyEvents.length === 0) {
-                    await redis.del(processingKey);
+                    await completeProcessingBatch(processingKey, pendingKey, deferredEvents);
                     await redis.del(heartbeatKey);
                     continue;
                 }
@@ -662,7 +688,7 @@ cron.schedule(config.batchCron, async () => {
                     await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend }, { jobId });
                 }
 
-                await redis.del(processingKey);
+                await completeProcessingBatch(processingKey, pendingKey, deferredEvents);
                 await redis.del(heartbeatKey);
             } finally {
                 await releaseRedisLock(lockKey, lockToken);
@@ -928,8 +954,20 @@ app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(query, params);
 
     let replayed = 0;
+    let skipped = 0;
     for (const row of rows) {
-        const parsedPayload = JSON.parse(row.payload);
+        let parsedPayload;
+        try {
+            parsedPayload = JSON.parse(row.payload);
+        } catch (error) {
+            await pool.query(
+                "UPDATE dead_letters SET status = 'SKIPPED_UNREPLAYABLE', error_reason = $2 WHERE id = $1",
+                [row.id, `Invalid dead letter payload JSON: ${error.message}`],
+            );
+            skipped += 1;
+            continue;
+        }
+
         const dbEvents = Array.isArray(parsedPayload) ? parsedPayload : [parsedPayload];
         const replayEvents = await restoreReplayableEvents(row.shop_id, dbEvents);
         if (replayEvents.length > 0) {
@@ -940,10 +978,16 @@ app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
             );
             await pool.query("UPDATE dead_letters SET status = 'REPLAYED' WHERE id = $1", [row.id]);
             replayed += 1;
+        } else {
+            await pool.query(
+                "UPDATE dead_letters SET status = 'SKIPPED_UNREPLAYABLE', error_reason = COALESCE(error_reason, 'No replayable events found') WHERE id = $1",
+                [row.id],
+            );
+            skipped += 1;
         }
     }
 
-    res.json({ success: true, replayed });
+    res.json({ success: true, replayed, skipped });
 }));
 
 app.use((err, req, res, next) => {

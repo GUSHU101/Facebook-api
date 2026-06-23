@@ -39,6 +39,19 @@ redis.defineCommand('rollbackProcessing', {
     `,
 });
 
+redis.defineCommand('completeProcessing', {
+    numberOfKeys: 2,
+    lua: `
+        local processingKey = KEYS[1]
+        local pendingKey = KEYS[2]
+        for i = #ARGV, 1, -1 do
+            redis.call('LPUSH', pendingKey, ARGV[i])
+        end
+        redis.call('DEL', processingKey)
+        return #ARGV
+    `,
+});
+
 redis.on('error', error => {
     console.error('Redis error:', error);
 });
