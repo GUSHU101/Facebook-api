@@ -16,7 +16,7 @@ const { buildShopifyOrderPurchasePayload } = require('../src/events/shopify');
 const { eventHasSuccessfulDelivery, shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
-const { normalizeForHash } = require('../src/utils/crypto');
+const { decryptTokenIfPossible, encryptToken, normalizeForHash } = require('../src/utils/crypto');
 
 function sha256(value) {
     return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
@@ -164,6 +164,12 @@ test('customer information normalization matches platform hashing expectations',
     assert.equal(normalizeForHash('+1 (212) 555-1212', 'phone'), '12125551212');
     assert.equal(normalizeForHash(' São Paulo ', 'city'), 'saopaulo');
     assert.equal(normalizeForHash(' E1 1AA ', 'zip'), 'e11aa');
+});
+
+test('encrypted secret helper remains backward compatible with plaintext values', () => {
+    const encrypted = encryptToken('shopify-secret-1');
+    assert.equal(decryptTokenIfPossible(encrypted), 'shopify-secret-1');
+    assert.equal(decryptTokenIfPossible('legacy-plaintext-secret'), 'legacy-plaintext-secret');
 });
 
 test('missing match signal diagnostics identify EMQ gaps', () => {

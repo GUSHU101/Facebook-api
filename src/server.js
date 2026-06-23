@@ -16,7 +16,7 @@ const { ExpressAdapter } = require('@bull-board/express');
 const config = require('./config');
 const pool = require('./utils/db');
 const redis = require('./utils/redis');
-const { hashUserData, encryptToken, timingSafeCompare } = require('./utils/crypto');
+const { hashUserData, encryptToken, decryptTokenIfPossible, timingSafeCompare } = require('./utils/crypto');
 const { calculateEMQ, missingMatchSignals } = require('./utils/emq');
 const { compactObject, firstPresent, normalizeShopifyId } = require('./events/common');
 const { buildShopifyOrderPurchasePayload } = require('./events/shopify');
@@ -490,7 +490,8 @@ async function handleShopifyPurchaseWebhook(req, res) {
     );
     if (rows.length === 0) return res.status(401).send('Unauthorized');
 
-    const generatedHash = crypto.createHmac('sha256', rows[0].app_secret).update(req.rawBody).digest('base64');
+    const appSecret = decryptTokenIfPossible(rows[0].app_secret);
+    const generatedHash = crypto.createHmac('sha256', appSecret).update(req.rawBody).digest('base64');
     if (!timingSafeCompare(generatedHash, hmacHeader)) return res.status(401).send('HMAC Failed');
 
     if (webhookId) {
@@ -667,7 +668,7 @@ const authMw = basicAuth({
 });
 
 app.use('/admin', adminLimiter, authMw);
-app.use('/api/admin', authMw);
+app.use('/api/admin', adminLimiter, authMw);
 
 const serverAdapter = new ExpressAdapter();
 serverAdapter.setBasePath('/admin/queue');
@@ -692,7 +693,7 @@ app.post('/api/admin/shops', asyncHandler(async (req, res) => {
         `INSERT INTO shops (shop_domain, app_secret)
          VALUES ($1, $2)
          ON CONFLICT (shop_domain) DO UPDATE SET app_secret = EXCLUDED.app_secret, status = 'active'`,
-        [shopDomain, appSecret],
+        [shopDomain, encryptToken(appSecret)],
     );
     res.status(201).json({ success: true });
 }));
@@ -790,7 +791,12 @@ app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
         ? await pool.query('DELETE FROM event_store WHERE shop_id = $1', [shopId])
         : await pool.query('DELETE FROM event_store');
 
-    res.json({ success: true, deleted: rowCount, scope: shopId ? 'shop' : 'all' });
+    await Promise.all([
+        deleteKeysByPattern(shopId ? `dedup:${shopId}:*` : 'dedup:*'),
+        deleteKeysByPattern(shopId ? `dedup-alias:${shopId}:*` : 'dedup-alias:*'),
+    ]);
+
+    res.json({ success: true, deleted: rowCount, scope: shopId ? 'shop' : 'all', dedupe_cache_cleared: true });
 }));
 
 app.get('/api/admin/summary', asyncHandler(async (req, res) => {

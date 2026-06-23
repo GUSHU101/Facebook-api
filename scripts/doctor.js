@@ -44,6 +44,7 @@ async function main() {
     await check('postgres schema', async () => {
         const requiredColumns = [
             ['shops', 'shop_domain'],
+            ['shops', 'app_secret'],
             ['pixels', 'platform'],
             ['pixels', 'access_token'],
             ['event_store', 'request_payload'],
@@ -61,6 +62,17 @@ async function main() {
                 [table, column],
             );
             if (rowCount === 0) throw new Error(`Missing column ${table}.${column}`);
+        }
+
+        const secretType = await pool.query(
+            `SELECT data_type
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'shops'
+               AND column_name = 'app_secret'`,
+        );
+        if (secretType.rows[0]?.data_type !== 'text') {
+            throw new Error('shops.app_secret should be TEXT; run npm run migrate');
         }
         return 'required columns present';
     });

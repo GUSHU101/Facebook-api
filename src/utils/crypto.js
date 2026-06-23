@@ -28,6 +28,15 @@ function decryptToken(text) {
     ]).toString('utf8');
 }
 
+function decryptTokenIfPossible(text) {
+    if (!text) return text;
+    try {
+        return decryptToken(text);
+    } catch (error) {
+        return text;
+    }
+}
+
 function timingSafeCompare(generatedHash, hmacHeader) {
     if (!generatedHash || !hmacHeader) return false;
     const left = Buffer.from(String(generatedHash), 'base64');
@@ -57,6 +66,7 @@ function hashUserData(data, type = 'default') {
 module.exports = {
     encryptToken,
     decryptToken,
+    decryptTokenIfPossible,
     timingSafeCompare,
     hashUserData,
     normalizeForHash,

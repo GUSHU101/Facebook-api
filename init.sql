@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS shops (
     id SERIAL PRIMARY KEY,
     shop_domain VARCHAR(255) UNIQUE NOT NULL,
-    app_secret VARCHAR(255) NOT NULL,
+    app_secret TEXT NOT NULL,
     status VARCHAR(20) DEFAULT 'active',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
