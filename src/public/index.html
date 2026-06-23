@@ -53,12 +53,13 @@
                     <button @click="addShop" class="bg-slate-950 text-white rounded-md px-5 py-2 font-medium">保存店铺</button>
                 </div>
                 <table class="w-full bg-white border rounded-lg overflow-hidden text-sm">
-                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">店铺</th><th class="p-3">状态</th><th class="p-3">创建时间</th></tr></thead>
+                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">店铺</th><th class="p-3">状态</th><th class="p-3">创建时间</th><th class="p-3">操作</th></tr></thead>
                     <tbody>
                         <tr v-for="s in shops" :key="s.id" class="border-t">
                             <td class="p-3 font-mono font-semibold">{{ s.shop_domain }}</td>
                             <td class="p-3">{{ s.status }}</td>
                             <td class="p-3">{{ formatTime(s.created_at) }}</td>
+                            <td class="p-3"><button @click="deleteShop(s)" class="text-red-600 font-medium">删除</button></td>
                         </tr>
                     </tbody>
                 </table>
@@ -603,6 +604,11 @@ analytics.subscribe('ui_extension_errored', event => {
                     if (!confirm('确认删除这个 Pixel 路由？')) return;
                     await this.api('/api/admin/pixels/' + id, { method: 'DELETE' });
                     await this.fetchPixels();
+                },
+                async deleteShop(shop) {
+                    if (!confirm(`确认删除店铺 ${shop.shop_domain}？相关 Pixel 路由和事件日志也会一起删除。`)) return;
+                    await this.api('/api/admin/shops/' + shop.id, { method: 'DELETE' });
+                    await this.fetchAll();
                 },
                 formatTime(value) {
                     return value ? new Date(value).toLocaleString() : '-';

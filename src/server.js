@@ -388,6 +388,35 @@ app.post('/api/admin/shops', asyncHandler(async (req, res) => {
     res.status(201).json({ success: true });
 }));
 
+app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
+    const shopId = Number(req.params.id);
+    if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
+
+    const client = await pool.connect();
+    let rowCount = 0;
+    try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shopId]);
+        const result = await client.query('DELETE FROM shops WHERE id = $1', [shopId]);
+        rowCount = result.rowCount;
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
+
+    await Promise.all([
+        redis.del(`pending:events:${shopId}`),
+        redis.del(`processing:events:${shopId}`),
+        redis.del(`heartbeat:processing:${shopId}`),
+    ]);
+
+    if (rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
+    res.json({ success: true });
+}));
+
 app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
         SELECT p.id, s.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code
