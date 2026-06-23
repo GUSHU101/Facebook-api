@@ -137,6 +137,7 @@
                     <button @click="fetchAll" class="bg-slate-950 text-white rounded-md px-4 py-2">刷新全部</button>
                     <button @click="fetchDlq" class="bg-red-600 text-white rounded-md px-4 py-2">刷新死信</button>
                     <button v-if="dlq.length" @click="replayDlq" class="bg-emerald-600 text-white rounded-md px-4 py-2">重放死信 {{ dlq.length }}</button>
+                    <button v-if="logs.length" @click="clearLogs" class="bg-white border border-red-300 text-red-700 rounded-md px-4 py-2">清空事件日志</button>
                 </div>
 
                 <table v-if="dlq.length" class="w-full bg-red-50 border border-red-200 rounded-lg overflow-hidden text-xs">
@@ -719,6 +720,13 @@ analytics.subscribe('ui_extension_errored', event => {
                         body: JSON.stringify({ ids: this.dlq.map(item => item.id) }),
                     });
                     await this.fetchAll();
+                },
+                async clearLogs() {
+                    const scope = this.selectedShopId ? '当前店铺' : '全部店铺';
+                    if (!confirm(`确认清空${scope}的事件日志？此操作不会删除死信记录。`)) return;
+                    const result = await this.api(this.shopScopedPath('/api/admin/logs'), { method: 'DELETE' });
+                    await this.fetchOperationalData();
+                    alert(`已清空 ${result.deleted || 0} 条事件日志`);
                 },
                 async addShop() {
                     await this.api('/api/admin/shops', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.newShop) });

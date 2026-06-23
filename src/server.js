@@ -778,6 +778,15 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
     res.json(rows);
 }));
 
+app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    const { rowCount } = shopId
+        ? await pool.query('DELETE FROM event_store WHERE shop_id = $1', [shopId])
+        : await pool.query('DELETE FROM event_store');
+
+    res.json({ success: true, deleted: rowCount, scope: shopId ? 'shop' : 'all' });
+}));
+
 app.get('/api/admin/summary', asyncHandler(async (req, res) => {
     const shopId = readOptionalShopId(req);
     const params = shopId ? [shopId] : [];
