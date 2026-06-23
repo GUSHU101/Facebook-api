@@ -218,18 +218,20 @@ test('successful delivery keys prevent resending already successful pixels', () 
 test('successful delivery keys only skip a pixel when every event already succeeded', () => {
     const keys = successfulDeliveryKeys([
         {
+            request_payload: { event_id: 'evt-a' },
             fb_response: {
                 deliveries: [
-                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
-                    { platform: 'tiktok', pixel_id: 'TT1', status: 'SUCCESS' },
+                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS', event_ids: ['evt-a'] },
+                    { platform: 'tiktok', pixel_id: 'TT1', status: 'SUCCESS', event_ids: ['evt-a'] },
                 ],
             },
         },
         {
+            request_payload: { event_id: 'evt-b' },
             fb_response: {
                 deliveries: [
-                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
-                    { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED' },
+                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS', event_ids: ['evt-b'] },
+                    { platform: 'tiktok', pixel_id: 'TT1', status: 'SUCCESS', event_ids: ['evt-a'] },
                 ],
             },
         },
@@ -241,16 +243,32 @@ test('successful delivery keys only skip a pixel when every event already succee
 
 test('eventHasSuccessfulDelivery checks success per event and pixel', () => {
     const event = {
+        request_payload: { event_id: 'evt-a' },
         fb_response: {
             deliveries: [
-                { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
-                { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED' },
+                { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS', event_ids: ['evt-a'] },
+                { platform: 'facebook', pixel_id: 'META2', status: 'SUCCESS', event_ids: ['evt-b'] },
+                { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED', event_ids: ['evt-a'] },
             ],
         },
     };
 
     assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META1' }), true);
+    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META2' }), false);
     assert.equal(eventHasSuccessfulDelivery(event, { platform: 'tiktok', pixel_id: 'TT1' }), false);
+});
+
+test('legacy successful deliveries without event ids still count as successful', () => {
+    const event = {
+        request_payload: { event_id: 'evt-a' },
+        fb_response: {
+            deliveries: [
+                { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
+            ],
+        },
+    };
+
+    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META1' }), true);
 });
 
 test('generated Shopify pixel uses unique checkout stage event IDs while preserving Purchase dedupe ID', async () => {
