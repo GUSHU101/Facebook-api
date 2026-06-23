@@ -203,15 +203,19 @@ const SHOP_DOMAIN = "${this.currentShop}";
 const FB_PIXEL_ID = "${this.currentPixelId}";
 const TIKTOK_PIXEL_ID = "${this.currentTikTokPixelId}";
 
-!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
-n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
-n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
-t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
-document,'script','https://connect.facebook.net/en_US/fbevents.js');
+const PIXEL_GLOBAL = typeof window !== 'undefined' ? window : self;
 
-window.fbq('init', FB_PIXEL_ID);
+if (typeof document !== 'undefined') {
+    !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+    t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(PIXEL_GLOBAL,
+    document,'script','https://connect.facebook.net/en_US/fbevents.js');
 
-if (TIKTOK_PIXEL_ID) {
+    if (PIXEL_GLOBAL.fbq) PIXEL_GLOBAL.fbq('init', FB_PIXEL_ID);
+}
+
+if (TIKTOK_PIXEL_ID && typeof document !== 'undefined') {
     !function (w, d, t) {
         w.TiktokAnalyticsObject = t;
         var ttq = w[t] = w[t] || [];
@@ -235,7 +239,7 @@ if (TIKTOK_PIXEL_ID) {
             a.parentNode.insertBefore(s, a);
         };
         ttq.load(TIKTOK_PIXEL_ID);
-    }(window, document, 'ttq');
+    }(PIXEL_GLOBAL, document, 'ttq');
 }
 
 async function getCookieValue(name) {
@@ -244,19 +248,21 @@ async function getCookieValue(name) {
             return await browser.cookie.get(name);
         }
     } catch (error) {}
+    if (typeof document === 'undefined' || !document.cookie) return undefined;
     const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
     return match ? decodeURIComponent(match[2]) : undefined;
 }
 
 async function setCookieValue(name, value, days = 90) {
     if (!value) return;
+    const maxAge = days * 24 * 60 * 60;
     try {
         if (typeof browser !== 'undefined' && browser.cookie?.set) {
-            await browser.cookie.set(name, value, { expires: days });
+            await browser.cookie.set(name + '=' + encodeURIComponent(value) + '; path=/; max-age=' + maxAge + '; SameSite=Lax');
             return;
         }
     } catch (error) {}
-    const maxAge = days * 24 * 60 * 60;
+    if (typeof document === 'undefined') return;
     document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=' + maxAge + '; SameSite=Lax';
 }
 
@@ -288,10 +294,31 @@ function compact(object) {
 
 function getUrlParam(name, href) {
     try {
-        return new URL(href || window.location.href).searchParams.get(name) || undefined;
+        const fallbackHref = typeof location !== 'undefined' ? location.href : undefined;
+        return new URL(href || fallbackHref).searchParams.get(name) || undefined;
     } catch (error) {
         return undefined;
     }
+}
+
+function trackMetaPixel(method, eventName, customData, eventId) {
+    try {
+        if (PIXEL_GLOBAL.fbq) {
+            PIXEL_GLOBAL.fbq(method, eventName, customData, { eventID: eventId });
+        }
+    } catch (error) {}
+}
+
+function trackTikTokPixel(eventName, customData, eventId) {
+    try {
+        if (!PIXEL_GLOBAL.ttq) return;
+        const tiktokEvent = mapTikTokEvent(eventName);
+        if (tiktokEvent === 'PageView') {
+            PIXEL_GLOBAL.ttq.page({ event_id: eventId });
+        } else {
+            PIXEL_GLOBAL.ttq.track(tiktokEvent, mapTikTokProperties(customData), { event_id: eventId });
+        }
+    } catch (error) {}
 }
 
 async function getOrCreateFbp() {
@@ -385,15 +412,8 @@ async function sendDualChannelEvent(metaEventName, event, customData = {}, force
         'PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase', 'Search',
     ]);
     const pixelMethod = standardEvents.has(metaEventName) ? 'track' : 'trackCustom';
-    window.fbq(pixelMethod, metaEventName, customData, { eventID: eventId });
-    if (window.ttq) {
-        const tiktokEvent = mapTikTokEvent(metaEventName);
-        if (tiktokEvent === 'PageView') {
-            window.ttq.page({ event_id: eventId });
-        } else {
-            window.ttq.track(tiktokEvent, mapTikTokProperties(customData), { event_id: eventId });
-        }
-    }
+    trackMetaPixel(pixelMethod, metaEventName, customData, eventId);
+    trackTikTokPixel(metaEventName, customData, eventId);
 
     fetch(CAPI_HUB_URL, {
         method: 'POST',
