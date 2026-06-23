@@ -46,6 +46,7 @@ const capiQueue = new Queue('capi-events', {
 const pixelLimiter = rateLimit({
     windowMs: 60_000,
     max: config.pixelRateLimitPerMinute,
+    keyGenerator: req => `${normalizeShopDomain(req.body?.shop_domain) || 'unknown'}:${firstForwardedIp(req)}`,
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -72,6 +73,18 @@ function requireString(value, fieldName) {
         throw error;
     }
     return normalized;
+}
+
+function readOptionalShopId(req) {
+    const raw = req.query.shop_id;
+    if (raw === undefined || raw === null || raw === '') return null;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value <= 0) {
+        const error = new Error('Invalid shop_id');
+        error.statusCode = 400;
+        throw error;
+    }
+    return value;
 }
 
 function firstForwardedIp(req) {
@@ -180,6 +193,15 @@ async function saveAttributionSnapshot(shopId, payload) {
     if (Object.keys(snapshot).length === 0) return;
 
     await Promise.all(keys.map(key => redis.set(key, JSON.stringify(snapshot), 'EX', ATTRIBUTION_TTL_SECONDS)));
+}
+
+async function deleteKeysByPattern(pattern) {
+    let cursor = '0';
+    do {
+        const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
+        cursor = nextCursor;
+        if (keys.length > 0) await redis.del(...keys);
+    } while (cursor !== '0');
 }
 
 function buildUserData(req, payload) {
@@ -437,104 +459,108 @@ app.get('/readyz', asyncHandler(async (req, res) => {
 }));
 
 cron.schedule(config.batchCron, async () => {
-    const lock = await redis.set('lock:batch_packing', '1', 'EX', 4, 'NX');
-    if (!lock) return;
-
     try {
         const { rows: shops } = await pool.query("SELECT id FROM shops WHERE status = 'active'");
         for (const shop of shops) {
+            const lock = await redis.set(`lock:batch_packing:${shop.id}`, '1', 'EX', 55, 'NX');
+            if (!lock) continue;
+
             const pendingKey = `pending:events:${shop.id}`;
             const processingKey = `processing:events:${shop.id}`;
             const heartbeatKey = `heartbeat:processing:${shop.id}`;
-            const len = await redis.llen(pendingKey);
-            if (len === 0) continue;
+            try {
+                const len = await redis.llen(pendingKey);
+                if (len === 0) continue;
 
-            const itemsToProcess = await redis.safePopAndTransfer(
-                pendingKey,
-                processingKey,
-                Math.min(len, config.batchSize),
-            );
-            if (!itemsToProcess?.length) continue;
+                const itemsToProcess = await redis.safePopAndTransfer(
+                    pendingKey,
+                    processingKey,
+                    Math.min(len, config.batchSize),
+                );
+                if (!itemsToProcess?.length) continue;
 
-            await redis.set(heartbeatKey, '1', 'EX', 30);
-            const parsedEvents = itemsToProcess.map(item => JSON.parse(item));
-            const now = Date.now();
-            const readyEvents = [];
-            const deferredEvents = [];
-            for (const event of parsedEvents) {
-                const age = now - Number(event._received_at || now);
-                if (event.event_name === 'Purchase' && age < config.purchaseSettleMs) {
-                    deferredEvents.push(event);
-                } else {
-                    readyEvents.push(event);
+                await redis.set(heartbeatKey, '1', 'EX', 30);
+                const parsedEvents = itemsToProcess.map(item => JSON.parse(item));
+                const now = Date.now();
+                const readyEvents = [];
+                const deferredEvents = [];
+                for (const event of parsedEvents) {
+                    const age = now - Number(event._received_at || now);
+                    if (event.event_name === 'Purchase' && age < config.purchaseSettleMs) {
+                        deferredEvents.push(event);
+                    } else {
+                        readyEvents.push(event);
+                    }
                 }
-            }
 
-            if (deferredEvents.length > 0) {
-                for (let index = deferredEvents.length - 1; index >= 0; index -= 1) {
-                    await redis.lpush(pendingKey, JSON.stringify(deferredEvents[index]));
+                if (deferredEvents.length > 0) {
+                    for (let index = deferredEvents.length - 1; index >= 0; index -= 1) {
+                        await redis.lpush(pendingKey, JSON.stringify(deferredEvents[index]));
+                    }
                 }
-            }
 
-            if (readyEvents.length === 0) {
+                if (readyEvents.length === 0) {
+                    await redis.del(processingKey);
+                    await redis.del(heartbeatKey);
+                    continue;
+                }
+
+                const mergedReadyEvents = mergeReadyEvents(readyEvents);
+                const shopIds = [];
+                const eventNames = [];
+                const eventIds = [];
+                const statuses = [];
+                const emqs = [];
+                const payloads = [];
+
+                mergedReadyEvents.forEach(event => {
+                    const purePayload = { ...event };
+                    delete purePayload._emq_estimate;
+                    shopIds.push(shop.id);
+                    eventNames.push(event.event_name);
+                    eventIds.push(event.event_id);
+                    statuses.push('PENDING');
+                    emqs.push(event._emq_estimate);
+                    payloads.push(JSON.stringify(purePayload));
+                });
+
+                const outboxQuery = `
+                    INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload)
+                    SELECT * FROM UNNEST ($1::int[], $2::text[], $3::text[], $4::text[], $5::numeric[], $6::jsonb[])
+                    ON CONFLICT (shop_id, event_name, md5(event_id)) DO UPDATE SET
+                        emq_estimate = GREATEST(event_store.emq_estimate, EXCLUDED.emq_estimate),
+                        request_payload =
+                            event_store.request_payload ||
+                            EXCLUDED.request_payload ||
+                            jsonb_build_object(
+                                'user_data',
+                                COALESCE(event_store.request_payload->'user_data', '{}'::jsonb) ||
+                                COALESCE(EXCLUDED.request_payload->'user_data', '{}'::jsonb),
+                                'custom_data',
+                                COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
+                                COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb),
+                                '_platform_data',
+                                COALESCE(event_store.request_payload->'_platform_data', '{}'::jsonb) ||
+                                COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb)
+                            )
+                    WHERE event_store.status <> 'SUCCESS'
+                    RETURNING id, request_payload, status, fb_response;
+                `;
+                const { rows: validDbEvents } = await pool.query(
+                    outboxQuery,
+                    [shopIds, eventNames, eventIds, statuses, emqs, payloads],
+                );
+
+                const eventsToSend = validDbEvents.filter(event => event.status !== 'SUCCESS');
+                if (eventsToSend.length > 0) {
+                    await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend });
+                }
+
                 await redis.del(processingKey);
                 await redis.del(heartbeatKey);
-                continue;
+            } finally {
+                await redis.del(`lock:batch_packing:${shop.id}`);
             }
-
-            const mergedReadyEvents = mergeReadyEvents(readyEvents);
-            const shopIds = [];
-            const eventNames = [];
-            const eventIds = [];
-            const statuses = [];
-            const emqs = [];
-            const payloads = [];
-
-            mergedReadyEvents.forEach(event => {
-                const purePayload = { ...event };
-                delete purePayload._emq_estimate;
-                shopIds.push(shop.id);
-                eventNames.push(event.event_name);
-                eventIds.push(event.event_id);
-                statuses.push('PENDING');
-                emqs.push(event._emq_estimate);
-        payloads.push(JSON.stringify(purePayload));
-            });
-
-            const outboxQuery = `
-                INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload)
-                SELECT * FROM UNNEST ($1::int[], $2::text[], $3::text[], $4::text[], $5::numeric[], $6::jsonb[])
-                ON CONFLICT (shop_id, event_name, md5(event_id)) DO UPDATE SET
-                    emq_estimate = GREATEST(event_store.emq_estimate, EXCLUDED.emq_estimate),
-                    request_payload =
-                        event_store.request_payload ||
-                        EXCLUDED.request_payload ||
-                        jsonb_build_object(
-                            'user_data',
-                            COALESCE(event_store.request_payload->'user_data', '{}'::jsonb) ||
-                            COALESCE(EXCLUDED.request_payload->'user_data', '{}'::jsonb),
-                            'custom_data',
-                            COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
-                            COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb),
-                            '_platform_data',
-                            COALESCE(event_store.request_payload->'_platform_data', '{}'::jsonb) ||
-                            COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb)
-                        )
-                WHERE event_store.status <> 'SUCCESS'
-                RETURNING id, request_payload, status, fb_response;
-            `;
-            const { rows: validDbEvents } = await pool.query(
-                outboxQuery,
-                [shopIds, eventNames, eventIds, statuses, emqs, payloads],
-            );
-
-            const eventsToSend = validDbEvents.filter(event => event.status !== 'SUCCESS');
-            if (eventsToSend.length > 0) {
-                await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend });
-            }
-
-            await redis.del(processingKey);
-            await redis.del(heartbeatKey);
         }
     } catch (error) {
         console.error('Outbox pack error:', error);
@@ -542,23 +568,27 @@ cron.schedule(config.batchCron, async () => {
 });
 
 cron.schedule(config.watchdogCron, async () => {
-    const lock = await redis.set('lock:watchdog', '1', 'EX', 50, 'NX');
-    if (!lock) return;
-
     try {
         const { rows: shops } = await pool.query('SELECT id FROM shops');
         for (const shop of shops) {
+            const lock = await redis.set(`lock:watchdog:${shop.id}`, '1', 'EX', 50, 'NX');
+            if (!lock) continue;
+
             const processingKey = `processing:events:${shop.id}`;
             const pendingKey = `pending:events:${shop.id}`;
             const heartbeatKey = `heartbeat:processing:${shop.id}`;
-            const [isAlive, processingLen] = await Promise.all([
-                redis.exists(heartbeatKey),
-                redis.llen(processingKey),
-            ]);
+            try {
+                const [isAlive, processingLen] = await Promise.all([
+                    redis.exists(heartbeatKey),
+                    redis.llen(processingKey),
+                ]);
 
-            if (processingLen > 0 && !isAlive) {
-                const restored = await redis.rollbackProcessing(processingKey, pendingKey);
-                console.warn(`[Watchdog] restored ${restored} processing events for shop ${shop.id}`);
+                if (processingLen > 0 && !isAlive) {
+                    const restored = await redis.rollbackProcessing(processingKey, pendingKey);
+                    console.warn(`[Watchdog] restored ${restored} processing events for shop ${shop.id}`);
+                }
+            } finally {
+                await redis.del(`lock:watchdog:${shop.id}`);
             }
         }
     } catch (error) {
@@ -608,8 +638,11 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
 
     const client = await pool.connect();
     let rowCount = 0;
+    let shopDomain;
     try {
         await client.query('BEGIN');
+        const shopResult = await client.query('SELECT shop_domain FROM shops WHERE id = $1 FOR UPDATE', [shopId]);
+        shopDomain = shopResult.rows[0]?.shop_domain;
         await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shopId]);
         const result = await client.query('DELETE FROM shops WHERE id = $1', [shopId]);
         rowCount = result.rowCount;
@@ -625,6 +658,11 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
         redis.del(`pending:events:${shopId}`),
         redis.del(`processing:events:${shopId}`),
         redis.del(`heartbeat:processing:${shopId}`),
+        redis.del(`lock:batch_packing:${shopId}`),
+        redis.del(`lock:watchdog:${shopId}`),
+        deleteKeysByPattern(`attr:${shopId}:*`),
+        deleteKeysByPattern(`dedup:${shopId}:*`),
+        shopDomain ? deleteKeysByPattern(`shopify:webhook:${shopDomain}:*`) : Promise.resolve(),
     ]);
 
     if (rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
@@ -633,7 +671,7 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
 
 app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
-        SELECT p.id, s.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code
+        SELECT p.id, p.shop_id, s.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code
         FROM pixels p
         JOIN shops s ON p.shop_id = s.id
         ORDER BY p.id DESC
@@ -665,18 +703,28 @@ app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/admin/logs', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    const params = shopId ? [shopId] : [];
+    const shopFilter = shopId ? 'WHERE e.shop_id = $1' : '';
     const { rows } = await pool.query(`
         SELECT e.id, s.shop_domain, e.event_name, e.event_id, e.status, e.emq_estimate,
                e.request_payload->'_quality' AS quality, e.fb_response, e.timestamp
         FROM event_store e
         JOIN shops s ON e.shop_id = s.id
+        ${shopFilter}
         ORDER BY e.id DESC
         LIMIT 100
-    `);
+    `, params);
     res.json(rows);
 }));
 
 app.get('/api/admin/summary', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    const params = shopId ? [shopId] : [];
+    const eventShopFilter = shopId ? ' AND shop_id = $1' : '';
+    const shopFilter = shopId ? ' AND id = $1' : '';
+    const pixelFilter = shopId ? 'WHERE shop_id = $1' : '';
+    const dlqShopFilter = shopId ? ' AND shop_id = $1' : '';
     const [
         statusResult,
         emqResult,
@@ -688,22 +736,22 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         pool.query(`
             SELECT status, COUNT(*)::int AS count
             FROM event_store
-            WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
             GROUP BY status
-        `),
+        `, params),
         pool.query(`
             SELECT COUNT(*)::int AS total_events,
                    ROUND(AVG(emq_estimate)::numeric, 2) AS avg_emq
             FROM event_store
-            WHERE timestamp >= NOW() - INTERVAL '24 hours'
-        `),
-        pool.query("SELECT COUNT(*)::int AS count FROM dead_letters WHERE status = 'FAILED_PERMANENT'"),
-        pool.query("SELECT COUNT(*)::int AS count FROM shops WHERE status = 'active'"),
-        pool.query("SELECT platform, COUNT(*)::int AS count FROM pixels GROUP BY platform"),
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
+        `, params),
+        pool.query(`SELECT COUNT(*)::int AS count FROM dead_letters WHERE status = 'FAILED_PERMANENT'${dlqShopFilter}`, params),
+        pool.query(`SELECT COUNT(*)::int AS count FROM shops WHERE status = 'active'${shopFilter}`, params),
+        pool.query(`SELECT platform, COUNT(*)::int AS count FROM pixels ${pixelFilter} GROUP BY platform`, params),
         capiQueue.getJobCounts('waiting', 'active', 'delayed', 'failed', 'completed'),
     ]);
 
-    const { rows: shops } = await pool.query("SELECT id FROM shops WHERE status = 'active'");
+    const { rows: shops } = await pool.query(`SELECT id FROM shops WHERE status = 'active'${shopFilter}`, params);
     const pendingByShop = [];
     for (const shop of shops) {
         const pending = await redis.llen(`pending:events:${shop.id}`);
@@ -726,14 +774,18 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/admin/dlq', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    const params = shopId ? [shopId] : [];
+    const shopFilter = shopId ? 'AND d.shop_id = $1' : '';
     const { rows } = await pool.query(`
         SELECT d.*, s.shop_domain
         FROM dead_letters d
         JOIN shops s ON d.shop_id = s.id
         WHERE d.status = 'FAILED_PERMANENT'
+        ${shopFilter}
         ORDER BY d.id DESC
         LIMIT 50
-    `);
+    `, params);
     res.json(rows);
 }));
 

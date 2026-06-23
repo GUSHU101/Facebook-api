@@ -21,7 +21,14 @@
 
         <main class="max-w-7xl mx-auto px-6 py-6">
             <section v-if="tab === 'deploy'" class="space-y-5">
-                <div class="grid md:grid-cols-4 gap-4">
+                <div class="grid md:grid-cols-5 gap-4">
+                    <label class="block">
+                        <span class="text-sm font-medium">已配置店铺</span>
+                        <select v-model="deployShopId" @change="applyDeployShop" class="mt-1 w-full border rounded-md p-2">
+                            <option value="">手动填写</option>
+                            <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
+                        </select>
+                    </label>
                     <label class="block">
                         <span class="text-sm font-medium">Shopify 域名</span>
                         <input v-model="currentShop" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="your-store.myshopify.com">
@@ -123,6 +130,10 @@
                     </div>
                 </div>
                 <div class="flex flex-wrap gap-3">
+                    <select v-model="selectedShopId" @change="fetchOperationalData" class="border rounded-md px-3 py-2 bg-white">
+                        <option value="">全部店铺</option>
+                        <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
+                    </select>
                     <button @click="fetchAll" class="bg-slate-950 text-white rounded-md px-4 py-2">刷新全部</button>
                     <button @click="fetchDlq" class="bg-red-600 text-white rounded-md px-4 py-2">刷新死信</button>
                     <button v-if="dlq.length" @click="replayDlq" class="bg-emerald-600 text-white rounded-md px-4 py-2">重放死信 {{ dlq.length }}</button>
@@ -175,6 +186,8 @@
                     dlq: [],
                     summary: {},
                     apiDomain: '',
+                    deployShopId: '',
+                    selectedShopId: '',
                     currentShop: 'your-store.myshopify.com',
                     currentPixelId: 'YOUR_PIXEL_ID',
                     currentTikTokPixelId: '',
@@ -594,14 +607,24 @@ analytics.subscribe('ui_extension_errored', event => {
                 async fetchAll() {
                     await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchDlq(), this.fetchSummary()]);
                 },
+                shopScopedPath(path) {
+                    return this.selectedShopId ? `${path}?shop_id=${encodeURIComponent(this.selectedShopId)}` : path;
+                },
+                async fetchOperationalData() {
+                    await Promise.all([this.fetchLogs(), this.fetchDlq(), this.fetchSummary()]);
+                },
                 async fetchShops() { this.shops = await this.api('/api/admin/shops'); },
                 async fetchPixels() { this.pixels = await this.api('/api/admin/pixels'); },
-                async fetchLogs() { this.logs = await this.api('/api/admin/logs'); },
-                async fetchDlq() { this.dlq = await this.api('/api/admin/dlq'); },
-                async fetchSummary() { this.summary = await this.api('/api/admin/summary'); },
+                async fetchLogs() { this.logs = await this.api(this.shopScopedPath('/api/admin/logs')); },
+                async fetchDlq() { this.dlq = await this.api(this.shopScopedPath('/api/admin/dlq')); },
+                async fetchSummary() { this.summary = await this.api(this.shopScopedPath('/api/admin/summary')); },
                 async replayDlq() {
-                    if (!confirm('确认重放当前所有失败事件？')) return;
-                    await this.api('/api/admin/dlq/replay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                    if (!confirm('确认重放当前列表中的失败事件？')) return;
+                    await this.api('/api/admin/dlq/replay', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ids: this.dlq.map(item => item.id) }),
+                    });
                     await this.fetchAll();
                 },
                 async addShop() {
@@ -613,6 +636,17 @@ analytics.subscribe('ui_extension_errored', event => {
                     await this.api('/api/admin/pixels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.newPixel) });
                     this.newPixel = { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', test_event_code: '' };
                     await this.fetchPixels();
+                },
+                applyDeployShop() {
+                    const shopId = Number(this.deployShopId);
+                    const shop = this.shops.find(item => Number(item.id) === shopId);
+                    if (!shop) return;
+
+                    const facebookPixel = this.pixels.find(item => Number(item.shop_id) === shopId && item.platform === 'facebook');
+                    const tiktokPixel = this.pixels.find(item => Number(item.shop_id) === shopId && item.platform === 'tiktok');
+                    this.currentShop = shop.shop_domain;
+                    if (facebookPixel) this.currentPixelId = facebookPixel.pixel_id;
+                    this.currentTikTokPixelId = tiktokPixel?.pixel_id || '';
                 },
                 async copyCode() {
                     await navigator.clipboard.writeText(this.generatedCode);
