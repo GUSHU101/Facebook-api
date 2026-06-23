@@ -203,7 +203,7 @@ const SHOP_DOMAIN = "${this.currentShop}";
 const FB_PIXEL_ID = "${this.currentPixelId}";
 const TIKTOK_PIXEL_ID = "${this.currentTikTokPixelId}";
 
-const PIXEL_GLOBAL = typeof window !== 'undefined' ? window : self;
+const PIXEL_GLOBAL = typeof window !== 'undefined' ? window : globalThis;
 
 if (typeof document !== 'undefined') {
     !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
@@ -275,6 +275,29 @@ function moneyCurrency(value, fallback = 'USD') {
     return value?.currencyCode || value?.currency || fallback;
 }
 
+function firstNonEmpty() {
+    return Array.prototype.slice.call(arguments).find(value => value !== undefined && value !== null && value !== '');
+}
+
+function uniqueValues(values) {
+    const seen = {};
+    return values.filter(value => {
+        if (value === undefined || value === null || value === '') return false;
+        const key = String(value);
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+    });
+}
+
+function normalizeShopifyId(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    const text = String(value).trim();
+    const marker = 'gid://shopify/';
+    if (!text.startsWith(marker)) return text || undefined;
+    return text.slice(marker.length).split('/').pop() || undefined;
+}
+
 function lineItemToContent(item) {
     const variant = item.variant || item.merchandise || {};
     const product = item.product || variant.product || {};
@@ -282,7 +305,7 @@ function lineItemToContent(item) {
     const totalPrice = moneyAmount(item.cost?.totalAmount || item.finalLinePrice);
     const price = moneyAmount(variant.price || item.cost?.amountPerQuantity || (totalPrice && quantity ? totalPrice / quantity : undefined));
     return {
-        id: String(variant.id || product.id || item.id || '').replace('gid://shopify/ProductVariant/', '').replace('gid://shopify/Product/', ''),
+        id: normalizeShopifyId(variant.id || product.id || item.id),
         quantity,
         item_price: price,
     };
@@ -319,6 +342,25 @@ function trackTikTokPixel(eventName, customData, eventId) {
             PIXEL_GLOBAL.ttq.track(tiktokEvent, mapTikTokProperties(customData), { event_id: eventId });
         }
     } catch (error) {}
+}
+
+function eventIdFrom(value) {
+    const normalized = normalizeShopifyId(value);
+    return normalized ? String(normalized) : undefined;
+}
+
+function purchaseEventId(checkout, event) {
+    return firstNonEmpty(
+        checkout.token,
+        checkout.checkoutToken,
+        eventIdFrom(checkout.order?.id),
+        checkout.order?.name,
+        event.id,
+    );
+}
+
+function checkoutLineItems(checkout) {
+    return Array.isArray(checkout.lineItems) ? checkout.lineItems : [];
 }
 
 async function getOrCreateFbp() {
@@ -387,7 +429,7 @@ function mapTikTokProperties(customData) {
 }
 
 async function sendDualChannelEvent(metaEventName, event, customData = {}, forcedEventId = undefined) {
-    const eventId = forcedEventId || event.id;
+    const eventId = String(eventIdFrom(forcedEventId) || event.id || metaEventName + '_' + Date.now());
     const context = event.context || {};
     const documentInfo = context.document || {};
     const navigatorInfo = context.navigator || {};
@@ -405,8 +447,19 @@ async function sendDualChannelEvent(metaEventName, event, customData = {}, force
     const shopifyY = await getCookieValue('_shopify_y');
     const shopifyS = await getCookieValue('_shopify_s');
     const checkoutToken = checkout.token || checkout.checkoutToken;
-    const cartToken = event.data?.cart?.id || checkout.cartToken;
-    const orderId = checkout.order?.id || checkout.order?.name;
+    const cartToken = normalizeShopifyId(event.data?.cart?.id || checkout.cartToken);
+    const normalizedOrderId = normalizeShopifyId(checkout.order?.id);
+    const orderId = firstNonEmpty(checkout.order?.name, normalizedOrderId);
+    const externalIds = uniqueValues([
+        event.clientId,
+        normalizeShopifyId(customer.id),
+        normalizeShopifyId(checkout.order?.customer?.id),
+        shopifyY,
+        checkoutToken,
+        cartToken,
+        normalizedOrderId,
+        checkout.order?.name,
+    ]);
 
     const standardEvents = new Set([
         'PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase', 'Search',
@@ -445,7 +498,7 @@ async function sendDualChannelEvent(metaEventName, event, customData = {}, force
             checkout_token: checkoutToken,
             cart_token: cartToken,
             order_id: orderId,
-            external_id: event.clientId || customer.id || checkout.order?.customer?.id || shopifyY || checkoutToken,
+            external_id: externalIds.length ? externalIds : undefined,
             ...customData,
         })),
     }).catch(console.error);
@@ -480,7 +533,7 @@ analytics.subscribe('collection_viewed', event => {
 analytics.subscribe('product_viewed', event => {
     const variant = event.data?.productVariant || {};
     const product = event.data?.product || variant.product || {};
-    const contentId = String(variant.id || product.id || '').replace('gid://shopify/ProductVariant/', '');
+    const contentId = normalizeShopifyId(variant.id || product.id);
     sendDualChannelEvent('ViewContent', event, {
         value: moneyAmount(variant.price),
         currency: moneyCurrency(variant.price),
@@ -519,7 +572,7 @@ analytics.subscribe('product_removed_from_cart', event => {
 
 analytics.subscribe('checkout_started', event => {
     const checkout = event.data?.checkout || {};
-    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    const contents = checkoutLineItems(checkout).map(lineItemToContent).filter(item => item.id);
     sendDualChannelEvent('InitiateCheckout', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
@@ -532,7 +585,7 @@ analytics.subscribe('checkout_started', event => {
 
 analytics.subscribe('checkout_contact_info_submitted', event => {
     const checkout = event.data?.checkout || {};
-    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    const contents = checkoutLineItems(checkout).map(lineItemToContent).filter(item => item.id);
     sendDualChannelEvent('CheckoutContactInfoSubmitted', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
@@ -545,7 +598,7 @@ analytics.subscribe('checkout_contact_info_submitted', event => {
 
 analytics.subscribe('checkout_address_info_submitted', event => {
     const checkout = event.data?.checkout || {};
-    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    const contents = checkoutLineItems(checkout).map(lineItemToContent).filter(item => item.id);
     sendDualChannelEvent('CheckoutAddressInfoSubmitted', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
@@ -558,7 +611,7 @@ analytics.subscribe('checkout_address_info_submitted', event => {
 
 analytics.subscribe('checkout_shipping_info_submitted', event => {
     const checkout = event.data?.checkout || {};
-    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    const contents = checkoutLineItems(checkout).map(lineItemToContent).filter(item => item.id);
     sendDualChannelEvent('CheckoutShippingInfoSubmitted', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
@@ -571,7 +624,7 @@ analytics.subscribe('checkout_shipping_info_submitted', event => {
 
 analytics.subscribe('payment_info_submitted', event => {
     const checkout = event.data?.checkout || {};
-    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    const contents = checkoutLineItems(checkout).map(lineItemToContent).filter(item => item.id);
     sendDualChannelEvent('AddPaymentInfo', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
@@ -584,7 +637,7 @@ analytics.subscribe('payment_info_submitted', event => {
 
 analytics.subscribe('checkout_completed', event => {
     const checkout = event.data?.checkout || {};
-    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    const contents = checkoutLineItems(checkout).map(lineItemToContent).filter(item => item.id);
     sendDualChannelEvent('Purchase', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
@@ -592,8 +645,8 @@ analytics.subscribe('checkout_completed', event => {
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-        order_id: checkout.order?.id || checkout.order?.name,
-    }, checkout.token || checkout.order?.id || event.id);
+        order_id: firstNonEmpty(checkout.order?.name, normalizeShopifyId(checkout.order?.id)),
+    }, purchaseEventId(checkout, event));
 });
 
 analytics.subscribe('search_submitted', event => {

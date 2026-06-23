@@ -53,6 +53,19 @@ async function updateEvents(ids, status, fbResponse) {
     );
 }
 
+async function refreshDbEvents(dbEvents) {
+    const ids = dbEvents.map(event => event.id);
+    const { rows } = await pool.query(
+        'SELECT id, status, fb_response FROM event_store WHERE id = ANY($1::bigint[])',
+        [ids],
+    );
+    const latestById = new Map(rows.map(row => [String(row.id), row]));
+    return dbEvents.map(event => {
+        const latest = latestById.get(String(event.id));
+        return latest ? { ...event, status: latest.status, fb_response: latest.fb_response } : event;
+    });
+}
+
 async function insertDeadLetter(shopId, dbEvents, reason) {
     await pool.query(
         `INSERT INTO dead_letters (shop_id, payload, error_reason)
@@ -137,7 +150,8 @@ const worker = new Worker('capi-events', async job => {
         throw new Error('Invalid job payload');
     }
 
-    const idsToUpdate = dbEvents.map(event => event.id);
+    const freshDbEvents = await refreshDbEvents(dbEvents);
+    const idsToUpdate = freshDbEvents.map(event => event.id);
     const { rows: pixels } = await pool.query(
         'SELECT id, platform, name, pixel_id, access_token, test_event_code FROM pixels WHERE shop_id = $1 ORDER BY id ASC',
         [shopId],
@@ -152,7 +166,7 @@ const worker = new Worker('capi-events', async job => {
 
     const deliveries = [];
     const permanentFailures = [];
-    const successfulKeys = successfulDeliveryKeys(dbEvents);
+    const successfulKeys = successfulDeliveryKeys(freshDbEvents);
 
     for (const pixel of pixels) {
         if (shouldSkipPixel(pixel, successfulKeys)) {
@@ -166,7 +180,7 @@ const worker = new Worker('capi-events', async job => {
         }
 
         try {
-            const result = await sendToPlatform(pixel, dbEvents);
+            const result = await sendToPlatform(pixel, freshDbEvents);
             deliveries.push({ ...result, status: 'SUCCESS' });
         } catch (error) {
             const classification = pixel.platform === 'tiktok' ? classifyTikTokError(error) : classifyFacebookError(error);
@@ -180,7 +194,10 @@ const worker = new Worker('capi-events', async job => {
             };
 
             if (classification.retryable) {
-                throw new RetryableError(`Facebook retryable error (${classification.code || 'network'}): ${classification.message}`);
+                if (deliveries.length > 0) {
+                    await updateEvents(idsToUpdate, 'PENDING', { deliveries });
+                }
+                throw new RetryableError(`${pixel.platform} retryable error (${classification.code || 'network'}): ${classification.message}`);
             }
 
             deliveries.push(failure);
@@ -198,7 +215,7 @@ const worker = new Worker('capi-events', async job => {
     await updateEvents(idsToUpdate, status, fbResponse);
     await insertDeadLetter(
         shopId,
-        dbEvents.map(event => ({ ...event, fb_response: fbResponse })),
+        freshDbEvents.map(event => ({ ...event, fb_response: fbResponse })),
         `Permanent pixel failures: ${permanentFailures.map(item => item.pixel_id).join(', ')}`,
     );
 }, {

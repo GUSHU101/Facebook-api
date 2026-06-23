@@ -18,7 +18,7 @@ const pool = require('./utils/db');
 const redis = require('./utils/redis');
 const { hashUserData, encryptToken, timingSafeCompare } = require('./utils/crypto');
 const { calculateEMQ, missingMatchSignals } = require('./utils/emq');
-const { compactObject, firstPresent } = require('./events/common');
+const { compactObject, firstPresent, normalizeShopifyId } = require('./events/common');
 const { buildShopifyOrderPurchasePayload } = require('./events/shopify');
 
 const app = express();
@@ -124,6 +124,7 @@ function attributionKeys(shopId, payload) {
         ['checkout', payload.checkout_token],
         ['cart', payload.cart_token],
         ['order', payload.order_id],
+        ['session', payload.shopify_s],
     ];
     const keys = [];
     const seen = new Set();
@@ -158,6 +159,7 @@ function attributionSnapshot(payload) {
         zip: firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip),
         country: firstPresent(payload.country, payload.country_code, payload.customer_country),
         client_id: firstPresent(payload.client_id, payload.shopify_y),
+        external_id: payload.external_id,
         checkout_token: payload.checkout_token,
         cart_token: payload.cart_token,
         shopify_y: payload.shopify_y,
@@ -381,7 +383,7 @@ function resolveEventTime(payload) {
 
 async function queueForOutbox(req, res, payload, shopId) {
     const eventName = requireString(payload.event_name, 'event_name');
-    const eventId = String(payload.event_id || `${eventName}_${crypto.randomUUID()}`).trim();
+    const eventId = String(normalizeShopifyId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`).trim();
     const attribution = await loadAttributionSnapshot(shopId, payload);
     const enrichedPayload = { ...attribution, ...payload };
     const dedupKey = `dedup:${shopId}:${eventName}:${eventId}`;

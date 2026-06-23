@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { compactObject, firstPresent } = require('./common');
+const { compactObject, firstPresent, normalizeShopifyId } = require('./common');
 
 function toAbsoluteShopUrl(shopDomain, value) {
     if (!value) return `https://${shopDomain}`;
@@ -30,8 +30,7 @@ function buildFbcFromUrl(sourceUrl, timestampMs = Date.now()) {
 }
 
 function normalizeContentId(value) {
-    if (value === undefined || value === null || value === '') return undefined;
-    return String(value).replace('gid://shopify/ProductVariant/', '').replace('gid://shopify/Product/', '');
+    return normalizeShopifyId(value);
 }
 
 function buildOrderContents(order) {
@@ -47,6 +46,19 @@ function buildOrderContents(order) {
             item_price: Number.isFinite(itemPrice) ? itemPrice : undefined,
         });
     }).filter(Boolean);
+}
+
+function uniqueValues(values) {
+    const output = [];
+    const seen = new Set();
+    for (const value of values) {
+        if (value === undefined || value === null || value === '') continue;
+        const text = String(value);
+        if (seen.has(text)) continue;
+        seen.add(text);
+        output.push(text);
+    }
+    return output;
 }
 
 function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
@@ -81,11 +93,14 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         })(),
     );
     const shopifyY = readOrderAttribute(order, ['_shopify_y', 'shopify_y']);
+    const shopifyS = readOrderAttribute(order, ['_shopify_s', 'shopify_s']);
     const clientId = firstPresent(readOrderAttribute(order, ['client_id', 'shopify_client_id']), shopifyY);
+    const orderId = normalizeShopifyId(order.id);
+    const orderName = firstPresent(order.name, order.order_number, orderId);
 
     return {
         event_name: 'Purchase',
-        event_id: firstPresent(readOrderAttribute(order, ['event_id', 'capi_event_id']), checkoutToken, order.id, crypto.randomUUID()).toString(),
+        event_id: firstPresent(readOrderAttribute(order, ['event_id', 'capi_event_id']), checkoutToken, orderId, orderName, crypto.randomUUID()).toString(),
         email: firstPresent(order.email, order.contact_email, customer.email),
         phone: firstPresent(order.phone, customer.phone, billingAddress.phone, shippingAddress.phone),
         firstName: firstPresent(billingAddress.first_name, shippingAddress.first_name, customer.first_name),
@@ -94,17 +109,19 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         state: address.province_code || address.province,
         zip: address.zip,
         country: address.country_code || address.country,
-        external_id: [
-            customer.id,
-            customer.admin_graphql_api_id,
+        external_id: uniqueValues([
+            normalizeShopifyId(customer.id),
+            normalizeShopifyId(customer.admin_graphql_api_id),
             clientId,
             checkoutToken,
-            order.id,
-        ].filter(Boolean),
+            orderId,
+            orderName,
+        ]),
         client_id: clientId,
         checkout_token: checkoutToken,
         cart_token: order.cart_token,
         shopify_y: shopifyY,
+        shopify_s: shopifyS,
         client_ip: firstPresent(order.browser_ip, order.client_details?.browser_ip),
         user_agent: order.client_details?.user_agent,
         fbp,
@@ -112,12 +129,12 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         ttp,
         ttclid,
         value: firstPresent(order.current_total_price, order.total_price),
-        currency: order.currency || order.presentment_currency,
+        currency: firstPresent(order.currency, order.presentment_currency, order.current_total_price_set?.shop_money?.currency_code),
         content_ids: contents.map(item => item.id),
         contents,
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-        order_id: firstPresent(order.name, order.order_number, order.id),
+        order_id: orderName,
         source_url: sourceUrl,
         timestamp: order.created_at || order.processed_at || order.updated_at,
     };

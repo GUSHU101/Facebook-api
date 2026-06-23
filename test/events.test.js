@@ -61,7 +61,7 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     assert.equal(payload.client_id, 'shopify-y-cookie');
     assert.equal(payload.checkout_token, 'checkout-token-1');
     assert.equal(payload.shopify_y, 'shopify-y-cookie');
-    assert.deepEqual(payload.external_id, [12345, 'shopify-y-cookie', 'checkout-token-1', 987]);
+    assert.deepEqual(payload.external_id, ['12345', 'shopify-y-cookie', 'checkout-token-1', '987', '#1001']);
     assert.deepEqual(payload.content_ids, ['111', '222']);
     assert.deepEqual(payload.contents, [
         { id: '111', quantity: 2, item_price: 8 },
@@ -69,6 +69,20 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     ]);
     assert.equal(payload.num_items, 3);
     assert.equal(payload.order_id, '#1001');
+});
+
+test('buildShopifyOrderPurchasePayload normalizes Shopify GIDs for Purchase dedupe fallback', () => {
+    const payload = buildShopifyOrderPurchasePayload({
+        id: 'gid://shopify/Order/987',
+        email: 'buyer@example.com',
+        current_total_price: '46.00',
+        currency: 'USD',
+        line_items: [],
+    }, 'demo.myshopify.com');
+
+    assert.equal(payload.event_id, '987');
+    assert.equal(payload.order_id, '987');
+    assert.deepEqual(payload.external_id, ['987']);
 });
 
 test('buildTikTokPayload maps Purchase to CompletePayment and preserves dedupe event_id', () => {
