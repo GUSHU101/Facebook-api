@@ -202,3 +202,47 @@ npm run migrate
 npm run doctor
 pm2 restart ecosystem.config.js
 ```
+给数据库权限
+
+```sql
+ALTER SCHEMA public OWNER TO capi_saas;
+
+ALTER TABLE shops OWNER TO capi_saas;
+ALTER TABLE pixels OWNER TO capi_saas;
+ALTER TABLE event_store OWNER TO capi_saas;
+ALTER TABLE dead_letters OWNER TO capi_saas;
+
+ALTER SEQUENCE shops_id_seq OWNER TO capi_saas;
+ALTER SEQUENCE pixels_id_seq OWNER TO capi_saas;
+ALTER SEQUENCE event_store_id_seq OWNER TO capi_saas;
+ALTER SEQUENCE dead_letters_id_seq OWNER TO capi_saas;
+
+GRANT USAGE, CREATE ON SCHEMA public TO capi_saas;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO capi_saas;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO capi_saas;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE capi_saas IN SCHEMA public
+GRANT ALL PRIVILEGES ON TABLES TO capi_saas;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE capi_saas IN SCHEMA public
+GRANT ALL PRIVILEGES ON SEQUENCES TO capi_saas;
+```
+
+执行位置：
+
+```bash
+sudo -u postgres psql -d capi_saas
+```
+
+粘贴 SQL 执行，结束后输入：
+
+```sql
+\q
+```
+
+执行完后重启：
+
+```text
+capi-api
+capi-worker
+```
