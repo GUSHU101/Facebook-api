@@ -140,13 +140,14 @@
                 </table>
 
                 <table class="w-full bg-white border rounded-lg overflow-hidden text-xs">
-                    <thead class="bg-slate-200 text-left"><tr><th class="p-2">时间</th><th class="p-2">店铺</th><th class="p-2">事件</th><th class="p-2">EMQ</th><th class="p-2">状态</th><th class="p-2">Meta 响应</th></tr></thead>
+                    <thead class="bg-slate-200 text-left"><tr><th class="p-2">时间</th><th class="p-2">店铺</th><th class="p-2">事件</th><th class="p-2">EMQ</th><th class="p-2">缺失信号</th><th class="p-2">状态</th><th class="p-2">Meta 响应</th></tr></thead>
                     <tbody>
                         <tr v-for="log in logs" :key="log.id" class="border-t">
                             <td class="p-2">{{ formatTime(log.timestamp) }}</td>
                             <td class="p-2 font-mono">{{ log.shop_domain }}</td>
                             <td class="p-2"><b>{{ log.event_name }}</b><br><span class="font-mono text-slate-500">{{ log.event_id }}</span></td>
                             <td class="p-2 font-semibold">{{ log.emq_estimate || '-' }}/10</td>
+                            <td class="p-2 font-mono text-slate-500">{{ summarizeQuality(log.quality) }}</td>
                             <td class="p-2 font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
                             <td class="p-2 font-mono text-slate-500">{{ summarizeResponse(log.fb_response) }}</td>
                         </tr>
@@ -643,6 +644,10 @@ analytics.subscribe('ui_extension_errored', event => {
                     const deliveries = value.deliveries || [];
                     if (deliveries.length) return deliveries.map(item => `${item.pixel_id}:${item.status}`).join(', ');
                     return value.fbtrace_id || JSON.stringify(value).slice(0, 120);
+                },
+                summarizeQuality(value) {
+                    const missing = value?.missing_match_signals || [];
+                    return missing.length ? missing.join(', ') : 'OK';
                 },
             },
             mounted() {

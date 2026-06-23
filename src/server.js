@@ -58,6 +58,7 @@ const adminLimiter = rateLimit({
 });
 
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -92,6 +93,93 @@ function hashMany(values, type = 'default') {
         }
     }
     return hashes.length ? hashes : undefined;
+}
+
+function cleanKeyPart(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    return String(value).trim().slice(0, 256);
+}
+
+function firstScalar(value) {
+    if (Array.isArray(value)) return value.find(item => item !== undefined && item !== null && item !== '');
+    return value;
+}
+
+function attributionKeys(shopId, payload) {
+    const candidates = [
+        ['client', firstPresent(payload.client_id, payload.shopify_y, firstScalar(payload.external_id))],
+        ['checkout', payload.checkout_token],
+        ['cart', payload.cart_token],
+        ['order', payload.order_id],
+    ];
+    const keys = [];
+    const seen = new Set();
+    for (const [type, rawValue] of candidates) {
+        const value = cleanKeyPart(rawValue);
+        if (!value) continue;
+        const key = `attr:${shopId}:${type}:${value}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            keys.push(key);
+        }
+    }
+    return keys;
+}
+
+function attributionSnapshot(payload) {
+    return compactObject({
+        fbp: firstPresent(payload.fbp, payload._fbp),
+        fbc: firstPresent(payload.fbc, payload._fbc),
+        ttp: payload.ttp,
+        ttclid: payload.ttclid,
+        source_url: firstPresent(payload.source_url, payload.url),
+        referrer: payload.referrer,
+        client_ip: payload.client_ip,
+        user_agent: payload.user_agent,
+        email: firstPresent(payload.email, payload.customer_email),
+        phone: firstPresent(payload.phone, payload.customer_phone),
+        firstName: firstPresent(payload.firstName, payload.first_name, payload.customer_first_name),
+        lastName: firstPresent(payload.lastName, payload.last_name, payload.customer_last_name),
+        city: firstPresent(payload.city, payload.customer_city),
+        state: firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state),
+        zip: firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip),
+        country: firstPresent(payload.country, payload.country_code, payload.customer_country),
+        client_id: firstPresent(payload.client_id, payload.shopify_y),
+        checkout_token: payload.checkout_token,
+        cart_token: payload.cart_token,
+        shopify_y: payload.shopify_y,
+        shopify_s: payload.shopify_s,
+        updated_at: Date.now(),
+    });
+}
+
+async function loadAttributionSnapshot(shopId, payload) {
+    const keys = attributionKeys(shopId, payload);
+    if (keys.length === 0) return {};
+
+    const values = await redis.mget(keys);
+    const snapshots = values
+        .filter(Boolean)
+        .map(value => {
+            try {
+                return JSON.parse(value);
+            } catch (error) {
+                return {};
+            }
+        })
+        .sort((left, right) => Number(left.updated_at || 0) - Number(right.updated_at || 0));
+
+    return Object.assign({}, ...snapshots);
+}
+
+async function saveAttributionSnapshot(shopId, payload) {
+    const keys = attributionKeys(shopId, payload);
+    if (keys.length === 0) return;
+
+    const snapshot = attributionSnapshot(payload);
+    if (Object.keys(snapshot).length === 0) return;
+
+    await Promise.all(keys.map(key => redis.set(key, JSON.stringify(snapshot), 'EX', ATTRIBUTION_TTL_SECONDS)));
 }
 
 function buildUserData(req, payload) {
@@ -172,6 +260,87 @@ function buildCustomData(payload) {
     });
 }
 
+function mergeUniqueArrays(left, right) {
+    const output = [];
+    const seen = new Set();
+    for (const value of [...(Array.isArray(left) ? left : []), ...(Array.isArray(right) ? right : [])]) {
+        const key = JSON.stringify(value);
+        if (!seen.has(key)) {
+            seen.add(key);
+            output.push(value);
+        }
+    }
+    return output.length ? output : undefined;
+}
+
+function mergeUserData(left = {}, right = {}) {
+    const arrayFields = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'];
+    const merged = { ...left, ...right };
+    for (const field of arrayFields) {
+        merged[field] = mergeUniqueArrays(left[field], right[field]);
+    }
+    return compactObject({
+        ...merged,
+        client_ip_address: firstPresent(right.client_ip_address, left.client_ip_address),
+        client_user_agent: firstPresent(right.client_user_agent, left.client_user_agent),
+        fbc: firstPresent(right.fbc, left.fbc),
+        fbp: firstPresent(right.fbp, left.fbp),
+    });
+}
+
+function mergeCustomData(left = {}, right = {}) {
+    return compactObject({
+        ...left,
+        ...right,
+        content_ids: mergeUniqueArrays(left.content_ids, right.content_ids),
+        contents: Array.isArray(right.contents) && right.contents.length ? right.contents : left.contents,
+        value: firstPresent(right.value, left.value),
+        currency: firstPresent(right.currency, left.currency),
+        order_id: firstPresent(right.order_id, left.order_id),
+        num_items: firstPresent(right.num_items, left.num_items),
+    });
+}
+
+function mergePlatformData(left = {}, right = {}) {
+    return compactObject({
+        ...left,
+        ...right,
+        tiktok: compactObject({
+            ...(left.tiktok || {}),
+            ...(right.tiktok || {}),
+        }),
+    });
+}
+
+function mergeQueuedEvent(left, right) {
+    const mergedUserData = mergeUserData(left.user_data, right.user_data);
+    const merged = {
+        ...left,
+        ...right,
+        event_time: Math.min(Number(left.event_time || right.event_time), Number(right.event_time || left.event_time)),
+        event_source_url: firstPresent(right.event_source_url, left.event_source_url),
+        user_data: mergedUserData,
+        custom_data: mergeCustomData(left.custom_data, right.custom_data),
+        _platform_data: mergePlatformData(left._platform_data, right._platform_data),
+        _duplicate_candidate: Boolean(left._duplicate_candidate || right._duplicate_candidate),
+        _attribution_enriched: Boolean(left._attribution_enriched || right._attribution_enriched),
+        _received_at: Math.min(Number(left._received_at || right._received_at), Number(right._received_at || left._received_at)),
+    };
+    merged._emq_estimate = Math.max(Number(left._emq_estimate || 0), Number(right._emq_estimate || 0), calculateEMQ(mergedUserData));
+    merged._quality = { missing_match_signals: missingMatchSignals(mergedUserData) };
+    return compactObject(merged);
+}
+
+function mergeReadyEvents(events) {
+    const byKey = new Map();
+    for (const event of events) {
+        const key = `${event.event_name}:${event.event_id}`;
+        const existing = byKey.get(key);
+        byKey.set(key, existing ? mergeQueuedEvent(existing, event) : event);
+    }
+    return [...byKey.values()];
+}
+
 function resolveEventTime(payload) {
     const fromPayload = Date.parse(payload.timestamp);
     if (Number.isFinite(fromPayload)) return Math.floor(fromPayload / 1000);
@@ -181,27 +350,31 @@ function resolveEventTime(payload) {
 async function queueForOutbox(req, res, payload, shopId) {
     const eventName = requireString(payload.event_name, 'event_name');
     const eventId = String(payload.event_id || `${eventName}_${crypto.randomUUID()}`).trim();
+    const attribution = await loadAttributionSnapshot(shopId, payload);
+    const enrichedPayload = { ...attribution, ...payload };
     const dedupKey = `dedup:${shopId}:${eventName}:${eventId}`;
     const ttlSeconds = eventName === 'Purchase' ? 30 * 24 * 60 * 60 : 7 * 24 * 60 * 60;
 
     const isNew = await redis.set(dedupKey, '1', 'EX', ttlSeconds, 'NX');
+    await saveAttributionSnapshot(shopId, enrichedPayload);
     if (!isNew && eventName !== 'Purchase') {
         return res.status(200).json({ success: true, deduplicated: true });
     }
 
-    const userData = buildUserData(req, payload);
+    const userData = buildUserData(req, enrichedPayload);
     const fbEventData = {
         event_name: eventName,
-        event_time: resolveEventTime(payload),
+        event_time: resolveEventTime(enrichedPayload),
         action_source: 'website',
         event_id: eventId,
-        event_source_url: firstPresent(payload.source_url, payload.url, req.headers.referer),
+        event_source_url: firstPresent(enrichedPayload.source_url, enrichedPayload.url, req.headers.referer),
         user_data: userData,
-        custom_data: buildCustomData(payload),
+        custom_data: buildCustomData(enrichedPayload),
         _emq_estimate: calculateEMQ(userData),
         _quality: { missing_match_signals: missingMatchSignals(userData) },
-        _platform_data: buildPlatformData(payload),
+        _platform_data: buildPlatformData(enrichedPayload),
         _duplicate_candidate: !isNew,
+        _attribution_enriched: Object.keys(attribution).length > 0,
         _received_at: Date.now(),
     };
 
@@ -309,6 +482,7 @@ cron.schedule(config.batchCron, async () => {
                 continue;
             }
 
+            const mergedReadyEvents = mergeReadyEvents(readyEvents);
             const shopIds = [];
             const eventNames = [];
             const eventIds = [];
@@ -316,7 +490,7 @@ cron.schedule(config.batchCron, async () => {
             const emqs = [];
             const payloads = [];
 
-            readyEvents.forEach(event => {
+            mergedReadyEvents.forEach(event => {
                 const purePayload = { ...event };
                 delete purePayload._emq_estimate;
                 shopIds.push(shop.id);
@@ -493,7 +667,7 @@ app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
 app.get('/api/admin/logs', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
         SELECT e.id, s.shop_domain, e.event_name, e.event_id, e.status, e.emq_estimate,
-               e.fb_response, e.timestamp
+               e.request_payload->'_quality' AS quality, e.fb_response, e.timestamp
         FROM event_store e
         JOIN shops s ON e.shop_id = s.id
         ORDER BY e.id DESC
