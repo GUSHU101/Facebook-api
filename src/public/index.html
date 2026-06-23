@@ -342,7 +342,7 @@ function mapTikTokProperties(customData) {
     });
 }
 
-async function sendDualChannelEvent(metaEventName, event, customData = {}, forcedEventId) {
+async function sendDualChannelEvent(metaEventName, event, customData = {}, forcedEventId = undefined) {
     const eventId = forcedEventId || event.id;
     const context = event.context || {};
     const documentInfo = context.document || {};
