@@ -1,5 +1,6 @@
 # CAPI SaaS Data Hub
 
+
 Private VPS service for Shopify Web Pixel, Meta Pixel, Meta Conversions API, TikTok Pixel and TikTok Events API tracking.
 
 Baota/aaPanel is optional. For a clean Ubuntu VPS, use the one-command deployment guide: [DEPLOY_UBUNTU_ONECLICK.md](DEPLOY_UBUNTU_ONECLICK.md). For Baota-based operations, use [DEPLOY_BAOTA_UBUNTU.md](DEPLOY_BAOTA_UBUNTU.md). Before uploading to GitHub, see [GITHUB_RELEASE_CHECKLIST.md](GITHUB_RELEASE_CHECKLIST.md).
@@ -168,3 +169,29 @@ The unit tests cover Shopify order-to-Purchase conversion, TikTok Events API pay
 11. Watch the admin "日志与死信" page:
     - Low EMQ usually means missing email/phone/fbp/fbc/address.
     - DLQ means token, permission, rate limit, or platform API issues need action.
+   
+    - shopify权限
+    - | 你列的权限 | 建议 | 原因 |
+|---|---|---|
+| `read_orders` | 需要 | 读取订单金额、币种、商品、客户信息，用于 `Purchase` 和 webhook |
+| `write_orders` | 不需要 | 项目不创建/修改订单 |
+| `read_assigned_fulfillment_orders` | 不需要 | 项目不处理履约/发货 |
+| `write_assigned_fulfillment_orders` | 不需要 | 项目不创建/修改履约单 |
+| `read_checkouts` | 不需要 | 加购、发起结账由 Shopify Customer Events Pixel 捕获，不靠 Admin API 读取 |
+| `write_checkouts` | 不需要 | 项目不创建/修改 checkout |
+| `read_draft_orders` | 不需要 | 项目不读取草稿订单 |
+| `write_draft_orders` | 不需要 | 项目不创建/修改草稿订单 |
+| `read_customers` | 可选 | 若 Shopify 要求客户数据权限，可开启；有助于客户匹配数据完整性 |
+| `write_customers` | 不需要 | 项目不创建/修改客户 |
+| `read_products` | 不需要 | Pixel/webhook 已带商品 ID，项目不需要额外读商品 |
+| `write_products` | 不需要 | 项目不创建/修改商品 |
+| `read_merchant_managed_fulfillment_orders` | 不需要 | 项目不处理商家履约订单 |
+| `write_merchant_managed_fulfillment_orders` | 不需要 | 项目不创建/修改履约订单 |
+| `read_price_rules` | 不需要 | 项目不读取 Shopify 价格规则；订单事件里已有实际成交金额 |
+| `write_price_rules` | 不需要 | 项目不创建/修改价格规则 |
+| `read_discounts` | 不需要 | 项目不读取折扣规则；订单 webhook 会包含最终成交信息 |
+| `write_discounts` | 不需要 | 项目不创建/修改折扣 |
+| `read_markets` | 不需要 | 项目不上 Shopify 查询市场/汇率配置 |
+| `read_locations` | 不需要 | 项目不根据库存地点或门店位置处理归因 |
+| `read_online_store_navigation` | 不需要 | 项目不读取网站导航 |
+| `read_online_store_pages` | 不需要 | 项目不读取页面内容 |
