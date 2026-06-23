@@ -130,6 +130,8 @@ location / {
 
 如果你想直接替换宝塔「网站 -> 配置文件」里的整份 Nginx 配置，可以使用下面这个完整模板。这个模板只监听 `80` 和 `8443`，不会使用 `443`：
 
+仓库里也提供了可直接复制的模板文件：`deploy/baota-nginx-non443.conf.template`。使用时把 `__DOMAIN__`、`__PROJECT_DIR__`、`__BT_SITE_NAME__`、`__PUBLIC_PORT__`、`__INTERNAL_PORT__` 替换成你自己的值。
+
 ```nginx
 server
 {

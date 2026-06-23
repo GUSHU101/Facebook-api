@@ -1,0 +1,90 @@
+# Baota / aaPanel Nginx template for this project.
+# Purpose: use HTTPS on a non-443 public port, for example 8443.
+#
+# Replace these placeholders before using:
+#   __DOMAIN__        -> nestworks.com.au
+#   __PROJECT_DIR__   -> /www/wwwroot/Facebook-api-main
+#   __BT_SITE_NAME__  -> Facebook_api_main
+#   __PUBLIC_PORT__   -> 8443
+#   __INTERNAL_PORT__ -> 3000
+#
+# Important:
+#   - Do not add "listen 443 ssl;".
+#   - Do not add "listen 443 quic;".
+#   - Open __PUBLIC_PORT__ in your server firewall/security group.
+#   - Node.js keeps using __INTERNAL_PORT__ internally.
+
+server
+{
+    listen 80;
+    server_name __DOMAIN__;
+    index index.html index.htm default.htm default.html;
+
+    include /www/server/panel/vhost/nginx/extension/__BT_SITE_NAME__/*.conf;
+    include /www/server/panel/vhost/nginx/well-known/__BT_SITE_NAME__.conf;
+
+    location /.well-known/ {
+        root __PROJECT_DIR__;
+    }
+
+    location / {
+        return 301 https://$host:__PUBLIC_PORT__$request_uri;
+    }
+
+    access_log  /www/wwwlogs/__BT_SITE_NAME___80.log;
+    error_log   /www/wwwlogs/__BT_SITE_NAME___80.error.log;
+}
+
+server
+{
+    listen __PUBLIC_PORT__ ssl http2;
+    server_name __DOMAIN__;
+    index index.html index.htm default.htm default.html;
+
+    include /www/server/panel/vhost/nginx/extension/__BT_SITE_NAME__/*.conf;
+
+    ssl_certificate     /www/server/panel/vhost/cert/__BT_SITE_NAME__/fullchain.pem;
+    ssl_certificate_key /www/server/panel/vhost/cert/__BT_SITE_NAME__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size 10m;
+
+    location ~* (\.user.ini|\.htaccess|\.htpasswd|\.env.*|\.project|\.bashrc|\.bash_profile|\.bash_logout|\.DS_Store|\.gitignore|\.gitattributes|LICENSE|README\.md|CLAUDE\.md|CHANGELOG\.md|CHANGELOG|CONTRIBUTING\.md|TODO\.md|FAQ\.md|composer\.json|composer\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.\w+~|\.swp|\.swo|\.bak(up)?|\.old|\.tmp|\.temp|\.log|\.sql(\.gz)?|docker-compose\.yml|docker\.env|Dockerfile)$
+    {
+        return 404;
+    }
+
+    location ~* /(\.git|\.svn|\.bzr|\.vscode|\.claude|\.idea|\.ssh|\.github|\.npm|\.yarn|\.pnpm|\.cache|\.husky|\.turbo|\.next|\.nuxt|node_modules|runtime|backups)/ {
+        return 404;
+    }
+
+    location /.well-known/ {
+        root __PROJECT_DIR__;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:__INTERNAL_PORT__;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Port __PUBLIC_PORT__;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_connect_timeout 30s;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 30s;
+    }
+
+    access_log  /www/wwwlogs/__BT_SITE_NAME__.log;
+    error_log   /www/wwwlogs/__BT_SITE_NAME__.error.log;
+}
