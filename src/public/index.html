@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CAPI SaaS Data Hub</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body class="bg-slate-100 text-slate-900 font-sans">
+    <div id="app" class="min-h-screen">
+        <header class="bg-slate-950 text-white">
+            <div class="max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+                <h1 class="text-lg font-semibold tracking-wide">CAPI SaaS Data Hub</h1>
+                <nav class="flex flex-wrap gap-2 text-sm">
+                    <button v-for="item in tabs" :key="item.key" @click="tab = item.key" class="px-3 py-2 rounded-md hover:bg-white/10" :class="tab === item.key ? 'bg-white text-slate-950' : ''">{{ item.label }}</button>
+                </nav>
+                <a href="/admin/queue" target="_blank" class="px-3 py-2 rounded-md bg-cyan-500 text-slate-950 text-sm font-semibold">队列面板</a>
+            </div>
+        </header>
+
+        <main class="max-w-7xl mx-auto px-6 py-6">
+            <section v-if="tab === 'deploy'" class="space-y-5">
+                <div class="grid md:grid-cols-4 gap-4">
+                    <label class="block">
+                        <span class="text-sm font-medium">Shopify 域名</span>
+                        <input v-model="currentShop" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="your-store.myshopify.com">
+                    </label>
+                    <label class="block">
+                        <span class="text-sm font-medium">Meta Pixel ID</span>
+                        <input v-model="currentPixelId" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="1234567890">
+                    </label>
+                    <label class="block">
+                        <span class="text-sm font-medium">TikTok Pixel ID</span>
+                        <input v-model="currentTikTokPixelId" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="可选">
+                    </label>
+                    <label class="block">
+                        <span class="text-sm font-medium">API 地址</span>
+                        <input v-model="apiDomain" class="mt-1 w-full border rounded-md p-2 font-mono">
+                    </label>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                    <button @click="copyCode" class="bg-slate-950 text-white rounded-md px-4 py-2">复制追踪代码</button>
+                    <code class="bg-white border rounded-md px-3 py-2 text-sm">Webhook: {{ apiDomain }}/api/webhook/orders/paid</code>
+                </div>
+                <textarea readonly :value="generatedCode" class="w-full h-[620px] p-4 rounded-md bg-slate-950 text-emerald-300 font-mono text-xs leading-5 border border-slate-800"></textarea>
+            </section>
+
+            <section v-if="tab === 'shops'" class="space-y-5">
+                <div class="grid md:grid-cols-[1fr_1fr_auto] gap-3 bg-white border rounded-lg p-4">
+                    <input v-model="newShop.shop_domain" placeholder="your-store.myshopify.com" class="border rounded-md p-2 font-mono">
+                    <input v-model="newShop.app_secret" placeholder="Shopify Webhook Secret" class="border rounded-md p-2 font-mono">
+                    <button @click="addShop" class="bg-slate-950 text-white rounded-md px-5 py-2 font-medium">保存店铺</button>
+                </div>
+                <table class="w-full bg-white border rounded-lg overflow-hidden text-sm">
+                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">店铺</th><th class="p-3">状态</th><th class="p-3">创建时间</th></tr></thead>
+                    <tbody>
+                        <tr v-for="s in shops" :key="s.id" class="border-t">
+                            <td class="p-3 font-mono font-semibold">{{ s.shop_domain }}</td>
+                            <td class="p-3">{{ s.status }}</td>
+                            <td class="p-3">{{ formatTime(s.created_at) }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <section v-if="tab === 'pixels'" class="space-y-5">
+                <div class="grid md:grid-cols-2 gap-3 bg-white border rounded-lg p-4">
+                    <select v-model="newPixel.shop_id" class="border rounded-md p-2 md:col-span-2">
+                        <option value="">选择店铺</option>
+                        <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
+                    </select>
+                    <select v-model="newPixel.platform" class="border rounded-md p-2">
+                        <option value="facebook">Facebook / Meta</option>
+                        <option value="tiktok">TikTok</option>
+                    </select>
+                    <input v-model="newPixel.name" placeholder="备注名称" class="border rounded-md p-2">
+                    <input v-model="newPixel.pixel_id" placeholder="Pixel / Dataset ID / TikTok Pixel Code" class="border rounded-md p-2 font-mono">
+                    <input v-model="newPixel.access_token" type="password" placeholder="Meta System Token / TikTok Access Token" class="border rounded-md p-2 font-mono">
+                    <input v-model="newPixel.test_event_code" placeholder="Test Event Code，可留空" class="border rounded-md p-2 font-mono">
+                    <button @click="addPixel" class="bg-slate-950 text-white rounded-md px-5 py-2 font-medium md:col-span-2">保存 Pixel 路由</button>
+                </div>
+                <table class="w-full bg-white border rounded-lg overflow-hidden text-sm">
+                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">店铺</th><th class="p-3">平台</th><th class="p-3">备注</th><th class="p-3">Pixel / Dataset</th><th class="p-3">测试码</th><th class="p-3">操作</th></tr></thead>
+                    <tbody>
+                        <tr v-for="p in pixels" :key="p.id" class="border-t">
+                            <td class="p-3 font-mono">{{ p.shop_domain }}</td>
+                            <td class="p-3 uppercase font-semibold">{{ p.platform }}</td>
+                            <td class="p-3">{{ p.name }}</td>
+                            <td class="p-3 font-mono">{{ p.pixel_id }}</td>
+                            <td class="p-3 font-mono">{{ p.test_event_code || '-' }}</td>
+                            <td class="p-3"><button @click="deletePixel(p.id)" class="text-red-600 font-medium">删除</button></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <section v-if="tab === 'logs'" class="space-y-5">
+                <div class="grid md:grid-cols-4 gap-3">
+                    <div class="bg-white border rounded-lg p-4">
+                        <div class="text-xs text-slate-500">24h 事件</div>
+                        <div class="text-2xl font-semibold">{{ summary.last24h?.total_events || 0 }}</div>
+                    </div>
+                    <div class="bg-white border rounded-lg p-4">
+                        <div class="text-xs text-slate-500">平均 EMQ</div>
+                        <div class="text-2xl font-semibold">{{ summary.last24h?.avg_emq || '-' }}</div>
+                    </div>
+                    <div class="bg-white border rounded-lg p-4">
+                        <div class="text-xs text-slate-500">死信</div>
+                        <div class="text-2xl font-semibold text-red-600">{{ summary.dead_letters || 0 }}</div>
+                    </div>
+                    <div class="bg-white border rounded-lg p-4">
+                        <div class="text-xs text-slate-500">队列等待</div>
+                        <div class="text-2xl font-semibold">{{ summary.queue?.waiting || 0 }}</div>
+                    </div>
+                </div>
+                <div class="bg-white border rounded-lg p-4 text-sm">
+                    <div class="font-semibold mb-2">平台路由</div>
+                    <div class="flex flex-wrap gap-2">
+                        <span v-for="item in summary.pixels_by_platform || []" :key="item.platform" class="px-3 py-1 rounded-md bg-slate-100 font-mono">{{ item.platform }}: {{ item.count }}</span>
+                        <span v-if="!summary.pixels_by_platform?.length" class="text-slate-500">暂无路由</span>
+                    </div>
+                </div>
+                <div class="flex flex-wrap gap-3">
+                    <button @click="fetchAll" class="bg-slate-950 text-white rounded-md px-4 py-2">刷新全部</button>
+                    <button @click="fetchDlq" class="bg-red-600 text-white rounded-md px-4 py-2">刷新死信</button>
+                    <button v-if="dlq.length" @click="replayDlq" class="bg-emerald-600 text-white rounded-md px-4 py-2">重放死信 {{ dlq.length }}</button>
+                </div>
+
+                <table v-if="dlq.length" class="w-full bg-red-50 border border-red-200 rounded-lg overflow-hidden text-xs">
+                    <thead class="bg-red-200 text-left"><tr><th class="p-2">店铺</th><th class="p-2">失败时间</th><th class="p-2">原因</th></tr></thead>
+                    <tbody>
+                        <tr v-for="d in dlq" :key="d.id" class="border-t border-red-200">
+                            <td class="p-2 font-mono">{{ d.shop_domain }}</td>
+                            <td class="p-2">{{ formatTime(d.failed_at) }}</td>
+                            <td class="p-2 font-mono text-red-700">{{ d.error_reason }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <table class="w-full bg-white border rounded-lg overflow-hidden text-xs">
+                    <thead class="bg-slate-200 text-left"><tr><th class="p-2">时间</th><th class="p-2">店铺</th><th class="p-2">事件</th><th class="p-2">EMQ</th><th class="p-2">状态</th><th class="p-2">Meta 响应</th></tr></thead>
+                    <tbody>
+                        <tr v-for="log in logs" :key="log.id" class="border-t">
+                            <td class="p-2">{{ formatTime(log.timestamp) }}</td>
+                            <td class="p-2 font-mono">{{ log.shop_domain }}</td>
+                            <td class="p-2"><b>{{ log.event_name }}</b><br><span class="font-mono text-slate-500">{{ log.event_id }}</span></td>
+                            <td class="p-2 font-semibold">{{ log.emq_estimate || '-' }}/10</td>
+                            <td class="p-2 font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
+                            <td class="p-2 font-mono text-slate-500">{{ summarizeResponse(log.fb_response) }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+        createApp({
+            data() {
+                return {
+                    tab: 'deploy',
+                    tabs: [
+                        { key: 'deploy', label: '追踪代码' },
+                        { key: 'shops', label: '店铺' },
+                        { key: 'pixels', label: 'Pixel 路由' },
+                        { key: 'logs', label: '日志与死信' },
+                    ],
+                    shops: [],
+                    pixels: [],
+                    logs: [],
+                    dlq: [],
+                    summary: {},
+                    apiDomain: '',
+                    currentShop: 'your-store.myshopify.com',
+                    currentPixelId: 'YOUR_PIXEL_ID',
+                    currentTikTokPixelId: '',
+                    newShop: { shop_domain: '', app_secret: '' },
+                    newPixel: { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', test_event_code: '' },
+                };
+            },
+            computed: {
+                generatedCode() {
+                    return `// CAPI SaaS Hub - Shopify Web Pixel + Meta Pixel + Meta CAPI
+const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
+const SHOP_DOMAIN = "${this.currentShop}";
+const FB_PIXEL_ID = "${this.currentPixelId}";
+const TIKTOK_PIXEL_ID = "${this.currentTikTokPixelId}";
+
+!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
+document,'script','https://connect.facebook.net/en_US/fbevents.js');
+
+fbq('init', FB_PIXEL_ID);
+
+if (TIKTOK_PIXEL_ID) {
+    !function (w, d, t) {
+        w.TiktokAnalyticsObject = t;
+        var ttq = w[t] = w[t] || [];
+        ttq.methods = ['page','track','identify','instances','debug','on','off','once','ready','alias','group','enableCookie','disableCookie'];
+        ttq.setAndDefer = function(t, e) { t[e] = function() { t.push([e].concat(Array.prototype.slice.call(arguments, 0))); }; };
+        for (var i = 0; i < ttq.methods.length; i++) ttq.setAndDefer(ttq, ttq.methods[i]);
+        ttq.load = function(e) {
+            var n = 'https://analytics.tiktok.com/i18n/pixel/events.js';
+            ttq._i = ttq._i || {};
+            ttq._i[e] = [];
+            ttq._i[e]._u = n;
+            ttq._t = ttq._t || {};
+            ttq._t[e] = +new Date;
+            ttq._o = ttq._o || {};
+            ttq._o[e] = {};
+            var s = d.createElement('script');
+            s.type = 'text/javascript';
+            s.async = true;
+            s.src = n + '?sdkid=' + e + '&lib=' + t;
+            var a = d.getElementsByTagName('script')[0];
+            a.parentNode.insertBefore(s, a);
+        };
+        ttq.load(TIKTOK_PIXEL_ID);
+    }(window, document, 'ttq');
+}
+
+async function getCookieValue(name) {
+    try {
+        if (typeof browser !== 'undefined' && browser.cookie?.get) {
+            return await browser.cookie.get(name);
+        }
+    } catch (error) {}
+    const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return match ? decodeURIComponent(match[2]) : undefined;
+}
+
+async function setCookieValue(name, value, days = 90) {
+    if (!value) return;
+    try {
+        if (typeof browser !== 'undefined' && browser.cookie?.set) {
+            await browser.cookie.set(name, value, { expires: days });
+            return;
+        }
+    } catch (error) {}
+    const maxAge = days * 24 * 60 * 60;
+    document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=' + maxAge + '; SameSite=Lax';
+}
+
+function moneyAmount(value) {
+    const amount = Number(value?.amount ?? value);
+    return Number.isFinite(amount) ? amount : 0;
+}
+
+function moneyCurrency(value, fallback = 'USD') {
+    return value?.currencyCode || value?.currency || fallback;
+}
+
+function lineItemToContent(item) {
+    const variant = item.variant || item.merchandise || {};
+    const product = item.product || variant.product || {};
+    const quantity = Number(item.quantity || 1);
+    const price = moneyAmount(variant.price || item.finalLinePrice || item.cost?.totalAmount);
+    return {
+        id: String(variant.id || product.id || item.id || '').replace('gid://shopify/ProductVariant/', ''),
+        quantity,
+        item_price: price,
+    };
+}
+
+function compact(object) {
+    return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined && value !== null && value !== ''));
+}
+
+function getUrlParam(name, href) {
+    try {
+        return new URL(href || window.location.href).searchParams.get(name) || undefined;
+    } catch (error) {
+        return undefined;
+    }
+}
+
+async function getOrCreateFbp() {
+    const existing = await getCookieValue('_fbp');
+    if (existing) return existing;
+    const generated = 'fb.1.' + Date.now() + '.' + Math.floor(Math.random() * 10000000000);
+    await setCookieValue('_fbp', generated);
+    return generated;
+}
+
+async function getOrCreateFbc(href) {
+    const existing = await getCookieValue('_fbc');
+    if (existing) return existing;
+    const fbclid = getUrlParam('fbclid', href);
+    if (!fbclid) return undefined;
+    const generated = 'fb.1.' + Date.now() + '.' + fbclid;
+    await setCookieValue('_fbc', generated);
+    return generated;
+}
+
+async function getOrCreateTtp() {
+    const existing = await getCookieValue('_ttp');
+    if (existing) return existing;
+    const generated = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    await setCookieValue('_ttp', generated);
+    return generated;
+}
+
+async function rememberTtclid(href) {
+    const fromUrl = getUrlParam('ttclid', href);
+    if (fromUrl) {
+        await setCookieValue('ttclid', fromUrl);
+        return fromUrl;
+    }
+    return getCookieValue('ttclid');
+}
+
+function mapTikTokEvent(metaEventName) {
+    return {
+        Purchase: 'CompletePayment',
+        AddToCart: 'AddToCart',
+        InitiateCheckout: 'InitiateCheckout',
+        AddPaymentInfo: 'AddPaymentInfo',
+        ViewContent: 'ViewContent',
+        Search: 'Search',
+        PageView: 'PageView',
+    }[metaEventName] || metaEventName;
+}
+
+function mapTikTokProperties(customData) {
+    return compact({
+        value: customData.value,
+        currency: customData.currency,
+        content_type: customData.content_type,
+        content_name: customData.content_name,
+        content_category: customData.content_category,
+        query: customData.search_string,
+        contents: (customData.contents || []).map(item => compact({
+            content_id: item.id || item.content_id,
+            quantity: item.quantity,
+            price: item.item_price || item.price,
+            content_type: customData.content_type,
+        })),
+    });
+}
+
+async function sendDualChannelEvent(metaEventName, event, customData = {}, forcedEventId) {
+    const eventId = forcedEventId || event.id;
+    const context = event.context || {};
+    const documentInfo = context.document || {};
+    const navigatorInfo = context.navigator || {};
+    const locationInfo = documentInfo.location || {};
+    const checkout = event.data?.checkout || {};
+    const customer = event.data?.customer || checkout.order?.customer || {};
+    const address = checkout.billingAddress || checkout.shippingAddress || customer.defaultAddress || {};
+    const fbp = await getOrCreateFbp();
+    const fbc = await getOrCreateFbc(locationInfo.href);
+    const ttp = await getOrCreateTtp();
+    const ttclid = await rememberTtclid(locationInfo.href);
+
+    const standardEvents = new Set([
+        'PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase', 'Search',
+    ]);
+    const pixelMethod = standardEvents.has(metaEventName) ? 'track' : 'trackCustom';
+    fbq(pixelMethod, metaEventName, customData, { eventID: eventId });
+    if (window.ttq) {
+        const tiktokEvent = mapTikTokEvent(metaEventName);
+        if (tiktokEvent === 'PageView') {
+            ttq.page({ event_id: eventId });
+        } else {
+            ttq.track(tiktokEvent, mapTikTokProperties(customData), { event_id: eventId });
+        }
+    }
+
+    fetch(CAPI_HUB_URL, {
+        method: 'POST',
+        keepalive: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(compact({
+            shop_domain: SHOP_DOMAIN,
+            event_name: metaEventName,
+            event_id: eventId,
+            timestamp: event.timestamp,
+            source_url: locationInfo.href,
+            user_agent: navigatorInfo.userAgent,
+            fbp,
+            fbc,
+            ttp,
+            ttclid,
+            email: customer.email || checkout.email,
+            phone: customer.phone || checkout.phone || address.phone,
+            firstName: customer.firstName || address.firstName,
+            lastName: customer.lastName || address.lastName,
+            city: address.city,
+            state: address.provinceCode,
+            zip: address.zip,
+            country: address.countryCode,
+            external_id: event.clientId || customer.id || checkout.order?.customer?.id,
+            ...customData,
+        })),
+    }).catch(console.error);
+}
+
+analytics.subscribe('page_viewed', event => {
+    sendDualChannelEvent('PageView', event);
+});
+
+analytics.subscribe('cart_viewed', event => {
+    const cart = event.data?.cart || {};
+    const lines = cart.lines || cart.cartLines || [];
+    const contents = lines.map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('CartView', event, {
+        value: moneyAmount(cart.cost?.totalAmount || cart.totalQuantity),
+        currency: moneyCurrency(cart.cost?.totalAmount),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    });
+});
+
+analytics.subscribe('collection_viewed', event => {
+    const collection = event.data?.collection || {};
+    sendDualChannelEvent('CollectionView', event, {
+        content_category: collection.title,
+        content_name: collection.handle || collection.id,
+    });
+});
+
+analytics.subscribe('product_viewed', event => {
+    const variant = event.data?.productVariant || {};
+    const product = event.data?.product || variant.product || {};
+    const contentId = String(variant.id || product.id || '').replace('gid://shopify/ProductVariant/', '');
+    sendDualChannelEvent('ViewContent', event, {
+        value: moneyAmount(variant.price),
+        currency: moneyCurrency(variant.price),
+        content_ids: contentId ? [contentId] : undefined,
+        contents: contentId ? [{ id: contentId, quantity: 1, item_price: moneyAmount(variant.price) }] : undefined,
+        content_type: 'product',
+        content_name: product.title || variant.title,
+    });
+});
+
+analytics.subscribe('product_added_to_cart', event => {
+    const line = event.data?.cartLine || {};
+    const content = lineItemToContent(line);
+    sendDualChannelEvent('AddToCart', event, {
+        value: moneyAmount(line.cost?.totalAmount),
+        currency: moneyCurrency(line.cost?.totalAmount),
+        content_ids: content.id ? [content.id] : undefined,
+        contents: content.id ? [content] : undefined,
+        content_type: 'product',
+        num_items: content.quantity,
+    });
+});
+
+analytics.subscribe('product_removed_from_cart', event => {
+    const line = event.data?.cartLine || {};
+    const content = lineItemToContent(line);
+    sendDualChannelEvent('RemoveFromCart', event, {
+        value: moneyAmount(line.cost?.totalAmount),
+        currency: moneyCurrency(line.cost?.totalAmount),
+        content_ids: content.id ? [content.id] : undefined,
+        contents: content.id ? [content] : undefined,
+        content_type: 'product',
+        num_items: content.quantity,
+    });
+});
+
+analytics.subscribe('checkout_started', event => {
+    const checkout = event.data?.checkout || {};
+    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('InitiateCheckout', event, {
+        value: moneyAmount(checkout.totalPrice),
+        currency: moneyCurrency(checkout.totalPrice),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    }, checkout.token || event.id);
+});
+
+analytics.subscribe('checkout_contact_info_submitted', event => {
+    const checkout = event.data?.checkout || {};
+    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('CheckoutContactInfoSubmitted', event, {
+        value: moneyAmount(checkout.totalPrice),
+        currency: moneyCurrency(checkout.totalPrice),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    }, checkout.token || event.id);
+});
+
+analytics.subscribe('checkout_address_info_submitted', event => {
+    const checkout = event.data?.checkout || {};
+    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('CheckoutAddressInfoSubmitted', event, {
+        value: moneyAmount(checkout.totalPrice),
+        currency: moneyCurrency(checkout.totalPrice),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    }, checkout.token || event.id);
+});
+
+analytics.subscribe('checkout_shipping_info_submitted', event => {
+    const checkout = event.data?.checkout || {};
+    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('CheckoutShippingInfoSubmitted', event, {
+        value: moneyAmount(checkout.totalPrice),
+        currency: moneyCurrency(checkout.totalPrice),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    }, checkout.token || event.id);
+});
+
+analytics.subscribe('payment_info_submitted', event => {
+    const checkout = event.data?.checkout || {};
+    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('AddPaymentInfo', event, {
+        value: moneyAmount(checkout.totalPrice),
+        currency: moneyCurrency(checkout.totalPrice),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    }, checkout.token || event.id);
+});
+
+analytics.subscribe('checkout_completed', event => {
+    const checkout = event.data?.checkout || {};
+    const contents = (checkout.lineItems || []).map(lineItemToContent).filter(item => item.id);
+    sendDualChannelEvent('Purchase', event, {
+        value: moneyAmount(checkout.totalPrice),
+        currency: moneyCurrency(checkout.totalPrice),
+        content_ids: contents.map(item => item.id),
+        contents,
+        content_type: 'product',
+        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+        order_id: checkout.order?.id || checkout.order?.name,
+    }, checkout.token || checkout.order?.id || event.id);
+});
+
+analytics.subscribe('search_submitted', event => {
+    const query = event.data?.searchResult?.query || event.data?.search?.query;
+    sendDualChannelEvent('Search', event, { search_string: query });
+});
+
+analytics.subscribe('alert_displayed', event => {
+    const alert = event.data?.alert || {};
+    sendDualChannelEvent('ShopifyAlertDisplayed', event, {
+        content_name: alert.message || alert.type,
+        content_category: 'shopify_alert',
+    });
+});
+
+analytics.subscribe('ui_extension_errored', event => {
+    const error = event.data?.error || {};
+    sendDualChannelEvent('ShopifyUiExtensionErrored', event, {
+        content_name: error.message || error.name,
+        content_category: 'shopify_ui_extension',
+    });
+});`;
+                },
+            },
+            methods: {
+                async api(path, options = {}) {
+                    const response = await fetch(path, options);
+                    if (!response.ok) throw new Error((await response.json()).error || response.statusText);
+                    return response.json();
+                },
+                async fetchAll() {
+                    await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchDlq(), this.fetchSummary()]);
+                },
+                async fetchShops() { this.shops = await this.api('/api/admin/shops'); },
+                async fetchPixels() { this.pixels = await this.api('/api/admin/pixels'); },
+                async fetchLogs() { this.logs = await this.api('/api/admin/logs'); },
+                async fetchDlq() { this.dlq = await this.api('/api/admin/dlq'); },
+                async fetchSummary() { this.summary = await this.api('/api/admin/summary'); },
+                async replayDlq() {
+                    if (!confirm('确认重放当前所有失败事件？')) return;
+                    await this.api('/api/admin/dlq/replay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                    await this.fetchAll();
+                },
+                async addShop() {
+                    await this.api('/api/admin/shops', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.newShop) });
+                    this.newShop = { shop_domain: '', app_secret: '' };
+                    await this.fetchShops();
+                },
+                async addPixel() {
+                    await this.api('/api/admin/pixels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.newPixel) });
+                    this.newPixel = { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', test_event_code: '' };
+                    await this.fetchPixels();
+                },
+                async copyCode() {
+                    await navigator.clipboard.writeText(this.generatedCode);
+                    alert('追踪代码已复制');
+                },
+                async deletePixel(id) {
+                    if (!confirm('确认删除这个 Pixel 路由？')) return;
+                    await this.api('/api/admin/pixels/' + id, { method: 'DELETE' });
+                    await this.fetchPixels();
+                },
+                formatTime(value) {
+                    return value ? new Date(value).toLocaleString() : '-';
+                },
+                statusClass(status) {
+                    return {
+                        SUCCESS: 'text-emerald-600',
+                        PENDING: 'text-amber-600',
+                        FAILED: 'text-red-600',
+                        PARTIAL_FAILED: 'text-orange-600',
+                    }[status] || 'text-slate-700';
+                },
+                summarizeResponse(value) {
+                    if (!value) return 'Waiting';
+                    const deliveries = value.deliveries || [];
+                    if (deliveries.length) return deliveries.map(item => `${item.pixel_id}:${item.status}`).join(', ');
+                    return value.fbtrace_id || JSON.stringify(value).slice(0, 120);
+                },
+            },
+            mounted() {
+                this.apiDomain = window.location.origin;
+                this.fetchAll().catch(error => alert(error.message));
+            },
+        }).mount('#app');
+    </script>
+</body>
+</html>
