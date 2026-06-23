@@ -422,6 +422,12 @@ function resolveEventTime(payload) {
     return Math.floor(Date.now() / 1000);
 }
 
+function buildQueueJobId(shopId, dbEvents) {
+    const ids = dbEvents.map(event => String(event.id)).sort().join('|');
+    const digest = crypto.createHash('sha256').update(`${shopId}|${ids}`).digest('hex').slice(0, 32);
+    return `send-${shopId}-${digest}`;
+}
+
 async function queueForOutbox(req, res, payload, shopId) {
     const eventName = requireString(payload.event_name, 'event_name');
     const proposedEventId = normalizeEventId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`;
@@ -609,7 +615,7 @@ cron.schedule(config.batchCron, async () => {
 
                 const eventsToSend = validDbEvents.filter(event => event.status !== 'SUCCESS');
                 if (eventsToSend.length > 0) {
-                    const jobId = `send:${shop.id}:${eventsToSend.map(event => event.id).sort((left, right) => Number(left) - Number(right)).join(':')}`;
+                    const jobId = buildQueueJobId(shop.id, eventsToSend);
                     await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend }, { jobId });
                 }
 
