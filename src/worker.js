@@ -62,8 +62,8 @@ async function refreshDbEvents(dbEvents) {
     const latestById = new Map(rows.map(row => [String(row.id), row]));
     return dbEvents.map(event => {
         const latest = latestById.get(String(event.id));
-        return latest ? { ...event, status: latest.status, fb_response: latest.fb_response } : event;
-    });
+        return latest ? { ...event, status: latest.status, fb_response: latest.fb_response } : null;
+    }).filter(Boolean);
 }
 
 async function insertDeadLetter(shopId, dbEvents, reason) {
@@ -163,7 +163,7 @@ const worker = new Worker('capi-events', async job => {
     if (pixels.length === 0) {
         const reason = 'No pixels configured for shop';
         await updateEvents(idsToUpdate, 'FAILED', { error: reason });
-        await insertDeadLetter(shopId, dbEvents, reason);
+        await insertDeadLetter(shopId, sendableDbEvents, reason);
         return;
     }
 

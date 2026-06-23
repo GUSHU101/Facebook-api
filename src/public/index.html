@@ -723,10 +723,10 @@ analytics.subscribe('ui_extension_errored', event => {
                 },
                 async clearLogs() {
                     const scope = this.selectedShopId ? '当前店铺' : '全部店铺';
-                    if (!confirm(`确认清空${scope}的事件日志和去重缓存？此操作不会删除死信记录。`)) return;
+                    if (!confirm(`确认清空${scope}的事件日志、待发送任务和去重缓存？此操作不会删除死信记录。`)) return;
                     const result = await this.api(this.shopScopedPath('/api/admin/logs'), { method: 'DELETE' });
                     await this.fetchOperationalData();
-                    alert(`已清空 ${result.deleted || 0} 条事件日志`);
+                    alert(`已清空 ${result.deleted || 0} 条事件日志，移除 ${result.queued_jobs_removed || 0} 个待发送任务`);
                 },
                 async addShop() {
                     await this.api('/api/admin/shops', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.newShop) });

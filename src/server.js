@@ -257,6 +257,22 @@ async function releaseRedisLock(key, token) {
     await redis.eval(script, 1, key, token);
 }
 
+async function removeQueuedSendJobsForShop(shopId = null) {
+    const jobs = await capiQueue.getJobs(['waiting', 'delayed', 'paused'], 0, -1);
+    let removed = 0;
+    for (const job of jobs) {
+        if (job.name !== 'send-fb-batch') continue;
+        if (shopId && Number(job.data?.shopId) !== Number(shopId)) continue;
+        try {
+            await job.remove();
+            removed += 1;
+        } catch (error) {
+            // Active jobs cannot be removed here; the worker re-checks event_store before sending.
+        }
+    }
+    return removed;
+}
+
 function buildUserData(req, payload) {
     const email = firstPresent(payload.email, payload.customer_email);
     const phone = firstPresent(payload.phone, payload.customer_phone);
@@ -795,8 +811,15 @@ app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
         deleteKeysByPattern(shopId ? `dedup:${shopId}:*` : 'dedup:*'),
         deleteKeysByPattern(shopId ? `dedup-alias:${shopId}:*` : 'dedup-alias:*'),
     ]);
+    const queuedJobsRemoved = await removeQueuedSendJobsForShop(shopId);
 
-    res.json({ success: true, deleted: rowCount, scope: shopId ? 'shop' : 'all', dedupe_cache_cleared: true });
+    res.json({
+        success: true,
+        deleted: rowCount,
+        scope: shopId ? 'shop' : 'all',
+        dedupe_cache_cleared: true,
+        queued_jobs_removed: queuedJobsRemoved,
+    });
 }));
 
 app.get('/api/admin/summary', asyncHandler(async (req, res) => {
