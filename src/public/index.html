@@ -645,7 +645,7 @@ analytics.subscribe('ui_extension_errored', event => {
                     const facebookPixel = this.pixels.find(item => Number(item.shop_id) === shopId && item.platform === 'facebook');
                     const tiktokPixel = this.pixels.find(item => Number(item.shop_id) === shopId && item.platform === 'tiktok');
                     this.currentShop = shop.shop_domain;
-                    if (facebookPixel) this.currentPixelId = facebookPixel.pixel_id;
+                    this.currentPixelId = facebookPixel?.pixel_id || 'YOUR_PIXEL_ID';
                     this.currentTikTokPixelId = tiktokPixel?.pixel_id || '';
                 },
                 async copyCode() {
@@ -660,6 +660,8 @@ analytics.subscribe('ui_extension_errored', event => {
                 async deleteShop(shop) {
                     if (!confirm(`确认删除店铺 ${shop.shop_domain}？相关 Pixel 路由和事件日志也会一起删除。`)) return;
                     await this.api('/api/admin/shops/' + shop.id, { method: 'DELETE' });
+                    if (String(this.selectedShopId) === String(shop.id)) this.selectedShopId = '';
+                    if (String(this.deployShopId) === String(shop.id)) this.deployShopId = '';
                     await this.fetchAll();
                 },
                 formatTime(value) {

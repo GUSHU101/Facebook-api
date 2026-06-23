@@ -204,6 +204,16 @@ async function deleteKeysByPattern(pattern) {
     } while (cursor !== '0');
 }
 
+async function releaseRedisLock(key, token) {
+    const script = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        end
+        return 0
+    `;
+    await redis.eval(script, 1, key, token);
+}
+
 function buildUserData(req, payload) {
     const email = firstPresent(payload.email, payload.customer_email);
     const phone = firstPresent(payload.phone, payload.customer_phone);
@@ -462,7 +472,9 @@ cron.schedule(config.batchCron, async () => {
     try {
         const { rows: shops } = await pool.query("SELECT id FROM shops WHERE status = 'active'");
         for (const shop of shops) {
-            const lock = await redis.set(`lock:batch_packing:${shop.id}`, '1', 'EX', 55, 'NX');
+            const lockKey = `lock:batch_packing:${shop.id}`;
+            const lockToken = crypto.randomUUID();
+            const lock = await redis.set(lockKey, lockToken, 'EX', 55, 'NX');
             if (!lock) continue;
 
             const pendingKey = `pending:events:${shop.id}`;
@@ -559,7 +571,7 @@ cron.schedule(config.batchCron, async () => {
                 await redis.del(processingKey);
                 await redis.del(heartbeatKey);
             } finally {
-                await redis.del(`lock:batch_packing:${shop.id}`);
+                await releaseRedisLock(lockKey, lockToken);
             }
         }
     } catch (error) {
@@ -571,7 +583,9 @@ cron.schedule(config.watchdogCron, async () => {
     try {
         const { rows: shops } = await pool.query('SELECT id FROM shops');
         for (const shop of shops) {
-            const lock = await redis.set(`lock:watchdog:${shop.id}`, '1', 'EX', 50, 'NX');
+            const lockKey = `lock:watchdog:${shop.id}`;
+            const lockToken = crypto.randomUUID();
+            const lock = await redis.set(lockKey, lockToken, 'EX', 50, 'NX');
             if (!lock) continue;
 
             const processingKey = `processing:events:${shop.id}`;
@@ -588,7 +602,7 @@ cron.schedule(config.watchdogCron, async () => {
                     console.warn(`[Watchdog] restored ${restored} processing events for shop ${shop.id}`);
                 }
             } finally {
-                await redis.del(`lock:watchdog:${shop.id}`);
+                await releaseRedisLock(lockKey, lockToken);
             }
         }
     } catch (error) {
