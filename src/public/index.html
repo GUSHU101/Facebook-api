@@ -443,16 +443,6 @@ function getInitData() {
     return {};
 }
 
-function trackingAllowedByPrivacy() {
-    try {
-        if (typeof init === 'undefined' || !init || !init.customerPrivacy) return true;
-        var privacy = init.customerPrivacy;
-        if (privacy.analyticsProcessingAllowed === false) return false;
-        if (privacy.marketingAllowed === false) return false;
-    } catch (error) {}
-    return true;
-}
-
 function enqueueEventPayload(payload) {
     eventQueue.push(payload);
     if (!eventQueueTimer) {
@@ -552,8 +542,6 @@ async function flushEventQueue() {
 }
 
 async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
-    if (!trackingAllowedByPrivacy()) return;
-
     customData = customData || {};
     event = event || {};
     var initContext = getInitContext();

@@ -298,7 +298,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
     assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
     assert.equal(generated.includes('requeueFailedEvents'), true);
-    assert.equal(generated.includes('trackingAllowedByPrivacy'), true);
+    assert.equal(generated.includes('trackingAllowedByPrivacy'), false);
     assert.equal(generated.includes('getInitContext'), true);
 
     const callbacks = {};
@@ -451,10 +451,6 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
         data: {
             customer: { id: 'gid://shopify/Customer/777', email: 'init@example.com' },
         },
-        customerPrivacy: {
-            analyticsProcessingAllowed: true,
-            marketingAllowed: true,
-        },
     };
     callbacks.page_viewed({
         timestamp: '2026-06-24T00:03:00Z',
@@ -469,20 +465,6 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(initFallbackEvent.user_agent, 'InitUA/1.0');
     assert.equal(initFallbackEvent.external_id, '777');
 
-    requests.length = 0;
-    sandbox.init.customerPrivacy.marketingAllowed = false;
-    callbacks.page_viewed({
-        timestamp: '2026-06-24T00:04:00Z',
-        clientId: 'client-privacy',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/privacy' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {},
-    });
-    await new Promise(resolve => setTimeout(resolve, 0));
-    await sandbox.flushEventQueue();
-    assert.equal(requests.length, 0);
 });
 
 test('admin page script parses and handles admin action failures', async () => {
