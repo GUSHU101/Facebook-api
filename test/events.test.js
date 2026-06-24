@@ -278,7 +278,9 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
 
     const generated = match[1]
         .replaceAll('${this.apiDomain}', 'https://nestworks.com.au:8443')
-        .replaceAll('${this.currentShop}', 'demo.myshopify.com');
+        .replaceAll('${this.currentShop}', 'demo.myshopify.com')
+        .replaceAll('${JSON.stringify(this.currentMetaPixelIds)}', '["1234567890"]')
+        .replaceAll('${JSON.stringify(this.currentTikTokPixelIds)}', '["TT123"]');
 
     assert.equal(generated.includes('document.createElement'), false);
     assert.equal(generated.includes('typeof document'), false);
@@ -288,6 +290,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('ttq'), false);
     assert.equal(generated.includes('FB_PIXEL_ID'), false);
     assert.equal(generated.includes('TIKTOK_PIXEL_ID'), false);
+    assert.equal(generated.includes('META_ROUTE_PIXEL_IDS'), true);
 
     const callbacks = {};
     const bodies = [];
@@ -361,6 +364,10 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
 
     const ids = Object.fromEntries(bodies.map(body => [body.event_name, body.event_id]));
     assert.equal(bodies.filter(body => body.event_name === 'CheckoutContactInfoSubmitted').length, 1);
+    assert.deepEqual(bodies[0].route_hints, {
+        facebook_pixel_ids: ['1234567890'],
+        tiktok_pixel_ids: ['TT123'],
+    });
     assert.deepEqual(ids, {
         CheckoutContactInfoSubmitted: 'checkout-token-1:CheckoutContactInfoSubmitted',
         CheckoutAddressInfoSubmitted: 'checkout-token-1:CheckoutAddressInfoSubmitted',

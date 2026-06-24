@@ -44,6 +44,16 @@
                         <span class="text-sm font-medium">API origin</span>
                         <input v-model="apiDomain" class="mt-1 w-full border rounded-md p-2 font-mono">
                     </label>
+                    <div class="md:col-span-3 grid md:grid-cols-2 gap-3 text-sm text-slate-600">
+                        <div class="bg-slate-50 border rounded-md p-3">
+                            <div class="font-semibold text-slate-800">Meta server route hints</div>
+                            <div class="font-mono break-all">{{ currentMetaPixelIds.length ? currentMetaPixelIds.join(', ') : 'none' }}</div>
+                        </div>
+                        <div class="bg-slate-50 border rounded-md p-3">
+                            <div class="font-semibold text-slate-800">TikTok server route hints</div>
+                            <div class="font-mono break-all">{{ currentTikTokPixelIds.length ? currentTikTokPixelIds.join(', ') : 'none' }}</div>
+                        </div>
+                    </div>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                     <button @click="copyCode" class="bg-slate-950 text-white rounded-md px-4 py-2">Copy tracking code</button>
@@ -196,10 +206,26 @@
                 };
             },
             computed: {
+                currentMetaPixelIds() {
+                    const shop = String(this.currentShop || '').trim().toLowerCase();
+                    return this.pixels
+                        .filter(item => item.platform === 'facebook' && String(item.shop_domain || '').toLowerCase() === shop)
+                        .map(item => String(item.pixel_id))
+                        .filter(Boolean);
+                },
+                currentTikTokPixelIds() {
+                    const shop = String(this.currentShop || '').trim().toLowerCase();
+                    return this.pixels
+                        .filter(item => item.platform === 'tiktok' && String(item.shop_domain || '').toLowerCase() === shop)
+                        .map(item => String(item.pixel_id))
+                        .filter(Boolean);
+                },
                 generatedCode() {
                     return `// CAPI SaaS Hub - Shopify Customer Events to server-side Meta CAPI and TikTok Events API
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
 const SHOP_DOMAIN = "${this.currentShop}";
+const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
+const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const RECENT_EVENT_TTL_MS = 5000;
 const recentEvents = {};
 
@@ -423,6 +449,10 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
             checkout_token: checkoutToken,
             cart_token: cartToken,
             order_id: orderId,
+            route_hints: {
+                facebook_pixel_ids: META_ROUTE_PIXEL_IDS,
+                tiktok_pixel_ids: TIKTOK_ROUTE_PIXEL_IDS,
+            },
             external_id: externalIds.length ? externalIds : undefined,
             value: customData.value,
             currency: customData.currency,

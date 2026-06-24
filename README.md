@@ -27,6 +27,7 @@ The installer auto-installs missing Ubuntu dependencies, generates secrets when 
 The generated Shopify custom pixel subscribes to Shopify Customer Events and sends those events to this hub with stable `event_id` values. The hub then delivers events server-side to Meta CAPI and TikTok Events API through the configured Pixel routes.
 
 The custom pixel intentionally does not inject the Meta or TikTok browser SDK. Shopify Customer Events run in sandboxed environments where DOM access and script injection are unavailable or unreliable, so browser SDK events should not be treated as the primary tracking path.
+The generated code can include configured Meta/TikTok Pixel IDs as route hints for diagnostics, but the server still chooses delivery destinations from the saved Pixel Routes, not from client-supplied IDs.
 
 Meta standard events:
 

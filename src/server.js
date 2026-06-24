@@ -321,7 +321,19 @@ function buildUserData(req, payload) {
 }
 
 function buildPlatformData(payload) {
+    const routeHints = payload.route_hints || {};
+    const facebookPixelIds = Array.isArray(routeHints.facebook_pixel_ids)
+        ? routeHints.facebook_pixel_ids.map(String).filter(Boolean)
+        : undefined;
+    const tiktokPixelIds = Array.isArray(routeHints.tiktok_pixel_ids)
+        ? routeHints.tiktok_pixel_ids.map(String).filter(Boolean)
+        : undefined;
+
     return compactObject({
+        route_hints: compactObject({
+            facebook_pixel_ids: facebookPixelIds?.length ? facebookPixelIds : undefined,
+            tiktok_pixel_ids: tiktokPixelIds?.length ? tiktokPixelIds : undefined,
+        }),
         tiktok: compactObject({
             ttp: payload.ttp,
             ttclid: payload.ttclid,
