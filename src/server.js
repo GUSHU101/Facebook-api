@@ -90,12 +90,23 @@ function readOptionalShopId(req) {
     return value;
 }
 
+function readPositiveId(value, fieldName) {
+    const id = Number(value);
+    if (!Number.isInteger(id) || id <= 0) {
+        const error = new Error(`Invalid ${fieldName}`);
+        error.statusCode = 400;
+        throw error;
+    }
+    return id;
+}
+
 function firstForwardedIp(req) {
+    if (req.ip) return req.ip;
     const forwarded = req.headers['x-forwarded-for'];
     if (typeof forwarded === 'string' && forwarded.trim()) {
         return forwarded.split(',')[0].trim();
     }
-    return req.ip || req.socket?.remoteAddress;
+    return req.socket?.remoteAddress;
 }
 
 function hashMany(values, type = 'default') {
@@ -173,17 +184,21 @@ function primaryExternalId(payload) {
     );
 }
 
+function isPayloadObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function pixelPayloadsFromBody(body) {
-    if (Array.isArray(body)) return body.filter(Boolean);
+    if (Array.isArray(body)) return body.filter(isPayloadObject);
     if (Array.isArray(body?.events)) {
         return body.events
-            .filter(Boolean)
+            .filter(isPayloadObject)
             .map(event => ({
                 ...event,
                 shop_domain: event.shop_domain || body.shop_domain,
             }));
     }
-    return [body || {}];
+    return isPayloadObject(body) ? [body] : [];
 }
 
 function shopDomainFromPixelBody(body) {
@@ -317,6 +332,19 @@ async function deleteKeysByPattern(pattern) {
         cursor = nextCursor;
         if (keys.length > 0) await redis.del(...keys);
     } while (cursor !== '0');
+}
+
+async function deleteRuntimeQueueKeysForShop(shopId) {
+    await redis.del(
+        `pending:events:${shopId}`,
+        `processing:events:${shopId}`,
+        `heartbeat:processing:${shopId}`,
+    );
+}
+
+async function allShopIds() {
+    const { rows } = await pool.query('SELECT id FROM shops ORDER BY id ASC');
+    return rows.map(row => row.id);
 }
 
 async function releaseRedisLock(key, token) {
@@ -940,8 +968,7 @@ app.post('/api/admin/shops', asyncHandler(async (req, res) => {
 }));
 
 app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
-    const shopId = Number(req.params.id);
-    if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
+    const shopId = readPositiveId(req.params.id, 'shop_id');
 
     const client = await pool.connect();
     let rowCount = 0;
@@ -961,10 +988,10 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
         client.release();
     }
 
+    if (rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
+
     await Promise.all([
-        redis.del(`pending:events:${shopId}`),
-        redis.del(`processing:events:${shopId}`),
-        redis.del(`heartbeat:processing:${shopId}`),
+        deleteRuntimeQueueKeysForShop(shopId),
         redis.del(`lock:batch_packing:${shopId}`),
         redis.del(`lock:watchdog:${shopId}`),
         deleteKeysByPattern(`attr:${shopId}:*`),
@@ -973,7 +1000,6 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
         shopDomain ? deleteKeysByPattern(`shopify:webhook:${shopDomain}:*`) : Promise.resolve(),
     ]);
 
-    if (rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
     res.json({ success: true });
 }));
 
@@ -1015,7 +1041,9 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
 }));
 
 app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
-    await pool.query('DELETE FROM pixels WHERE id = $1', [req.params.id]);
+    const pixelId = readPositiveId(req.params.id, 'pixel_id');
+    const { rowCount } = await pool.query('DELETE FROM pixels WHERE id = $1', [pixelId]);
+    if (rowCount === 0) return res.status(404).json({ error: 'Pixel route not found' });
     res.json({ success: true });
 }));
 
@@ -1037,6 +1065,12 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
 
 app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
     const shopId = readOptionalShopId(req);
+    const shopIdsToClear = shopId ? [shopId] : await allShopIds();
+    if (shopId) {
+        const shopResult = await pool.query('SELECT id FROM shops WHERE id = $1', [shopId]);
+        if (shopResult.rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
+    }
+
     const { rowCount } = shopId
         ? await pool.query('DELETE FROM event_store WHERE shop_id = $1', [shopId])
         : await pool.query('DELETE FROM event_store');
@@ -1044,6 +1078,7 @@ app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
     await Promise.all([
         deleteKeysByPattern(shopId ? `dedup:${shopId}:*` : 'dedup:*'),
         deleteKeysByPattern(shopId ? `dedup-alias:${shopId}:*` : 'dedup-alias:*'),
+        ...shopIdsToClear.map(id => deleteRuntimeQueueKeysForShop(id)),
     ]);
     const queuedJobsRemoved = await removeQueuedSendJobsForShop(shopId);
 
@@ -1052,6 +1087,7 @@ app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
         deleted: rowCount,
         scope: shopId ? 'shop' : 'all',
         dedupe_cache_cleared: true,
+        redis_queues_cleared: true,
         queued_jobs_removed: queuedJobsRemoved,
     });
 }));
@@ -1118,7 +1154,7 @@ app.get('/api/admin/dlq', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
         SELECT d.*, s.shop_domain
         FROM dead_letters d
-        JOIN shops s ON d.shop_id = s.id
+        LEFT JOIN shops s ON d.shop_id = s.id
         WHERE d.status = 'FAILED_PERMANENT'
         ${shopFilter}
         ORDER BY d.id DESC
