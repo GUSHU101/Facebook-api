@@ -298,6 +298,8 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
     assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
     assert.equal(generated.includes('requeueFailedEvents'), true);
+    assert.equal(generated.includes('trackingAllowedByPrivacy'), true);
+    assert.equal(generated.includes('getInitContext'), true);
 
     const callbacks = {};
     const requests = [];
@@ -436,6 +438,51 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     const sameMomentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
     assert.equal(sameMomentEvents.length, 2);
     assert.notEqual(sameMomentEvents[0].event_id, sameMomentEvents[1].event_id);
+
+    requests.length = 0;
+    sandbox.init = {
+        context: {
+            document: {
+                location: { href: 'https://demo.myshopify.com/init-fallback?fbclid=fb3' },
+                referrer: 'https://instagram.com/',
+            },
+            navigator: { userAgent: 'InitUA/1.0' },
+        },
+        data: {
+            customer: { id: 'gid://shopify/Customer/777', email: 'init@example.com' },
+        },
+        customerPrivacy: {
+            analyticsProcessingAllowed: true,
+            marketingAllowed: true,
+        },
+    };
+    callbacks.page_viewed({
+        timestamp: '2026-06-24T00:03:00Z',
+        clientId: 'client-init',
+        data: {},
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await sandbox.flushEventQueue();
+
+    const initFallbackEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
+    assert.equal(initFallbackEvent.event_source_url, 'https://demo.myshopify.com/init-fallback?fbclid=fb3');
+    assert.equal(initFallbackEvent.user_agent, 'InitUA/1.0');
+    assert.equal(initFallbackEvent.external_id, '777');
+
+    requests.length = 0;
+    sandbox.init.customerPrivacy.marketingAllowed = false;
+    callbacks.page_viewed({
+        timestamp: '2026-06-24T00:04:00Z',
+        clientId: 'client-privacy',
+        context: {
+            document: { location: { href: 'https://demo.myshopify.com/privacy' } },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {},
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await sandbox.flushEventQueue();
+    assert.equal(requests.length, 0);
 });
 
 test('admin page script parses and handles admin action failures', async () => {

@@ -429,6 +429,30 @@ function primaryExternalId(event, customer, checkout, shopifyY, checkoutToken) {
     );
 }
 
+function getInitContext() {
+    try {
+        if (typeof init !== 'undefined' && init && init.context) return init.context;
+    } catch (error) {}
+    return {};
+}
+
+function getInitData() {
+    try {
+        if (typeof init !== 'undefined' && init && init.data) return init.data;
+    } catch (error) {}
+    return {};
+}
+
+function trackingAllowedByPrivacy() {
+    try {
+        if (typeof init === 'undefined' || !init || !init.customerPrivacy) return true;
+        var privacy = init.customerPrivacy;
+        if (privacy.analyticsProcessingAllowed === false) return false;
+        if (privacy.marketingAllowed === false) return false;
+    } catch (error) {}
+    return true;
+}
+
 function enqueueEventPayload(payload) {
     eventQueue.push(payload);
     if (!eventQueueTimer) {
@@ -528,18 +552,24 @@ async function flushEventQueue() {
 }
 
 async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
+    if (!trackingAllowedByPrivacy()) return;
+
     customData = customData || {};
     event = event || {};
-    var context = event.context || {};
+    var initContext = getInitContext();
+    var initData = getInitData();
+    var context = event.context || initContext || {};
     var documentInfo = context.document || {};
     var navigatorInfo = context.navigator || {};
-    var locationInfo = documentInfo.location || {};
+    var fallbackDocumentInfo = initContext.document || {};
+    var fallbackNavigatorInfo = initContext.navigator || {};
+    var locationInfo = documentInfo.location || fallbackDocumentInfo.location || {};
     var checkout = event.data && event.data.checkout || {};
-    var customer = event.data && event.data.customer || checkout.order && checkout.order.customer || {};
+    var customer = event.data && event.data.customer || checkout.order && checkout.order.customer || initData.customer || {};
     var billingAddress = checkout.billingAddress || {};
     var shippingAddress = checkout.shippingAddress || {};
     var address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
-    var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer;
+    var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer || fallbackDocumentInfo.URL || fallbackDocumentInfo.referrer;
     var eventId = String(eventIdFrom(forcedEventId) || event.id || fallbackEventId(metaEventName, event, currentUrl));
     if (!shouldSendRecentEvent(metaEventName, eventId)) return;
 
@@ -566,8 +596,8 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
             timestamp: event.timestamp,
             url: currentUrl,
             event_source_url: currentUrl,
-            referrer: documentInfo.referrer,
-            user_agent: navigatorInfo.userAgent,
+            referrer: documentInfo.referrer || fallbackDocumentInfo.referrer,
+            user_agent: navigatorInfo.userAgent || fallbackNavigatorInfo.userAgent,
             fbp: fbp,
             fbc: fbc,
             ttp: ttp,
