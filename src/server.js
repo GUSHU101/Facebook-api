@@ -140,11 +140,16 @@ function firstForwardedIp(req) {
     return req.socket?.remoteAddress;
 }
 
-function hashMany(values, type = 'default') {
+function isSha256Hex(value) {
+    return /^[a-f0-9]{64}$/.test(String(value || '').trim().toLowerCase());
+}
+
+function hashOrKeepMany(values, type = 'default') {
     const hashes = [];
     const seen = new Set();
     for (const value of values.flat()) {
-        const hash = hashUserData(value, type);
+        const normalized = String(value || '').trim().toLowerCase();
+        const hash = isSha256Hex(normalized) ? normalized : hashUserData(value, type);
         if (hash && !seen.has(hash)) {
             seen.add(hash);
             hashes.push(hash);
@@ -309,14 +314,14 @@ function attributionSnapshot(payload) {
         referrer: payload.referrer,
         client_ip: payload.client_ip,
         user_agent: payload.user_agent,
-        email: firstPresent(payload.email, payload.customer_email),
-        phone: firstPresent(payload.phone, payload.customer_phone),
-        firstName: firstPresent(payload.firstName, payload.first_name, payload.customer_first_name),
-        lastName: firstPresent(payload.lastName, payload.last_name, payload.customer_last_name),
-        city: firstPresent(payload.city, payload.customer_city),
-        state: firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state),
-        zip: firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip),
-        country: firstPresent(payload.country, payload.country_code, payload.customer_country),
+        email_hash: firstPresent(payload.email_hash, payload.email_sha256, payload.em, hashUserData(firstPresent(payload.email, payload.customer_email), 'email')),
+        phone_hash: firstPresent(payload.phone_hash, payload.phone_sha256, payload.ph, hashUserData(firstPresent(payload.phone, payload.customer_phone), 'phone')),
+        first_name_hash: firstPresent(payload.first_name_hash, payload.fn, hashUserData(firstPresent(payload.firstName, payload.first_name, payload.customer_first_name), 'name')),
+        last_name_hash: firstPresent(payload.last_name_hash, payload.ln, hashUserData(firstPresent(payload.lastName, payload.last_name, payload.customer_last_name), 'name')),
+        city_hash: firstPresent(payload.city_hash, payload.ct, hashUserData(firstPresent(payload.city, payload.customer_city), 'city')),
+        state_hash: firstPresent(payload.state_hash, payload.st, hashUserData(firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state), 'state')),
+        zip_hash: firstPresent(payload.zip_hash, payload.zp, hashUserData(firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip), 'zip')),
+        country_hash: firstPresent(payload.country_hash, payload.country_sha256, hashUserData(firstPresent(payload.country, payload.country_code, payload.customer_country), 'country')),
         client_id: firstPresent(payload.client_id, payload.shopify_y),
         external_id: payload.external_id,
         checkout_token: payload.checkout_token,
@@ -416,15 +421,15 @@ function buildUserData(req, payload) {
     const externalId = primaryExternalId(payload);
 
     const hashed = {
-        em: hashMany([email], 'email'),
-        ph: hashMany([phone], 'phone'),
-        fn: hashMany([firstName], 'name'),
-        ln: hashMany([lastName], 'name'),
-        ct: hashMany([city], 'city'),
-        st: hashMany([state], 'state'),
-        zp: hashMany([zip], 'zip'),
-        country: hashMany([country], 'country'),
-        external_id: hashMany([externalId], 'default'),
+        em: hashOrKeepMany([payload.email_hash, payload.email_sha256, payload.em, email], 'email'),
+        ph: hashOrKeepMany([payload.phone_hash, payload.phone_sha256, payload.ph, phone], 'phone'),
+        fn: hashOrKeepMany([payload.first_name_hash, payload.fn, firstName], 'name'),
+        ln: hashOrKeepMany([payload.last_name_hash, payload.ln, lastName], 'name'),
+        ct: hashOrKeepMany([payload.city_hash, payload.ct, city], 'city'),
+        st: hashOrKeepMany([payload.state_hash, payload.st, state], 'state'),
+        zp: hashOrKeepMany([payload.zip_hash, payload.zp, zip], 'zip'),
+        country: hashOrKeepMany([payload.country_hash, payload.country_sha256, payload.country_hashed, country], 'country'),
+        external_id: hashOrKeepMany([payload.external_id_hash, externalId], 'default'),
     };
 
     return compactObject({
@@ -446,9 +451,15 @@ function buildUserData(req, payload) {
 
 function buildPlatformData(payload) {
     const routeHints = payload.route_hints || {};
+    const pixelIds = Array.isArray(payload.pixel_ids)
+        ? payload.pixel_ids.map(String).filter(Boolean)
+        : (payload.pixel_id ? [String(payload.pixel_id)] : []);
+    const datasetIds = Array.isArray(payload.dataset_ids)
+        ? payload.dataset_ids.map(String).filter(Boolean)
+        : (payload.dataset_id ? [String(payload.dataset_id)] : []);
     const facebookPixelIds = Array.isArray(routeHints.facebook_pixel_ids)
         ? routeHints.facebook_pixel_ids.map(String).filter(Boolean)
-        : undefined;
+        : pixelIds;
     const tiktokPixelIds = Array.isArray(routeHints.tiktok_pixel_ids)
         ? routeHints.tiktok_pixel_ids.map(String).filter(Boolean)
         : undefined;
@@ -456,6 +467,11 @@ function buildPlatformData(payload) {
     return compactObject({
         tenant_id: payload.tenant_id,
         shop_domain: payload.shop_domain,
+        schema_version: payload.schema_version,
+        source_version: payload.source_version,
+        trace_id: payload.trace_id,
+        pixel_ids: pixelIds.length ? pixelIds : undefined,
+        dataset_ids: datasetIds.length ? datasetIds : undefined,
         pixel_id: payload.pixel_id,
         dataset_id: payload.dataset_id,
         route_hints: compactObject({

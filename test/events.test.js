@@ -22,6 +22,10 @@ function sha256(value) {
     return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
 }
 
+function hashFor(value, type = 'default') {
+    return crypto.createHash('sha256').update(normalizeForHash(value, type)).digest('hex');
+}
+
 test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product contents', () => {
     const payload = buildShopifyOrderPurchasePayload({
         id: 987,
@@ -279,7 +283,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     const generated = match[1]
         .replaceAll('${this.apiDomain}', 'https://nestworks.com.au:8443')
         .replaceAll('${this.currentShop}', 'demo.myshopify.com')
-        .replaceAll('${JSON.stringify(this.currentMetaPixelIds)}', '["1234567890"]')
+        .replaceAll('${JSON.stringify(this.currentMetaPixelIds)}', '["1234567890","2222222222"]')
         .replaceAll('${JSON.stringify(this.currentTikTokPixelIds)}', '["TT123"]');
 
     assert.equal(generated.includes('document.createElement'), false);
@@ -298,18 +302,28 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
     assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
     assert.equal(generated.includes('requeueFailedEvents'), true);
+    assert.equal(generated.includes('sendDualChannelEvent'), false);
+    assert.equal(generated.includes('sendGatewayEvent'), true);
+    assert.equal(generated.includes('browser.localStorage'), true);
+    assert.equal(generated.includes('MAX_CLIENT_RETRIES = 3'), true);
     assert.equal(generated.includes('trackingAllowedByPrivacy'), false);
     assert.equal(generated.includes('getInitContext'), true);
 
     const callbacks = {};
     const requests = [];
     const cookies = new Map();
+    const localStorage = new Map();
+    let uuidCounter = 0;
     const sandbox = {
         console,
         URL,
         Date,
         Math,
-        globalThis: {},
+        TextEncoder,
+        crypto: {
+            randomUUID: () => `uuid-${++uuidCounter}`,
+            subtle: crypto.webcrypto.subtle,
+        },
         setTimeout: () => 1,
         clearTimeout: () => {},
         analytics: {
@@ -324,6 +338,15 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
                     const [pair] = String(value).split(';');
                     const index = pair.indexOf('=');
                     cookies.set(pair.slice(0, index), decodeURIComponent(pair.slice(index + 1)));
+                },
+            },
+            localStorage: {
+                getItem: async key => localStorage.get(key),
+                setItem: async (key, value) => {
+                    localStorage.set(key, String(value));
+                },
+                removeItem: async key => {
+                    localStorage.delete(key);
                 },
             },
         },
@@ -361,6 +384,12 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
                     },
                 ],
             },
+            customer: {
+                email: 'Buyer@Example.com',
+                phone: '+1 (212) 555-1212',
+                firstName: 'Ada',
+                lastName: 'Lovelace',
+            },
         },
     };
 
@@ -371,7 +400,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     callbacks.payment_info_submitted(event);
     callbacks.checkout_completed(event);
 
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 20));
     await sandbox.flushEventQueue();
 
     const sentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
@@ -379,14 +408,25 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(requests.length, 1);
     assert.equal(requests[0].options.keepalive, true);
     assert.equal(requests[0].body.shop_domain, 'demo.myshopify.com');
+    assert.equal(localStorage.has('capi_gateway_event_queue_v3:demo.myshopify.com'), false);
     assert.equal(sentEvents.filter(body => body.event_name === 'CheckoutContactInfoSubmitted').length, 1);
     assert.deepEqual(sentEvents[0].route_hints, {
-        facebook_pixel_ids: ['1234567890'],
+        facebook_pixel_ids: ['1234567890', '2222222222'],
         tiktok_pixel_ids: ['TT123'],
     });
+    assert.deepEqual(sentEvents[0].pixel_ids, ['1234567890', '2222222222']);
+    assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
+    assert.equal(sentEvents[0].pixel_id, undefined);
+    assert.equal(sentEvents[0].schema_version, '2.0');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v3');
+    assert.ok(String(sentEvents[0].trace_id).startsWith('trace_uuid-'));
     assert.equal(sentEvents[0].action_source, 'website');
     assert.equal(sentEvents[0].event_source_url, 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1');
     assert.equal(sentEvents[0].external_id, 'client-1');
+    assert.equal(sentEvents[0].email, undefined);
+    assert.equal(sentEvents[0].phone, undefined);
+    assert.equal(sentEvents[0].email_hash, hashFor('Buyer@Example.com', 'email'));
+    assert.equal(sentEvents[0].phone_hash, hashFor('+1 (212) 555-1212', 'phone'));
     assert.deepEqual(ids, {
         CheckoutContactInfoSubmitted: 'checkout-token-1:CheckoutContactInfoSubmitted',
         CheckoutAddressInfoSubmitted: 'checkout-token-1:CheckoutAddressInfoSubmitted',
@@ -410,7 +450,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
             data: {},
         });
     }
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 20));
     await sandbox.flushEventQueue();
 
     const pageViewBatchSizes = requests.map(request => Array.isArray(request.body.events) ? request.body.events.length : 1);
@@ -432,7 +472,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     };
     callbacks.page_viewed({ ...sameMomentEvent, seq: 1 });
     callbacks.page_viewed({ ...sameMomentEvent, seq: 2 });
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 20));
     await sandbox.flushEventQueue();
 
     const sameMomentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
@@ -457,7 +497,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
         clientId: 'client-init',
         data: {},
     });
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 20));
     await sandbox.flushEventQueue();
 
     const initFallbackEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
@@ -488,7 +528,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
             },
         },
     });
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 20));
     await sandbox.flushEventQueue();
 
     const cartViewEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;

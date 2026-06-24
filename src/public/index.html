@@ -221,20 +221,27 @@
                         .filter(Boolean);
                 },
                 generatedCode() {
-                    return `// CAPI SaaS Hub - Shopify Customer Events to server-side Meta CAPI and TikTok Events API
+                    return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
 const SHOP_DOMAIN = "${this.currentShop}";
 const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
+const SCHEMA_VERSION = "2.0";
+const SOURCE_VERSION = "shopify-pixel-v3";
 const RECENT_EVENT_TTL_MS = 5000;
+const MAX_RECENT_EVENTS = 5000;
 const EVENT_QUEUE_FLUSH_MS = 1000;
 const FETCH_TIMEOUT_MS = 3000;
 const KEEPALIVE_LIMIT_BYTES = 60000;
 const MAX_BATCH_EVENTS = 20;
-const MAX_CLIENT_RETRIES = 1;
-const recentEvents = {};
+const MAX_CLIENT_RETRIES = 3;
+const RETRY_BACKOFF_MS = [1000, 5000, 15000];
+const STORAGE_QUEUE_KEY = 'capi_gateway_event_queue_v3:' + SHOP_DOMAIN;
+const MAX_STORED_EVENTS = 100;
+const recentEvents = new Map();
 const eventQueue = [];
 var eventQueueTimer = null;
+var persistedQueueLoaded = false;
 
 async function getCookieValue(name) {
     try {
@@ -252,6 +259,31 @@ async function setCookieValue(name, value, days) {
         if (typeof browser !== 'undefined' && browser.cookie && browser.cookie.set) {
             await browser.cookie.set(name + '=' + encodeURIComponent(value) + '; max-age=' + maxAge + '; path=/; SameSite=Lax');
             return;
+        }
+    } catch (error) {}
+}
+
+async function getStorageValue(key) {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.getItem) {
+            return await browser.localStorage.getItem(key);
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+async function setStorageValue(key, value) {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.setItem) {
+            await browser.localStorage.setItem(key, value);
+        }
+    } catch (error) {}
+}
+
+async function removeStorageValue(key) {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.removeItem) {
+            await browser.localStorage.removeItem(key);
         }
     } catch (error) {}
 }
@@ -302,6 +334,56 @@ function compact(object) {
     return output;
 }
 
+function normalizeForHash(value, type) {
+    if (value === undefined || value === null) return undefined;
+    var normalized = String(value).trim().toLowerCase();
+    if (!normalized) return undefined;
+    if (type === 'phone') {
+        normalized = normalized.replace(/[^0-9]/g, '');
+    } else if (type === 'name' || type === 'city' || type === 'state' || type === 'zip' || type === 'country') {
+        try {
+            normalized = normalized.normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '');
+        } catch (error) {}
+        normalized = normalized.replace(/\\s+/g, '');
+    } else {
+        normalized = normalized.replace(/\\s+/g, '');
+    }
+    return normalized || undefined;
+}
+
+function isSha256Hex(value) {
+    return /^[a-f0-9]{64}$/.test(String(value || '').trim().toLowerCase());
+}
+
+function toHex(buffer) {
+    return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+    }).join('');
+}
+
+async function sha256Hex(value, type) {
+    var normalized = normalizeForHash(value, type);
+    if (!normalized) return undefined;
+    if (isSha256Hex(normalized)) return normalized;
+    try {
+        var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+        var subtle = cryptoApi && cryptoApi.subtle;
+        var encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : undefined;
+        if (subtle && encoder) {
+            return toHex(await subtle.digest('SHA-256', encoder.encode(normalized)));
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+function randomId(prefix) {
+    try {
+        var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+        if (cryptoApi && cryptoApi.randomUUID) return prefix + '_' + cryptoApi.randomUUID();
+    } catch (error) {}
+    return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+}
+
 function safeDecode(value) {
     try {
         return decodeURIComponent(String(value || '').replace(/\\+/g, ' '));
@@ -333,11 +415,14 @@ function getUrlParam(name, href) {
 function shouldSendRecentEvent(eventName, eventId) {
     var now = Date.now();
     var key = eventName + ':' + eventId;
-    Object.keys(recentEvents).forEach(function (item) {
-        if (recentEvents[item] <= now) delete recentEvents[item];
+    recentEvents.forEach(function (expiresAt, item) {
+        if (expiresAt <= now) recentEvents.delete(item);
     });
-    if (recentEvents[key]) return false;
-    recentEvents[key] = now + RECENT_EVENT_TTL_MS;
+    if (recentEvents.has(key)) return false;
+    recentEvents.set(key, now + RECENT_EVENT_TTL_MS);
+    while (recentEvents.size > MAX_RECENT_EVENTS) {
+        recentEvents.delete(recentEvents.keys().next().value);
+    }
     return true;
 }
 
@@ -357,7 +442,7 @@ function stableHash(value) {
 }
 
 function fallbackEventId(eventName, event, currentUrl) {
-    return eventName + '_' + stableHash([
+    var stablePart = stableHash([
         SHOP_DOMAIN,
         event && event.clientId,
         event && event.timestamp,
@@ -366,6 +451,7 @@ function fallbackEventId(eventName, event, currentUrl) {
         currentUrl,
         eventName,
     ].join('|'));
+    return randomId(eventName + '_' + stablePart);
 }
 
 function purchaseEventId(checkout, event) {
@@ -443,11 +529,51 @@ function getInitData() {
     return {};
 }
 
+function scheduleEventQueueFlush(delayMs) {
+    if (eventQueueTimer) clearTimeout(eventQueueTimer);
+    eventQueueTimer = setTimeout(flushEventQueue, Math.max(0, delayMs || EVENT_QUEUE_FLUSH_MS));
+}
+
+function mergeQueuedEvents(events) {
+    var merged = [];
+    var seen = new Set();
+    events.forEach(function (event) {
+        var key = [event.event_name, event.event_id, event.trace_id].join(':');
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(event);
+    });
+    return merged;
+}
+
+async function persistEventQueue() {
+    var storable = eventQueue.slice(-MAX_STORED_EVENTS);
+    if (!storable.length) {
+        await removeStorageValue(STORAGE_QUEUE_KEY);
+        return;
+    }
+    await setStorageValue(STORAGE_QUEUE_KEY, JSON.stringify(storable));
+}
+
+async function loadPersistedEventQueue() {
+    if (persistedQueueLoaded) return;
+    persistedQueueLoaded = true;
+    var stored = await getStorageValue(STORAGE_QUEUE_KEY);
+    if (!stored) return;
+    try {
+        var parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length) {
+            var merged = mergeQueuedEvents(parsed.concat(eventQueue)).slice(-MAX_STORED_EVENTS);
+            eventQueue.splice(0, eventQueue.length);
+            Array.prototype.push.apply(eventQueue, merged);
+        }
+    } catch (error) {}
+}
+
 function enqueueEventPayload(payload) {
     eventQueue.push(payload);
-    if (!eventQueueTimer) {
-        eventQueueTimer = setTimeout(flushEventQueue, EVENT_QUEUE_FLUSH_MS);
-    }
+    persistEventQueue();
+    if (!eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
 }
 
 function requestPayloadForEvents(events) {
@@ -481,19 +607,22 @@ function buildEventBatches(events) {
 }
 
 function requeueFailedEvents(events) {
+    var now = Date.now();
     var retryable = events.filter(function (event) {
         return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES;
     }).map(function (event) {
+        var nextRetryCount = Number(event._client_retry_count || 0) + 1;
+        var delay = RETRY_BACKOFF_MS[Math.min(nextRetryCount - 1, RETRY_BACKOFF_MS.length - 1)] || EVENT_QUEUE_FLUSH_MS;
         return Object.assign({}, event, {
-            _client_retry_count: Number(event._client_retry_count || 0) + 1,
+            _client_retry_count: nextRetryCount,
+            _client_next_attempt_at: now + delay,
         });
     });
 
     if (!retryable.length) return;
     Array.prototype.push.apply(eventQueue, retryable);
-    if (!eventQueueTimer) {
-        eventQueueTimer = setTimeout(flushEventQueue, EVENT_QUEUE_FLUSH_MS);
-    }
+    persistEventQueue();
+    if (!eventQueueTimer) scheduleEventQueueFlush(RETRY_BACKOFF_MS[0]);
 }
 
 function requestOptionsForBody(body) {
@@ -521,9 +650,30 @@ async function flushEventQueue() {
         clearTimeout(eventQueueTimer);
         eventQueueTimer = null;
     }
+    await loadPersistedEventQueue();
     if (!eventQueue.length) return;
 
-    var batches = buildEventBatches(eventQueue.splice(0, eventQueue.length));
+    var now = Date.now();
+    var dueEvents = [];
+    var waitingEvents = [];
+    eventQueue.splice(0, eventQueue.length).forEach(function (event) {
+        if (Number(event._client_next_attempt_at || 0) > now) {
+            waitingEvents.push(event);
+        } else {
+            dueEvents.push(event);
+        }
+    });
+    Array.prototype.push.apply(eventQueue, waitingEvents);
+    if (!dueEvents.length) {
+        await persistEventQueue();
+        var nextAttemptAt = Math.min.apply(Math, waitingEvents.map(function (event) {
+            return Number(event._client_next_attempt_at || (now + EVENT_QUEUE_FLUSH_MS));
+        }));
+        scheduleEventQueueFlush(Math.max(EVENT_QUEUE_FLUSH_MS, nextAttemptAt - now));
+        return;
+    }
+
+    var batches = buildEventBatches(dueEvents);
     for (var index = 0; index < batches.length; index += 1) {
         var batch = batches[index];
         var requestPayload = requestPayloadForEvents(batch);
@@ -539,9 +689,12 @@ async function flushEventQueue() {
             delete options._timeoutId;
         }
     }
+
+    await persistEventQueue();
+    if (eventQueue.length && !eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
 }
 
-async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
+async function sendGatewayEvent(metaEventName, event, customData, forcedEventId) {
     customData = customData || {};
     event = event || {};
     var initContext = getInitContext();
@@ -572,12 +725,34 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     var normalizedOrderId = normalizeShopifyId(checkout.order && checkout.order.id);
     var orderId = firstNonEmpty(checkout.order && checkout.order.name, normalizedOrderId);
     var externalId = primaryExternalId(event, customer, checkout, shopifyY, checkoutToken);
+    var rawEmail = customer.email || checkout.email;
+    var rawPhone = customer.phone || checkout.phone || address.phone;
+    var rawFirstName = customer.firstName || address.firstName;
+    var rawLastName = customer.lastName || address.lastName;
+    var rawCity = address.city;
+    var rawState = address.provinceCode || address.province;
+    var rawZip = address.zip;
+    var rawCountry = address.countryCode || address.country;
+    var hashedFields = await Promise.all([
+        sha256Hex(rawEmail, 'email'),
+        sha256Hex(rawPhone, 'phone'),
+        sha256Hex(rawFirstName, 'name'),
+        sha256Hex(rawLastName, 'name'),
+        sha256Hex(rawCity, 'city'),
+        sha256Hex(rawState, 'state'),
+        sha256Hex(rawZip, 'zip'),
+        sha256Hex(rawCountry, 'country'),
+    ]);
+    var traceId = randomId('trace');
 
     enqueueEventPayload(compact({
             shop_domain: SHOP_DOMAIN,
             tenant_id: SHOP_DOMAIN,
-            pixel_id: META_ROUTE_PIXEL_IDS[0],
-            dataset_id: META_ROUTE_PIXEL_IDS[0],
+            schema_version: SCHEMA_VERSION,
+            source_version: SOURCE_VERSION,
+            trace_id: traceId,
+            pixel_ids: META_ROUTE_PIXEL_IDS,
+            dataset_ids: META_ROUTE_PIXEL_IDS,
             event_name: metaEventName,
             event_id: eventId,
             action_source: 'website',
@@ -592,14 +767,14 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
             ttclid: ttclid,
             shopify_y: shopifyY,
             shopify_s: shopifyS,
-            email: customer.email || checkout.email,
-            phone: customer.phone || checkout.phone || address.phone,
-            firstName: customer.firstName || address.firstName,
-            lastName: customer.lastName || address.lastName,
-            city: address.city,
-            state: address.provinceCode || address.province,
-            zip: address.zip,
-            country: address.countryCode || address.country,
+            email_hash: hashedFields[0],
+            phone_hash: hashedFields[1],
+            first_name_hash: hashedFields[2],
+            last_name_hash: hashedFields[3],
+            city_hash: hashedFields[4],
+            state_hash: hashedFields[5],
+            zip_hash: hashedFields[6],
+            country_hash: hashedFields[7],
             client_id: event.clientId || shopifyY,
             checkout_token: checkoutToken,
             cart_token: cartToken,
@@ -622,14 +797,14 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
 }
 
 analytics.subscribe('page_viewed', function (event) {
-    sendDualChannelEvent('PageView', event);
+    sendGatewayEvent('PageView', event);
 });
 
 analytics.subscribe('cart_viewed', function (event) {
     var cart = event.data && event.data.cart || {};
     var lines = cart.lines || cart.cartLines || [];
     var contents = lines.map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('CartView', event, {
+    sendGatewayEvent('CartView', event, {
         value: moneyAmount(cart.cost && cart.cost.totalAmount),
         currency: moneyCurrency(cart.cost && cart.cost.totalAmount),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -641,7 +816,7 @@ analytics.subscribe('cart_viewed', function (event) {
 
 analytics.subscribe('collection_viewed', function (event) {
     var collection = event.data && event.data.collection || {};
-    sendDualChannelEvent('CollectionView', event, {
+    sendGatewayEvent('CollectionView', event, {
         content_category: collection.title,
         content_name: collection.title,
     });
@@ -651,7 +826,7 @@ analytics.subscribe('product_viewed', function (event) {
     var variant = event.data && event.data.productVariant || {};
     var product = event.data && event.data.product || variant.product || {};
     var contentId = normalizeShopifyId(variant.id || product.id);
-    sendDualChannelEvent('ViewContent', event, {
+    sendGatewayEvent('ViewContent', event, {
         value: moneyAmount(variant.price),
         currency: moneyCurrency(variant.price),
         content_ids: contentId ? [contentId] : undefined,
@@ -664,7 +839,7 @@ analytics.subscribe('product_viewed', function (event) {
 analytics.subscribe('product_added_to_cart', function (event) {
     var line = event.data && event.data.cartLine || {};
     var content = lineItemToContent(line);
-    sendDualChannelEvent('AddToCart', event, {
+    sendGatewayEvent('AddToCart', event, {
         value: moneyAmount(line.cost && line.cost.totalAmount),
         currency: moneyCurrency(line.cost && line.cost.totalAmount),
         content_ids: content.id ? [content.id] : undefined,
@@ -677,7 +852,7 @@ analytics.subscribe('product_added_to_cart', function (event) {
 analytics.subscribe('product_removed_from_cart', function (event) {
     var line = event.data && event.data.cartLine || {};
     var content = lineItemToContent(line);
-    sendDualChannelEvent('RemoveFromCart', event, {
+    sendGatewayEvent('RemoveFromCart', event, {
         value: moneyAmount(line.cost && line.cost.totalAmount),
         currency: moneyCurrency(line.cost && line.cost.totalAmount),
         content_ids: content.id ? [content.id] : undefined,
@@ -690,7 +865,7 @@ analytics.subscribe('product_removed_from_cart', function (event) {
 analytics.subscribe('checkout_started', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('InitiateCheckout', event, {
+    sendGatewayEvent('InitiateCheckout', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -703,7 +878,7 @@ analytics.subscribe('checkout_started', function (event) {
 analytics.subscribe('checkout_contact_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('CheckoutContactInfoSubmitted', event, {
+    sendGatewayEvent('CheckoutContactInfoSubmitted', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -716,7 +891,7 @@ analytics.subscribe('checkout_contact_info_submitted', function (event) {
 analytics.subscribe('checkout_address_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('CheckoutAddressInfoSubmitted', event, {
+    sendGatewayEvent('CheckoutAddressInfoSubmitted', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -729,7 +904,7 @@ analytics.subscribe('checkout_address_info_submitted', function (event) {
 analytics.subscribe('checkout_shipping_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('CheckoutShippingInfoSubmitted', event, {
+    sendGatewayEvent('CheckoutShippingInfoSubmitted', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -742,7 +917,7 @@ analytics.subscribe('checkout_shipping_info_submitted', function (event) {
 analytics.subscribe('payment_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('AddPaymentInfo', event, {
+    sendGatewayEvent('AddPaymentInfo', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -755,7 +930,7 @@ analytics.subscribe('payment_info_submitted', function (event) {
 analytics.subscribe('checkout_completed', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendDualChannelEvent('Purchase', event, {
+    sendGatewayEvent('Purchase', event, {
         value: moneyAmount(checkout.totalPrice),
         currency: moneyCurrency(checkout.totalPrice),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -768,12 +943,12 @@ analytics.subscribe('checkout_completed', function (event) {
 
 analytics.subscribe('search_submitted', function (event) {
     var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
-    sendDualChannelEvent('Search', event, { search_string: query });
+    sendGatewayEvent('Search', event, { search_string: query });
 });
 
 analytics.subscribe('alert_displayed', function (event) {
     var alert = event.data && event.data.alert || {};
-    sendDualChannelEvent('ShopifyAlertDisplayed', event, {
+    sendGatewayEvent('ShopifyAlertDisplayed', event, {
         content_name: alert.message || alert.type,
         content_category: 'shopify_alert',
     });
@@ -781,7 +956,7 @@ analytics.subscribe('alert_displayed', function (event) {
 
 analytics.subscribe('ui_extension_errored', function (event) {
     var error = event.data && event.data.error || {};
-    sendDualChannelEvent('ShopifyUiExtensionErrored', event, {
+    sendGatewayEvent('ShopifyUiExtensionErrored', event, {
         content_name: error.message || error.name,
         content_category: 'shopify_ui_extension',
     });
