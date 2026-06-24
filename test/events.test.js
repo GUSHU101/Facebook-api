@@ -295,6 +295,8 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('fallbackEventId'), true);
     assert.equal(generated.includes('AbortController'), true);
     assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
+    assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
+    assert.equal(generated.includes('requeueFailedEvents'), true);
 
     const callbacks = {};
     const requests = [];
@@ -389,6 +391,28 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
         AddPaymentInfo: 'checkout-token-1:AddPaymentInfo',
         Purchase: 'checkout-token-1',
     });
+
+    requests.length = 0;
+    for (let index = 0; index < 25; index += 1) {
+        callbacks.page_viewed({
+            timestamp: `2026-06-24T00:01:${String(index).padStart(2, '0')}Z`,
+            clientId: `client-${index}`,
+            context: {
+                document: {
+                    location: { href: `https://demo.myshopify.com/products/${index}` },
+                    referrer: 'https://facebook.com/',
+                },
+                navigator: { userAgent: 'Mozilla/5.0' },
+            },
+            data: {},
+        });
+    }
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await sandbox.flushEventQueue();
+
+    const pageViewBatchSizes = requests.map(request => Array.isArray(request.body.events) ? request.body.events.length : 1);
+    assert.deepEqual(pageViewBatchSizes, [20, 5]);
+    assert.ok(requests.every(request => request.options.keepalive === true));
 });
 
 test('admin page script parses and handles admin action failures', async () => {

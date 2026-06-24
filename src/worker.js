@@ -124,6 +124,10 @@ async function sendToFacebookPixel(pixel, dbEvents) {
         },
     );
 
+    if (Number(response.data.events_received || 0) < finalEvents.length) {
+        throw new RetryableError(`Meta accepted ${response.data.events_received || 0}/${finalEvents.length} events`);
+    }
+
     return {
         platform: 'facebook',
         pixel_id: pixel.pixel_id,

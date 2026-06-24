@@ -230,6 +230,8 @@ const RECENT_EVENT_TTL_MS = 5000;
 const EVENT_QUEUE_FLUSH_MS = 1000;
 const FETCH_TIMEOUT_MS = 3000;
 const KEEPALIVE_LIMIT_BYTES = 60000;
+const MAX_BATCH_EVENTS = 20;
+const MAX_CLIENT_RETRIES = 1;
 const recentEvents = {};
 const eventQueue = [];
 var eventQueueTimer = null;
@@ -413,6 +415,52 @@ function enqueueEventPayload(payload) {
     }
 }
 
+function requestPayloadForEvents(events) {
+    return events.length === 1 ? events[0] : { shop_domain: SHOP_DOMAIN, events: events };
+}
+
+function serializedSize(value) {
+    try {
+        return JSON.stringify(value).length;
+    } catch (error) {
+        return KEEPALIVE_LIMIT_BYTES + 1;
+    }
+}
+
+function buildEventBatches(events) {
+    var batches = [];
+    var current = [];
+    events.forEach(function (event) {
+        var candidate = current.concat([event]);
+        var tooManyEvents = candidate.length > MAX_BATCH_EVENTS;
+        var tooLarge = serializedSize(requestPayloadForEvents(candidate)) >= KEEPALIVE_LIMIT_BYTES;
+        if (current.length && (tooManyEvents || tooLarge)) {
+            batches.push(current);
+            current = [event];
+        } else {
+            current = candidate;
+        }
+    });
+    if (current.length) batches.push(current);
+    return batches;
+}
+
+function requeueFailedEvents(events) {
+    var retryable = events.filter(function (event) {
+        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES;
+    }).map(function (event) {
+        return Object.assign({}, event, {
+            _client_retry_count: Number(event._client_retry_count || 0) + 1,
+        });
+    });
+
+    if (!retryable.length) return;
+    Array.prototype.push.apply(eventQueue, retryable);
+    if (!eventQueueTimer) {
+        eventQueueTimer = setTimeout(flushEventQueue, EVENT_QUEUE_FLUSH_MS);
+    }
+}
+
 function requestOptionsForBody(body) {
     var options = {
         method: 'POST',
@@ -440,16 +488,21 @@ async function flushEventQueue() {
     }
     if (!eventQueue.length) return;
 
-    var events = eventQueue.splice(0, eventQueue.length);
-    var requestPayload = events.length === 1 ? events[0] : { shop_domain: SHOP_DOMAIN, events: events };
-    var options = requestOptionsForBody(JSON.stringify(requestPayload));
+    var batches = buildEventBatches(eventQueue.splice(0, eventQueue.length));
+    for (var index = 0; index < batches.length; index += 1) {
+        var batch = batches[index];
+        var requestPayload = requestPayloadForEvents(batch);
+        var options = requestOptionsForBody(JSON.stringify(requestPayload));
 
-    try {
-        await fetch(CAPI_HUB_URL, options);
-    } catch (error) {
-    } finally {
-        if (options._timeoutId) clearTimeout(options._timeoutId);
-        delete options._timeoutId;
+        try {
+            var response = await fetch(CAPI_HUB_URL, options);
+            if (response && response.ok === false) requeueFailedEvents(batch);
+        } catch (error) {
+            requeueFailedEvents(batch);
+        } finally {
+            if (options._timeoutId) clearTimeout(options._timeoutId);
+            delete options._timeoutId;
+        }
     }
 }
 
