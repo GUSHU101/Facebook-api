@@ -318,7 +318,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO c
 执行位置：
 
 ```bash
-sudo -u postgres psql -d capi_saas
+查找目录 find /www/server -type f -name psql 2>/dev/null
+
+进入目录 sudo -u postgres 实际目录地址 -d capi_saas
 ```
 
 粘贴 SQL 执行，结束后输入：
