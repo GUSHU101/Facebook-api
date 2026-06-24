@@ -465,6 +465,37 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(initFallbackEvent.user_agent, 'InitUA/1.0');
     assert.equal(initFallbackEvent.external_id, '777');
 
+    requests.length = 0;
+    callbacks.cart_viewed({
+        id: 'cart-view-1',
+        timestamp: '2026-06-24T00:04:00Z',
+        clientId: 'client-cart',
+        context: {
+            document: {
+                location: { href: 'https://demo.myshopify.com/cart' },
+            },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {
+            cart: {
+                totalQuantity: 3,
+                lines: [
+                    {
+                        merchandise: { id: 'gid://shopify/ProductVariant/222' },
+                        quantity: 3,
+                    },
+                ],
+            },
+        },
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await sandbox.flushEventQueue();
+
+    const cartViewEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
+    assert.equal(cartViewEvent.event_name, 'CartView');
+    assert.equal(cartViewEvent.value, undefined);
+    assert.equal(cartViewEvent.num_items, 3);
+
 });
 
 test('admin page script parses and handles admin action failures', async () => {

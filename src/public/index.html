@@ -258,7 +258,7 @@ async function setCookieValue(name, value, days) {
 
 function moneyAmount(value) {
     var amount = Number((value && (value.amount || value.value)) || value);
-    return Number.isFinite(amount) ? amount : 0;
+    return Number.isFinite(amount) ? amount : undefined;
 }
 
 function moneyCurrency(value, fallback) {
@@ -285,7 +285,7 @@ function lineItemToContent(item) {
     var product = item.product || variant.product || {};
     var quantity = Number(item.quantity || 1);
     var totalPrice = moneyAmount(item.cost && item.cost.totalAmount || item.finalLinePrice);
-    var price = moneyAmount(variant.price || item.cost && item.cost.amountPerQuantity || (totalPrice && quantity ? totalPrice / quantity : undefined));
+    var price = moneyAmount(variant.price || item.cost && item.cost.amountPerQuantity || (totalPrice !== undefined && quantity ? totalPrice / quantity : undefined));
     return {
         id: normalizeShopifyId(variant.id || product.id || item.id),
         quantity: Number.isFinite(quantity) ? quantity : 1,
@@ -630,7 +630,7 @@ analytics.subscribe('cart_viewed', function (event) {
     var lines = cart.lines || cart.cartLines || [];
     var contents = lines.map(lineItemToContent).filter(function (item) { return item.id; });
     sendDualChannelEvent('CartView', event, {
-        value: moneyAmount(cart.cost && cart.cost.totalAmount || cart.totalQuantity),
+        value: moneyAmount(cart.cost && cart.cost.totalAmount),
         currency: moneyCurrency(cart.cost && cart.cost.totalAmount),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
