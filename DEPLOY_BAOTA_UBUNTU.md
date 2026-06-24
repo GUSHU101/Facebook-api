@@ -218,7 +218,7 @@ TRUST_PROXY_HOPS=1
 https://nestworks.com.au:8443
 ```
 
-生产环境必须使用 HTTPS，因为 Shopify Customer Events 和 Meta Pixel 都依赖安全上下文。可以使用非标准 HTTPS 端口，例如：
+生产环境必须使用 HTTPS，因为 Shopify Customer Events 的自定义像素需要安全上下文，后端也必须通过 HTTPS 接收事件。可以使用非标准 HTTPS 端口，例如：
 
 ```text
 https://capi.example.com:8443
@@ -243,7 +243,7 @@ https://capi.example.com:8443/admin
    - Facebook / Meta：填写 Pixel / Dataset ID 和 System User Access Token。
    - TikTok：填写 TikTok Pixel Code 和 Events API Access Token。
 3. 测试阶段填入对应平台的 Test Event Code。
-4. 打开“追踪代码”，填入店铺域名、Meta Pixel ID、可选 TikTok Pixel ID。
+4. 打开“追踪代码”，选择或填入店铺域名；Meta / TikTok Pixel ID 在平台路由里配置，不写入 Shopify 自定义像素代码。
 5. 确认 API 地址显示为 `https://capi.example.com:8443`。
 6. 将生成代码粘贴到 Shopify 后台：Settings -> Customer events -> Add custom pixel。
 
@@ -251,11 +251,11 @@ https://capi.example.com:8443/admin
 
 在 Meta Events Manager 中确认：
 
-- Browser 和 Server 事件同时出现。
-- 同一个事件的 browser `eventID` 与 server `event_id` 一致。
+- Server 事件从已配置的平台路由正常出现。
+- 同一个 checkout / webhook 合并后的 `event_id` 保持一致。
 - `Purchase` 包含 `value`、`currency`、`content_ids`、`contents`、`order_id`。
 - `_fbp`、`_fbc`、IP、User-Agent、email、phone、name、address、external_id 能尽量进入事件匹配。
-- TikTok Browser 和 Events API 事件使用相同 `event_id`，`Purchase` 在 TikTok 中映射为 `CompletePayment`。
+- TikTok Events API 事件使用相同 `event_id`，`Purchase` 在 TikTok 中映射为 `CompletePayment`。
 
 ## 9. Shopify Purchase Webhook 兜底
 

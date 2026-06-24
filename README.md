@@ -1,7 +1,7 @@
 # CAPI SaaS Data Hub
 
 
-Private VPS service for Shopify Web Pixel, Meta Pixel, Meta Conversions API, TikTok Pixel and TikTok Events API tracking.
+Private VPS service for Shopify Customer Events, Meta Conversions API, and TikTok Events API tracking.
 
 Baota/aaPanel is optional. For a clean Ubuntu VPS, use the one-command deployment guide: [DEPLOY_UBUNTU_ONECLICK.md](DEPLOY_UBUNTU_ONECLICK.md). For Baota-based operations, use [DEPLOY_BAOTA_UBUNTU.md](DEPLOY_BAOTA_UBUNTU.md). Before uploading to GitHub, see [GITHUB_RELEASE_CHECKLIST.md](GITHUB_RELEASE_CHECKLIST.md).
 
@@ -24,7 +24,9 @@ The installer auto-installs missing Ubuntu dependencies, generates secrets when 
 
 ## What it tracks
 
-The generated Shopify custom pixel subscribes to Shopify Web Pixels standard events and sends the same `event_id` to browser Pixel and server CAPI for deduplication.
+The generated Shopify custom pixel subscribes to Shopify Customer Events and sends those events to this hub with stable `event_id` values. The hub then delivers events server-side to Meta CAPI and TikTok Events API through the configured Pixel routes.
+
+The custom pixel intentionally does not inject the Meta or TikTok browser SDK. Shopify Customer Events run in sandboxed environments where DOM access and script injection are unavailable or unreliable, so browser SDK events should not be treated as the primary tracking path.
 
 Meta standard events:
 
@@ -60,13 +62,13 @@ TikTok event mapping:
 
 ## Accuracy notes
 
-- Meta Pixel and CAPI deduplication depends on matching `event_name` and `event_id`.
-- TikTok Pixel and Events API deduplication depends on matching `event` and `event_id`; TikTok can deduplicate overlapping Pixel/API events within its deduplication window.
-- `Purchase` uses a two-layer dedupe strategy: Redis absorbs obvious repeat traffic, while PostgreSQL merges browser pixel and Shopify webhook payloads with the same `event_id` before successful delivery. This lets webhook order data enrich browser events without double-sending already successful events.
+- Meta server-side deduplication depends on stable `event_name` and `event_id` values across Shopify Customer Events and order webhooks.
+- TikTok server-side delivery preserves the same `event_id` and maps standard events to TikTok Events API names, for example `Purchase` -> `CompletePayment`.
+- `Purchase` uses a two-layer dedupe strategy: Redis absorbs obvious repeat traffic, while PostgreSQL merges Shopify Customer Events and Shopify webhook payloads with the same `event_id` before successful delivery. This lets webhook order data enrich checkout events without double-sending already successful events.
 - Partial platform failures preserve delivery history. When replaying or retrying a partially failed event, pixels/platform routes already marked `SUCCESS` are skipped so only failed destinations are retried.
 - Purchase events have a short settle window (`PURCHASE_SETTLE_MS`, default 8000ms) before batching. This gives Shopify `orders/paid` webhook data a chance to merge with browser pixel data before server-side delivery.
 - Stale database events still marked `PENDING` are automatically re-queued after `STALE_PENDING_MINUTES` to recover from queue metadata loss, old-version residue, or interrupted deployments.
-- Browser tracking generates/persists fallback `_fbp`, `_fbc`, `_ttp`, and `ttclid` when official cookies are missing but URL click IDs are present, improving attribution continuity.
+- The Shopify pixel uses the Web Pixels `browser.cookie` API to read or persist fallback `_fbp`, `_fbc`, `_ttp`, and `ttclid` when official cookies are missing but URL click IDs are present, improving attribution continuity without DOM access.
 - Shopify `checkout_completed` is emitted once per checkout, usually on the thank-you page; upsell flows can emit it earlier.
 - Shopify may return protected customer data as `null` when the app lacks approved protected scopes. The generated pixel tolerates missing email, phone, name and address data.
 - Highest matching quality comes from combining `_fbp`, `_fbc`, browser user agent, server IP, Shopify `clientId`, email, phone, name and address when available.
@@ -120,8 +122,8 @@ TikTok event mapping:
 ## Verification
 
 - Use the Meta test event code in the Pixel route while testing.
-- Confirm browser and server events show the same event ID in Meta Events Manager.
-- Confirm TikTok browser and server events show the same event ID in TikTok Events Manager.
+- Confirm Meta server events arrive with the expected `event_id`, URL, user agent, `_fbp` / `_fbc` when available, and customer match fields when Shopify exposes them.
+- Confirm TikTok server events arrive with the expected `event_id`, `_ttp` / `ttclid` when available, value, currency, and contents.
 - Confirm purchase values, currency, content IDs and order ID are populated for `Purchase`.
 
 Local code checks:
@@ -150,7 +152,7 @@ The unit tests cover Shopify order-to-Purchase conversion, TikTok Events API pay
    - TikTok Pixel Code
    - Events API Access Token
    - Optional test event code
-7. Go to "追踪代码", enter the shop domain, Meta Pixel ID, and optional TikTok Pixel ID.
+7. Go to "追踪代码", select or enter the shop domain, and confirm the API origin is your public HTTPS origin such as `https://your-domain:8443`.
 8. Copy the generated code into Shopify Admin -> Settings -> Customer events -> Add custom pixel.
 9. Configure Shopify `orders/paid` webhook to:
 
@@ -159,8 +161,8 @@ The unit tests cover Shopify order-to-Purchase conversion, TikTok Events API pay
    ```
 
 10. Test in Meta Events Manager:
-    - Browser and Server events appear.
-    - `eventID` and `event_id` match.
+    - Server events appear from the configured Pixel route.
+    - `event_id` is stable across checkout and webhook enrichment.
     - `Purchase` includes value, currency, contents, content_ids, and order_id.
     - EMQ improves as email, phone, fbp, fbc, IP, user-agent, and address become available.
 11. Watch the admin "日志与死信" page:

@@ -225,14 +225,14 @@ Then:
 1. Add Shopify shop.
 2. Add Facebook / Meta route.
 3. Add TikTok route if needed.
-4. Copy generated Shopify Custom Pixel code.
+4. Copy generated Shopify Custom Pixel code. Pixel IDs and access tokens are configured in Pixel routes; the Shopify code only sends Customer Events to the hub.
 5. Configure Shopify `orders/paid` webhook:
 
 ```text
 https://capi.example.com:8443/api/webhook/orders/paid
 ```
 
-For `Purchase`, browser and webhook events should use the same checkout/order event ID. The server merges duplicate Purchase payloads while the event is still pending, so Shopify order webhook data can enrich browser events without causing already successful events to be sent again.
+For `Purchase`, Shopify Customer Events and webhook events should use the same checkout/order event ID. The server merges duplicate Purchase payloads while the event is still pending, so Shopify order webhook data can enrich checkout events without causing already successful events to be sent again.
 
 ## Upgrade
 

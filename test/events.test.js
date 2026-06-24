@@ -278,9 +278,16 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
 
     const generated = match[1]
         .replaceAll('${this.apiDomain}', 'https://nestworks.com.au:8443')
-        .replaceAll('${this.currentShop}', 'demo.myshopify.com')
-        .replaceAll('${this.currentPixelId}', '1234567890')
-        .replaceAll('${this.currentTikTokPixelId}', '');
+        .replaceAll('${this.currentShop}', 'demo.myshopify.com');
+
+    assert.equal(generated.includes('document.createElement'), false);
+    assert.equal(generated.includes('typeof document'), false);
+    assert.equal(generated.includes('connect.facebook.net'), false);
+    assert.equal(generated.includes('analytics.tiktok.com'), false);
+    assert.equal(generated.includes('fbq'), false);
+    assert.equal(generated.includes('ttq'), false);
+    assert.equal(generated.includes('FB_PIXEL_ID'), false);
+    assert.equal(generated.includes('TIKTOK_PIXEL_ID'), false);
 
     const callbacks = {};
     const bodies = [];

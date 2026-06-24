@@ -28,7 +28,7 @@
             </div>
 
             <section v-if="tab === 'deploy'" class="space-y-5">
-                <div class="grid md:grid-cols-5 gap-4 bg-white border rounded-lg p-4">
+                <div class="grid md:grid-cols-3 gap-4 bg-white border rounded-lg p-4">
                     <label class="block">
                         <span class="text-sm font-medium">Configured shop</span>
                         <select v-model="deployShopId" @change="applyDeployShop" class="mt-1 w-full border rounded-md p-2">
@@ -39,14 +39,6 @@
                     <label class="block">
                         <span class="text-sm font-medium">Shopify domain</span>
                         <input v-model="currentShop" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="your-store.myshopify.com">
-                    </label>
-                    <label class="block">
-                        <span class="text-sm font-medium">Meta Pixel ID</span>
-                        <input v-model="currentPixelId" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="1234567890">
-                    </label>
-                    <label class="block">
-                        <span class="text-sm font-medium">TikTok Pixel ID</span>
-                        <input v-model="currentTikTokPixelId" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="optional">
                     </label>
                     <label class="block">
                         <span class="text-sm font-medium">API origin</span>
@@ -199,59 +191,17 @@
                     deployShopId: '',
                     selectedShopId: '',
                     currentShop: 'your-store.myshopify.com',
-                    currentPixelId: 'YOUR_PIXEL_ID',
-                    currentTikTokPixelId: '',
                     newShop: { shop_domain: '', app_secret: '' },
                     newPixel: { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', test_event_code: '' },
                 };
             },
             computed: {
                 generatedCode() {
-                    return `// CAPI SaaS Hub - Shopify Web Pixel + Meta Pixel + Meta CAPI
+                    return `// CAPI SaaS Hub - Shopify Customer Events to server-side Meta CAPI and TikTok Events API
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
 const SHOP_DOMAIN = "${this.currentShop}";
-const FB_PIXEL_ID = "${this.currentPixelId}";
-const TIKTOK_PIXEL_ID = "${this.currentTikTokPixelId}";
-const PIXEL_GLOBAL = typeof window !== 'undefined' ? window : globalThis;
 const RECENT_EVENT_TTL_MS = 5000;
 const recentEvents = {};
-
-if (typeof document !== 'undefined' && FB_PIXEL_ID && FB_PIXEL_ID !== 'YOUR_PIXEL_ID') {
-    !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
-    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
-    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
-    t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(PIXEL_GLOBAL,
-    document,'script','https://connect.facebook.net/en_US/fbevents.js');
-    if (PIXEL_GLOBAL.fbq) PIXEL_GLOBAL.fbq('init', FB_PIXEL_ID);
-}
-
-if (TIKTOK_PIXEL_ID && typeof document !== 'undefined') {
-    !function (w, d, t) {
-        w.TiktokAnalyticsObject = t;
-        var ttq = w[t] = w[t] || [];
-        ttq.methods = ['page', 'track', 'identify'];
-        ttq.setAndDefer = function (t, e) { t[e] = function () { t.push([e].concat(Array.prototype.slice.call(arguments, 0))); }; };
-        for (var i = 0; i < ttq.methods.length; i++) ttq.setAndDefer(ttq, ttq.methods[i]);
-        ttq.load = function (e) {
-            var n = 'https://analytics.tiktok.com/i18n/pixel/events.js';
-            ttq._i = ttq._i || {};
-            ttq._i[e] = [];
-            ttq._i[e]._u = n;
-            ttq._t = ttq._t || {};
-            ttq._t[e] = +new Date();
-            ttq._o = ttq._o || {};
-            ttq._o[e] = {};
-            var a = d.createElement('script');
-            a.type = 'text/javascript';
-            a.async = true;
-            a.src = n + '?sdkid=' + e + '&lib=' + t;
-            var s = d.getElementsByTagName('script')[0];
-            s.parentNode.insertBefore(a, s);
-        };
-        ttq.load(TIKTOK_PIXEL_ID);
-        ttq.page();
-    }(PIXEL_GLOBAL, document, 'ttq');
-}
 
 async function getCookieValue(name) {
     try {
@@ -259,9 +209,7 @@ async function getCookieValue(name) {
             return await browser.cookie.get(name);
         }
     } catch (error) {}
-    if (typeof document === 'undefined' || !document.cookie) return undefined;
-    var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-    return match ? decodeURIComponent(match[2]) : undefined;
+    return undefined;
 }
 
 async function setCookieValue(name, value, days) {
@@ -273,9 +221,6 @@ async function setCookieValue(name, value, days) {
             return;
         }
     } catch (error) {}
-    if (typeof document !== 'undefined') {
-        document.cookie = name + '=' + encodeURIComponent(value) + '; max-age=' + maxAge + '; path=/; SameSite=Lax';
-    }
 }
 
 function moneyAmount(value) {
@@ -342,36 +287,6 @@ function getUrlParam(name, href) {
     } catch (error) {
         return undefined;
     }
-}
-
-function trackMetaPixel(method, eventName, customData, eventId) {
-    try {
-        if (PIXEL_GLOBAL.fbq) PIXEL_GLOBAL.fbq(method, eventName, customData || {}, { eventID: eventId });
-    } catch (error) {}
-}
-
-function mapTikTokEvent(metaEventName) {
-    return {
-        Purchase: 'CompletePayment',
-        AddToCart: 'AddToCart',
-        InitiateCheckout: 'InitiateCheckout',
-        AddPaymentInfo: 'AddPaymentInfo',
-        ViewContent: 'ViewContent',
-        Search: 'Search',
-        PageView: 'PageView',
-    }[metaEventName] || metaEventName;
-}
-
-function trackTikTokPixel(eventName, customData, eventId) {
-    try {
-        if (!PIXEL_GLOBAL.ttq) return;
-        var tiktokEvent = mapTikTokEvent(eventName);
-        if (tiktokEvent === 'PageView') {
-            PIXEL_GLOBAL.ttq.page({ event_id: eventId });
-        } else {
-            PIXEL_GLOBAL.ttq.track(tiktokEvent, customData || {}, { event_id: eventId });
-        }
-    } catch (error) {}
 }
 
 function shouldSendRecentEvent(eventName, eventId) {
@@ -477,11 +392,6 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
         normalizedOrderId,
         checkout.order && checkout.order.name,
     ]);
-
-    var standardEvents = ['PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase', 'Search'];
-    var pixelMethod = standardEvents.indexOf(metaEventName) >= 0 ? 'track' : 'trackCustom';
-    trackMetaPixel(pixelMethod, metaEventName, customData, eventId);
-    trackTikTokPixel(metaEventName, customData, eventId);
 
     fetch(CAPI_HUB_URL, {
         method: 'POST',
@@ -791,11 +701,7 @@ analytics.subscribe('ui_extension_errored', function (event) {
                     const shop = this.shops.find(item => Number(item.id) === shopId);
                     if (!shop) return;
 
-                    const facebookPixel = this.pixels.find(item => Number(item.shop_id) === shopId && item.platform === 'facebook');
-                    const tiktokPixel = this.pixels.find(item => Number(item.shop_id) === shopId && item.platform === 'tiktok');
                     this.currentShop = shop.shop_domain;
-                    this.currentPixelId = facebookPixel?.pixel_id || 'YOUR_PIXEL_ID';
-                    this.currentTikTokPixelId = tiktokPixel?.pixel_id || '';
                 },
                 async copyCode() {
                     await navigator.clipboard.writeText(this.generatedCode);
