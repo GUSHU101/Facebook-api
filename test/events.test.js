@@ -291,6 +291,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('FB_PIXEL_ID'), false);
     assert.equal(generated.includes('TIKTOK_PIXEL_ID'), false);
     assert.equal(generated.includes('META_ROUTE_PIXEL_IDS'), true);
+    assert.equal(generated.includes('new URL'), false);
     assert.equal(generated.includes("metaEventName + '_' + Date.now()"), false);
     assert.equal(generated.includes('fallbackEventId'), true);
     assert.equal(generated.includes('AbortController'), true);
@@ -413,6 +414,28 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     const pageViewBatchSizes = requests.map(request => Array.isArray(request.body.events) ? request.body.events.length : 1);
     assert.deepEqual(pageViewBatchSizes, [20, 5]);
     assert.ok(requests.every(request => request.options.keepalive === true));
+
+    requests.length = 0;
+    const sameMomentEvent = {
+        timestamp: '2026-06-24T00:02:00Z',
+        clientId: 'client-same',
+        context: {
+            document: {
+                location: { href: 'https://demo.myshopify.com/pages/about?fbclid=fb2' },
+                referrer: 'https://facebook.com/',
+            },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {},
+    };
+    callbacks.page_viewed({ ...sameMomentEvent, seq: 1 });
+    callbacks.page_viewed({ ...sameMomentEvent, seq: 2 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await sandbox.flushEventQueue();
+
+    const sameMomentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
+    assert.equal(sameMomentEvents.length, 2);
+    assert.notEqual(sameMomentEvents[0].event_id, sameMomentEvents[1].event_id);
 });
 
 test('admin page script parses and handles admin action failures', async () => {

@@ -121,6 +121,47 @@ function firstScalar(value) {
     return value;
 }
 
+function normalizeActionSource(value) {
+    const allowed = new Set([
+        'email',
+        'website',
+        'app',
+        'phone_call',
+        'chat',
+        'physical_store',
+        'system_generated',
+        'business_messaging',
+        'other',
+    ]);
+    const normalized = String(value || '').trim();
+    return allowed.has(normalized) ? normalized : 'website';
+}
+
+function normalizeUrl(value) {
+    try {
+        const parsed = new URL(String(value || '').trim());
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+        return parsed.toString();
+    } catch (error) {
+        return undefined;
+    }
+}
+
+function fallbackShopUrl(payload) {
+    const shopDomain = normalizeShopDomain(payload.shop_domain);
+    return shopDomain ? `https://${shopDomain}/` : undefined;
+}
+
+function eventSourceUrlForPayload(req, payload) {
+    return firstPresent(
+        normalizeUrl(payload.event_source_url),
+        normalizeUrl(payload.source_url),
+        normalizeUrl(payload.url),
+        normalizeUrl(req.headers.referer),
+        fallbackShopUrl(payload),
+    );
+}
+
 function primaryExternalId(payload) {
     const externalId = firstScalar(payload.external_id);
     return firstPresent(
@@ -473,9 +514,15 @@ function mergeReadyEvents(events) {
 }
 
 function resolveEventTime(payload) {
+    const now = Math.floor(Date.now() / 1000);
     const fromPayload = Date.parse(payload.timestamp);
-    if (Number.isFinite(fromPayload)) return Math.floor(fromPayload / 1000);
-    return Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(fromPayload)) return now;
+
+    const seconds = Math.floor(fromPayload / 1000);
+    const sevenDays = 7 * 24 * 60 * 60;
+    if (seconds > now + 300) return now;
+    if (seconds < now - sevenDays) return now;
+    return seconds;
 }
 
 function buildQueueJobId(shopId, dbEvents) {
@@ -575,9 +622,9 @@ async function queueEventForOutbox(req, payload, shopId) {
     const fbEventData = {
         event_name: eventName,
         event_time: resolveEventTime(enrichedPayload),
-        action_source: firstPresent(enrichedPayload.action_source, 'website'),
+        action_source: normalizeActionSource(enrichedPayload.action_source),
         event_id: eventId,
-        event_source_url: firstPresent(enrichedPayload.event_source_url, enrichedPayload.source_url, enrichedPayload.url, req.headers.referer),
+        event_source_url: eventSourceUrlForPayload(req, enrichedPayload),
         user_data: userData,
         custom_data: buildCustomData(enrichedPayload),
         _emq_estimate: calculateEMQ(userData),

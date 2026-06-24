@@ -302,13 +302,32 @@ function compact(object) {
     return output;
 }
 
-function getUrlParam(name, href) {
+function safeDecode(value) {
     try {
-        var fallbackHref = typeof location !== 'undefined' ? location.href : undefined;
-        return new URL(href || fallbackHref).searchParams.get(name) || undefined;
+        return decodeURIComponent(String(value || '').replace(/\\+/g, ' '));
     } catch (error) {
-        return undefined;
+        return String(value || '');
     }
+}
+
+function getUrlParam(name, href) {
+    var text = String(href || '');
+    var queryStart = text.indexOf('?');
+    if (queryStart === -1) return undefined;
+
+    var queryEnd = text.indexOf('#', queryStart);
+    var query = text.slice(queryStart + 1, queryEnd === -1 ? text.length : queryEnd);
+    var parts = query.split('&');
+    for (var index = 0; index < parts.length; index += 1) {
+        var part = parts[index];
+        if (!part) continue;
+        var equalsIndex = part.indexOf('=');
+        var rawKey = equalsIndex === -1 ? part : part.slice(0, equalsIndex);
+        var rawValue = equalsIndex === -1 ? '' : part.slice(equalsIndex + 1);
+        var key = safeDecode(rawKey);
+        if (key === name) return safeDecode(rawValue) || undefined;
+    }
+    return undefined;
 }
 
 function shouldSendRecentEvent(eventName, eventId) {
@@ -342,6 +361,8 @@ function fallbackEventId(eventName, event, currentUrl) {
         SHOP_DOMAIN,
         event && event.clientId,
         event && event.timestamp,
+        event && event.seq,
+        event && event.name,
         currentUrl,
         eventName,
     ].join('|'));
