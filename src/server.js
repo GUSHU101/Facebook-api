@@ -470,12 +470,22 @@ function buildPlatformData(payload) {
 }
 
 function buildCustomData(payload) {
+    const contents = Array.isArray(payload.contents)
+        ? payload.contents
+            .filter(Boolean)
+            .map(item => compactObject({
+                id: firstPresent(item.id, item.content_id),
+                quantity: Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : undefined,
+                item_price: Number.isFinite(Number(firstPresent(item.item_price, item.price))) ? Number(firstPresent(item.item_price, item.price)) : undefined,
+            }))
+            .filter(item => item.id)
+        : undefined;
     const contentIds = Array.isArray(payload.content_ids)
         ? payload.content_ids.filter(Boolean).map(String)
-        : undefined;
-    const contents = Array.isArray(payload.contents)
-        ? payload.contents.filter(Boolean)
-        : undefined;
+        : contents?.map(item => String(item.id));
+    const numItems = Number.isFinite(Number(payload.num_items))
+        ? Number(payload.num_items)
+        : contents?.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
 
     return compactObject({
         value: payload.value !== undefined && Number.isFinite(Number(payload.value)) ? Number(payload.value) : undefined,
@@ -485,7 +495,7 @@ function buildCustomData(payload) {
         content_type: payload.content_type,
         content_name: payload.content_name,
         content_category: payload.content_category,
-        num_items: Number.isFinite(Number(payload.num_items)) ? Number(payload.num_items) : undefined,
+        num_items: numItems || undefined,
         order_id: payload.order_id,
         search_string: payload.search_string,
     });

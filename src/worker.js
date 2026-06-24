@@ -105,8 +105,28 @@ function finalStatusForDeliveries(deliveries) {
     return deliveries.some(delivery => delivery.status === 'SUCCESS') ? 'PARTIAL_FAILED' : 'FAILED';
 }
 
-async function sendToFacebookPixel(pixel, dbEvents) {
-    const token = decryptTokenIfPossible(pixel.access_token);
+function chunkItems(items, size) {
+    const chunks = [];
+    const chunkSize = Math.max(1, Number(size || 1));
+    for (let index = 0; index < items.length; index += chunkSize) {
+        chunks.push(items.slice(index, index + chunkSize));
+    }
+    return chunks;
+}
+
+function facebookFailureResult(pixel, dbEvents, classification) {
+    return {
+        platform: 'facebook',
+        pixel_id: pixel.pixel_id,
+        name: pixel.name,
+        status: 'FAILED',
+        code: classification.code,
+        message: classification.message,
+        event_ids: eventIds(dbEvents),
+    };
+}
+
+async function postFacebookBatch(pixel, token, dbEvents) {
     const finalEvents = dbEvents.map(event => stripPrivateFields({ ...event.request_payload }));
     const requestBody = { data: finalEvents };
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
@@ -129,11 +149,59 @@ async function sendToFacebookPixel(pixel, dbEvents) {
     }
 
     return {
+        fbtrace_id: response.data.fbtrace_id,
+        events_received: Number(response.data.events_received || 0),
+        event_ids: eventIds(dbEvents),
+    };
+}
+
+async function sendFacebookBatchWithIsolation(pixel, token, dbEvents) {
+    try {
+        const result = await postFacebookBatch(pixel, token, dbEvents);
+        return {
+            successes: [result],
+            failures: [],
+        };
+    } catch (error) {
+        const classification = classifyFacebookError(error);
+        if (classification.retryable) throw error;
+
+        if (dbEvents.length === 1) {
+            return {
+                successes: [],
+                failures: [facebookFailureResult(pixel, dbEvents, classification)],
+            };
+        }
+
+        const midpoint = Math.ceil(dbEvents.length / 2);
+        const left = await sendFacebookBatchWithIsolation(pixel, token, dbEvents.slice(0, midpoint));
+        const right = await sendFacebookBatchWithIsolation(pixel, token, dbEvents.slice(midpoint));
+        return {
+            successes: [...left.successes, ...right.successes],
+            failures: [...left.failures, ...right.failures],
+        };
+    }
+}
+
+async function sendToFacebookPixel(pixel, dbEvents) {
+    const token = decryptTokenIfPossible(pixel.access_token);
+    const successes = [];
+    const failures = [];
+
+    for (const batch of chunkItems(dbEvents, config.facebookBatchSize)) {
+        const result = await sendFacebookBatchWithIsolation(pixel, token, batch);
+        successes.push(...result.successes);
+        failures.push(...result.failures);
+    }
+
+    return {
         platform: 'facebook',
         pixel_id: pixel.pixel_id,
         name: pixel.name,
-        fbtrace_id: response.data.fbtrace_id,
-        events_received: response.data.events_received,
+        events_received: successes.reduce((sum, item) => sum + Number(item.events_received || 0), 0),
+        results: successes,
+        successful_event_ids: successes.flatMap(item => item.event_ids || []),
+        permanent_failures: failures,
     };
 }
 
@@ -224,11 +292,19 @@ const worker = new Worker('capi-events', async job => {
 
         try {
             const result = await sendToPlatform(pixel, pixelDbEvents);
-            deliveries.push({
-                ...result,
-                status: 'SUCCESS',
-                event_ids: eventIds(pixelDbEvents),
-            });
+            const { successful_event_ids: successfulEventIds, permanent_failures: resultFailures, ...deliveryResult } = result;
+            const successEventIds = successfulEventIds || eventIds(pixelDbEvents);
+            if (successEventIds.length > 0) {
+                deliveries.push({
+                    ...deliveryResult,
+                    status: 'SUCCESS',
+                    event_ids: successEventIds,
+                });
+            }
+            for (const failure of resultFailures || []) {
+                deliveries.push(failure);
+                permanentFailures.push(failure);
+            }
         } catch (error) {
             const classification = pixel.platform === 'tiktok' ? classifyTikTokError(error) : classifyFacebookError(error);
             const failure = {

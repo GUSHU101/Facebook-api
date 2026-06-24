@@ -43,6 +43,7 @@ module.exports = {
     batchCron: process.env.BATCH_CRON || '*/5 * * * * *',
     watchdogCron: process.env.WATCHDOG_CRON || '* * * * *',
     fbRequestTimeoutMs: readInt('FB_REQUEST_TIMEOUT_MS', 15000),
+    facebookBatchSize: readInt('FACEBOOK_BATCH_SIZE', 100),
     workerConcurrency: readInt('WORKER_CONCURRENCY', 20),
     workerRateLimitMax: readInt('WORKER_RATE_LIMIT_MAX', 100),
     workerRateLimitDurationMs: readInt('WORKER_RATE_LIMIT_DURATION_MS', 1000),
