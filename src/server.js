@@ -68,10 +68,41 @@ function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 }
 
+function requireMyshopifyDomain(value) {
+    const shopDomain = normalizeShopDomain(value);
+    if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shopDomain)) {
+        const error = new Error('shop_domain must be a valid myshopify.com domain');
+        error.statusCode = 400;
+        throw error;
+    }
+    return shopDomain;
+}
+
 function requireString(value, fieldName) {
     const normalized = String(value || '').trim();
     if (!normalized) {
         const error = new Error(`Missing ${fieldName}`);
+        error.statusCode = 400;
+        throw error;
+    }
+    return normalized;
+}
+
+function requireBoundedString(value, fieldName, maxLength) {
+    const normalized = requireString(value, fieldName);
+    if (normalized.length > maxLength) {
+        const error = new Error(`${fieldName} must be ${maxLength} characters or fewer`);
+        error.statusCode = 400;
+        throw error;
+    }
+    return normalized;
+}
+
+function optionalBoundedString(value, fieldName, maxLength) {
+    const normalized = String(value || '').trim();
+    if (!normalized) return null;
+    if (normalized.length > maxLength) {
+        const error = new Error(`${fieldName} must be ${maxLength} characters or fewer`);
         error.statusCode = 400;
         throw error;
     }
@@ -632,7 +663,7 @@ async function restoreReplayableEvents(shopId, dbEvents) {
 }
 
 async function queueEventForOutbox(req, payload, shopId) {
-    const eventName = requireString(payload.event_name, 'event_name');
+    const eventName = requireBoundedString(payload.event_name, 'event_name', 50);
     const proposedEventId = normalizeEventId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`;
     const attribution = await loadAttributionSnapshot(shopId, payload);
     const enrichedPayload = { ...attribution, ...payload };
@@ -952,11 +983,8 @@ app.get('/api/admin/shops', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/admin/shops', asyncHandler(async (req, res) => {
-    const shopDomain = normalizeShopDomain(req.body.shop_domain);
-    const appSecret = requireString(req.body.app_secret, 'app_secret');
-    if (!shopDomain.endsWith('.myshopify.com')) {
-        return res.status(400).json({ error: 'shop_domain must be a myshopify.com domain' });
-    }
+    const shopDomain = requireMyshopifyDomain(req.body.shop_domain);
+    const appSecret = requireBoundedString(req.body.app_secret, 'app_secret', 2048);
 
     await pool.query(
         `INSERT INTO shops (shop_domain, app_secret)
@@ -1016,10 +1044,10 @@ app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
 app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     const shopId = Number(req.body.shop_id);
     const platform = String(req.body.platform || 'facebook').trim().toLowerCase();
-    const pixelId = requireString(req.body.pixel_id, 'pixel_id');
-    const name = String(req.body.name || '').trim() || `${platform}-${pixelId.slice(-6)}`;
-    const accessToken = requireString(req.body.access_token, 'access_token');
-    const testEventCode = String(req.body.test_event_code || '').trim() || null;
+    const pixelId = requireBoundedString(req.body.pixel_id, 'pixel_id', 64);
+    const name = optionalBoundedString(req.body.name, 'name', 100) || `${platform}-${pixelId.slice(-6)}`;
+    const accessToken = requireBoundedString(req.body.access_token, 'access_token', 10000);
+    const testEventCode = optionalBoundedString(req.body.test_event_code, 'test_event_code', 100);
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
 
