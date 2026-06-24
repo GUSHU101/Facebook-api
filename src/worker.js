@@ -126,6 +126,11 @@ function facebookFailureResult(pixel, dbEvents, classification) {
     };
 }
 
+function shouldIsolateFacebookError(classification) {
+    const pixelLevelCodes = new Set([102, 190, 463, 467]);
+    return !pixelLevelCodes.has(classification.code);
+}
+
 async function postFacebookBatch(pixel, token, dbEvents) {
     const finalEvents = dbEvents.map(event => stripPrivateFields({ ...event.request_payload }));
     const requestBody = { data: finalEvents };
@@ -166,7 +171,7 @@ async function sendFacebookBatchWithIsolation(pixel, token, dbEvents) {
         const classification = classifyFacebookError(error);
         if (classification.retryable) throw error;
 
-        if (dbEvents.length === 1) {
+        if (dbEvents.length === 1 || !shouldIsolateFacebookError(classification)) {
             return {
                 successes: [],
                 failures: [facebookFailureResult(pixel, dbEvents, classification)],

@@ -474,7 +474,7 @@ function buildCustomData(payload) {
         ? payload.contents
             .filter(Boolean)
             .map(item => compactObject({
-                id: firstPresent(item.id, item.content_id),
+                id: firstPresent(item.id, item.content_id) ? String(firstPresent(item.id, item.content_id)) : undefined,
                 quantity: Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : undefined,
                 item_price: Number.isFinite(Number(firstPresent(item.item_price, item.price))) ? Number(firstPresent(item.item_price, item.price)) : undefined,
             }))
@@ -490,8 +490,8 @@ function buildCustomData(payload) {
     return compactObject({
         value: payload.value !== undefined && Number.isFinite(Number(payload.value)) ? Number(payload.value) : undefined,
         currency: payload.currency ? String(payload.currency).trim().toUpperCase() : undefined,
-        content_ids: contentIds,
-        contents,
+        content_ids: contentIds?.length ? contentIds : undefined,
+        contents: contents?.length ? contents : undefined,
         content_type: payload.content_type,
         content_name: payload.content_name,
         content_category: payload.content_category,
