@@ -873,12 +873,21 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
 
-    await pool.query(
+    const shopResult = await pool.query(
+        'SELECT id FROM shops WHERE id = $1 AND status = $2',
+        [shopId, 'active'],
+    );
+    if (shopResult.rowCount === 0) {
+        return res.status(400).json({ error: 'Shop not found or inactive. Save an active shop before adding a Pixel route.' });
+    }
+
+    const { rows } = await pool.query(
         `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token, test_event_code)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
         [shopId, platform, name, pixelId, encryptToken(accessToken), testEventCode],
     );
-    res.status(201).json({ success: true });
+    res.status(201).json({ success: true, id: rows[0].id });
 }));
 
 app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
@@ -1041,6 +1050,13 @@ app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
 
 app.use((err, req, res, next) => {
     const statusCode = err.statusCode || 500;
+    if (err.code === '42501') {
+        console.error(err);
+        return res.status(500).json({
+            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, event_store, dead_letters, and their sequences.',
+            code: err.code,
+        });
+    }
     if (statusCode >= 500) console.error(err);
     res.status(statusCode).json({ error: statusCode >= 500 ? 'Internal Server Error' : err.message });
 });
