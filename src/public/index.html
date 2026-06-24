@@ -94,17 +94,19 @@
                     <input v-model.trim="newPixel.name" placeholder="Route name, optional" class="border rounded-md p-2">
                     <input v-model.trim="newPixel.pixel_id" placeholder="Pixel / Dataset ID / TikTok Pixel Code" class="border rounded-md p-2 font-mono">
                     <input v-model.trim="newPixel.access_token" type="password" placeholder="Meta System Token / TikTok Access Token" class="border rounded-md p-2 font-mono">
+                    <input v-model.trim="newPixel.quality_access_token" type="password" placeholder="Meta Dataset Quality API Token, optional" class="border rounded-md p-2 font-mono">
                     <input v-model.trim="newPixel.test_event_code" placeholder="Test Event Code, optional" class="border rounded-md p-2 font-mono">
                     <button @click="addPixel" :disabled="busy.addPixel" class="bg-slate-950 text-white rounded-md px-5 py-2 font-medium md:col-span-2 disabled:opacity-50">{{ busy.addPixel ? 'Saving...' : 'Save Pixel route' }}</button>
                 </div>
                 <table class="w-full bg-white border rounded-lg overflow-hidden text-sm">
-                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">Shop</th><th class="p-3">Platform</th><th class="p-3">Name</th><th class="p-3">Pixel / Dataset</th><th class="p-3">Test code</th><th class="p-3">Action</th></tr></thead>
+                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">Shop</th><th class="p-3">Platform</th><th class="p-3">Name</th><th class="p-3">Pixel / Dataset</th><th class="p-3">Quality token</th><th class="p-3">Test code</th><th class="p-3">Action</th></tr></thead>
                     <tbody>
                         <tr v-for="p in pixels" :key="p.id" class="border-t">
                             <td class="p-3 font-mono">{{ p.shop_domain }}</td>
                             <td class="p-3 uppercase font-semibold">{{ p.platform }}</td>
                             <td class="p-3">{{ p.name }}</td>
                             <td class="p-3 font-mono">{{ p.pixel_id }}</td>
+                            <td class="p-3">{{ p.has_quality_token ? 'Configured' : '-' }}</td>
                             <td class="p-3 font-mono">{{ p.test_event_code || '-' }}</td>
                             <td class="p-3"><button @click="deletePixel(p.id)" class="text-red-600 font-medium">Delete</button></td>
                         </tr>
@@ -158,6 +160,41 @@
                             <div class="mt-2 text-xs text-slate-500 font-mono">{{ signal.matched || 0 }}/{{ signal.total || 0 }}</div>
                         </div>
                     </div>
+                </div>
+                <div class="bg-white border rounded-lg p-4 text-sm">
+                    <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+                        <div>
+                            <div class="font-semibold">Meta official dataset quality</div>
+                            <div class="text-xs text-slate-500">Latest cached Dataset Quality API snapshot</div>
+                        </div>
+                        <button @click="refreshMetaQuality" :disabled="busy.metaQuality" class="bg-white border rounded-md px-3 py-2 text-sm disabled:opacity-50">{{ busy.metaQuality ? 'Refreshing...' : 'Refresh Meta quality' }}</button>
+                    </div>
+                    <div v-if="officialMetaQuality.length" class="grid md:grid-cols-2 gap-3">
+                        <div v-for="item in officialMetaQuality" :key="item.pixel_route_id" class="border rounded-md p-3 bg-slate-50">
+                            <div class="flex flex-wrap items-start justify-between gap-2">
+                                <div>
+                                    <div class="font-semibold">{{ item.name }}</div>
+                                    <div class="font-mono text-xs text-slate-500">{{ item.pixel_id }}</div>
+                                </div>
+                                <span class="px-2 py-1 rounded-md text-xs font-semibold" :class="item.status === 'SUCCESS' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'">{{ item.status }}</span>
+                            </div>
+                            <div class="mt-3 grid grid-cols-2 gap-3">
+                                <div class="border rounded-md bg-white p-3">
+                                    <div class="text-xs text-slate-500">Official EMQ avg</div>
+                                    <div class="text-2xl font-semibold">{{ officialAverageScore(item) }}</div>
+                                </div>
+                                <div class="border rounded-md bg-white p-3">
+                                    <div class="text-xs text-slate-500">Fetched</div>
+                                    <div class="font-mono text-xs">{{ formatTime(item.fetched_at) }}</div>
+                                </div>
+                            </div>
+                            <div v-if="officialEvents(item).length" class="mt-3 flex flex-wrap gap-2">
+                                <span v-for="event in officialEvents(item)" :key="event.event_name" class="px-2 py-1 rounded-md bg-white border font-mono text-xs">{{ event.event_name }}: {{ event.score }}/10</span>
+                            </div>
+                            <div v-if="item.error_message" class="mt-3 text-xs text-red-700 font-mono">{{ item.error_message }}</div>
+                        </div>
+                    </div>
+                    <div v-else class="text-slate-500">No Meta official quality snapshot yet. Add a Meta quality-capable token and refresh.</div>
                 </div>
                 <div class="flex flex-wrap gap-3">
                     <select v-model="selectedShopId" @change="fetchOperationalData" class="border rounded-md px-3 py-2 bg-white">
@@ -223,7 +260,7 @@
                     selectedShopId: '',
                     currentShop: 'your-store.myshopify.com',
                     newShop: { shop_domain: '', app_secret: '' },
-                    newPixel: { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', test_event_code: '' },
+                    newPixel: { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' },
                 };
             },
             computed: {
@@ -251,6 +288,9 @@
                         { key: 'client_ip_address', label: 'IP', matched: 0, total: 0, coverage: null },
                         { key: 'client_user_agent', label: 'User Agent', matched: 0, total: 0, coverage: null },
                     ];
+                },
+                officialMetaQuality() {
+                    return this.summary.official_meta_quality || [];
                 },
                 generatedCode() {
                     return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
@@ -1056,6 +1096,13 @@ analytics.subscribe('ui_extension_errored', function (event) {
                         return result;
                     }, 'DLQ replay submitted.');
                 },
+                async refreshMetaQuality() {
+                    await this.runAction('metaQuality', async () => {
+                        const result = await this.api(this.shopScopedPath('/api/admin/meta-quality/refresh'), { method: 'POST' });
+                        await this.fetchSummary();
+                        return result;
+                    }, 'Meta official quality refresh requested.');
+                },
                 async clearLogs() {
                     const scope = this.selectedShopId ? 'selected shop' : 'all shops';
                     if (!confirm(`Clear event logs, queued jobs, and dedupe cache for ${scope}? Dead letters will not be deleted.`)) return;
@@ -1083,7 +1130,7 @@ analytics.subscribe('ui_extension_errored', function (event) {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(this.newPixel),
                         });
-                        this.newPixel = { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', test_event_code: '' };
+                        this.newPixel = { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' };
                         await Promise.all([this.fetchPixels(), this.fetchSummary()]);
                     }, 'Pixel route saved.');
                 },
@@ -1149,6 +1196,13 @@ analytics.subscribe('ui_extension_errored', function (event) {
                     if (Number(value) >= 80) return 'bg-emerald-500';
                     if (Number(value) >= 50) return 'bg-amber-500';
                     return 'bg-red-500';
+                },
+                officialAverageScore(item) {
+                    const score = item?.summary?.average_score;
+                    return score === null || score === undefined ? '-' : `${Number(score).toFixed(1)}/10`;
+                },
+                officialEvents(item) {
+                    return Array.isArray(item?.summary?.events) ? item.summary.events : [];
                 },
             },
             mounted() {

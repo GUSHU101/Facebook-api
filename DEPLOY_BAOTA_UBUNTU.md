@@ -301,11 +301,13 @@ ALTER TABLE shops OWNER TO capi_saas;
 ALTER TABLE pixels OWNER TO capi_saas;
 ALTER TABLE event_store OWNER TO capi_saas;
 ALTER TABLE dead_letters OWNER TO capi_saas;
+ALTER TABLE meta_quality_snapshots OWNER TO capi_saas;
 
 ALTER SEQUENCE shops_id_seq OWNER TO capi_saas;
 ALTER SEQUENCE pixels_id_seq OWNER TO capi_saas;
 ALTER SEQUENCE event_store_id_seq OWNER TO capi_saas;
 ALTER SEQUENCE dead_letters_id_seq OWNER TO capi_saas;
+ALTER SEQUENCE meta_quality_snapshots_id_seq OWNER TO capi_saas;
 
 GRANT USAGE, CREATE ON SCHEMA public TO capi_saas;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO capi_saas;

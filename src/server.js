@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const axios = require('axios');
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -63,6 +64,7 @@ const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEDUPE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const PURCHASE_DEDUPE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_PIXEL_BATCH_SIZE = 50;
+const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -407,6 +409,157 @@ async function removeQueuedSendJobsForShop(shopId = null) {
         }
     }
     return removed;
+}
+
+function scoreFromValue(value) {
+    if (value === undefined || value === null || value === '') return null;
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+        const match = value.match(/\d+(?:\.\d+)?/);
+        if (match) return Number(match[0]);
+    }
+    if (typeof value === 'object') {
+        return scoreFromValue(firstPresent(
+            value.score,
+            value.value,
+            value.rating,
+            value.event_match_quality_score,
+            value.match_quality_score,
+            value.event_match_quality,
+        ));
+    }
+    return null;
+}
+
+function eventNameFromObject(value) {
+    return firstPresent(
+        value.event_name,
+        value.event,
+        value.standard_event,
+        value.event_type,
+        value.name,
+    );
+}
+
+function extractOfficialEmqEvents(rawPayload) {
+    const events = [];
+    const seen = new Set();
+
+    function visit(value) {
+        if (!value || typeof value !== 'object') return;
+        if (Array.isArray(value)) {
+            value.forEach(visit);
+            return;
+        }
+
+        const eventName = eventNameFromObject(value);
+        const score = scoreFromValue(firstPresent(
+            value.event_match_quality_score,
+            value.match_quality_score,
+            value.event_match_quality,
+            value.emq_score,
+            value.score,
+        ));
+        if (eventName && score !== null) {
+            const key = `${eventName}:${score}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                events.push({
+                    event_name: String(eventName),
+                    score: Number(score.toFixed(1)),
+                });
+            }
+        }
+
+        Object.values(value).forEach(visit);
+    }
+
+    visit(rawPayload);
+    return events;
+}
+
+function summarizeMetaQuality(rawPayload) {
+    const events = extractOfficialEmqEvents(rawPayload);
+    const average = events.length
+        ? Number((events.reduce((sum, item) => sum + Number(item.score || 0), 0) / events.length).toFixed(1))
+        : null;
+    return {
+        metric_type: META_QUALITY_METRIC_TYPE,
+        average_score: average,
+        events,
+    };
+}
+
+async function insertMetaQualitySnapshot(pixel, status, rawPayload, errorMessage = null) {
+    const summary = status === 'SUCCESS' ? summarizeMetaQuality(rawPayload) : null;
+    await pool.query(
+        `INSERT INTO meta_quality_snapshots
+            (pixel_route_id, shop_id, dataset_id, status, metric_type, summary_payload, raw_payload, error_message)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8)`,
+        [
+            pixel.id,
+            pixel.shop_id,
+            pixel.pixel_id,
+            status,
+            META_QUALITY_METRIC_TYPE,
+            summary ? JSON.stringify(summary) : null,
+            rawPayload ? JSON.stringify(rawPayload) : null,
+            errorMessage,
+        ],
+    );
+    return summary;
+}
+
+async function fetchMetaQualityForPixel(pixel) {
+    const token = decryptTokenIfPossible(firstPresent(pixel.quality_access_token, pixel.access_token));
+    if (!token) throw new Error('Missing Meta quality token');
+
+    const url = `https://graph.facebook.com/${config.fbApiVersion}/dataset_quality`;
+    const response = await axios.get(url, {
+        timeout: config.fbRequestTimeoutMs,
+        params: {
+            dataset_id: pixel.pixel_id,
+            web_metric_type: META_QUALITY_METRIC_TYPE,
+            access_token: token,
+        },
+    });
+    return response.data;
+}
+
+async function refreshMetaQualityForPixel(pixel) {
+    if (pixel.platform !== 'facebook') return null;
+
+    try {
+        const rawPayload = await fetchMetaQualityForPixel(pixel);
+        const summary = await insertMetaQualitySnapshot(pixel, 'SUCCESS', rawPayload);
+        return { pixel_id: pixel.pixel_id, status: 'SUCCESS', summary };
+    } catch (error) {
+        const responsePayload = error.response?.data || null;
+        const message = responsePayload?.error?.message || error.message;
+        await insertMetaQualitySnapshot(pixel, 'FAILED', responsePayload, message);
+        return { pixel_id: pixel.pixel_id, status: 'FAILED', error: message };
+    }
+}
+
+async function refreshMetaQualitySnapshots(shopId = null) {
+    const params = shopId ? [shopId] : [];
+    const shopFilter = shopId ? 'AND p.shop_id = $1' : '';
+    const { rows: pixels } = await pool.query(
+        `SELECT p.id, p.shop_id, p.platform, p.name, p.pixel_id, p.access_token, p.quality_access_token
+         FROM pixels p
+         JOIN shops s ON s.id = p.shop_id
+         WHERE p.platform = 'facebook'
+           AND s.status = 'active'
+           ${shopFilter}
+         ORDER BY p.id ASC`,
+        params,
+    );
+
+    const results = [];
+    for (const pixel of pixels) {
+        results.push(await refreshMetaQualityForPixel(pixel));
+    }
+    return results;
 }
 
 function buildUserData(req, payload) {
@@ -988,6 +1141,25 @@ cron.schedule(config.watchdogCron, async () => {
     }
 });
 
+cron.schedule(config.metaQualityCron, async () => {
+    const lockKey = 'lock:meta_quality_refresh';
+    const lockToken = crypto.randomUUID();
+    try {
+        const lock = await redis.set(lockKey, lockToken, 'EX', 300, 'NX');
+        if (!lock) return;
+
+        const results = await refreshMetaQualitySnapshots();
+        const failed = results.filter(result => result?.status === 'FAILED').length;
+        if (results.length > 0) {
+            console.warn(`[MetaQuality] refreshed ${results.length} dataset quality snapshots${failed ? `, ${failed} failed` : ''}`);
+        }
+    } catch (error) {
+        console.error('Meta quality refresh error:', error);
+    } finally {
+        await releaseRedisLock(lockKey, lockToken).catch(() => {});
+    }
+});
+
 const authMw = basicAuth({
     users: { [config.adminUsername]: config.adminPassword },
     challenge: true,
@@ -1059,7 +1231,8 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
 
 app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
-        SELECT p.id, p.shop_id, s.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code
+        SELECT p.id, p.shop_id, s.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code,
+               (p.quality_access_token IS NOT NULL AND p.quality_access_token <> '') AS has_quality_token
         FROM pixels p
         JOIN shops s ON p.shop_id = s.id
         ORDER BY p.id DESC
@@ -1073,6 +1246,7 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     const pixelId = requireBoundedString(req.body.pixel_id, 'pixel_id', 64);
     const name = optionalBoundedString(req.body.name, 'name', 100) || `${platform}-${pixelId.slice(-6)}`;
     const accessToken = requireBoundedString(req.body.access_token, 'access_token', 10000);
+    const qualityAccessToken = optionalBoundedString(req.body.quality_access_token, 'quality_access_token', 10000);
     const testEventCode = optionalBoundedString(req.body.test_event_code, 'test_event_code', 100);
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
@@ -1086,10 +1260,10 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     }
 
     const { rows } = await pool.query(
-        `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token, test_event_code)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token, quality_access_token, test_event_code)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id`,
-        [shopId, platform, name, pixelId, encryptToken(accessToken), testEventCode],
+        [shopId, platform, name, pixelId, encryptToken(accessToken), qualityAccessToken ? encryptToken(qualityAccessToken) : null, testEventCode],
     );
     res.status(201).json({ success: true, id: rows[0].id });
 }));
@@ -1157,6 +1331,7 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         statusResult,
         emqResult,
         signalResult,
+        officialQualityResult,
         dlqResult,
         shopsResult,
         pixelsResult,
@@ -1185,6 +1360,24 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                    COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'client_user_agent', false))::int AS client_user_agent
             FROM event_store
             WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
+        `, params),
+        pool.query(`
+            SELECT DISTINCT ON (m.pixel_route_id)
+                   m.pixel_route_id,
+                   m.shop_id,
+                   s.shop_domain,
+                   p.name,
+                   p.pixel_id,
+                   m.fetched_at,
+                   m.status,
+                   m.metric_type,
+                   m.summary_payload,
+                   m.error_message
+            FROM meta_quality_snapshots m
+            JOIN pixels p ON p.id = m.pixel_route_id
+            JOIN shops s ON s.id = m.shop_id
+            WHERE p.platform = 'facebook'${shopId ? ' AND m.shop_id = $1' : ''}
+            ORDER BY m.pixel_route_id, m.fetched_at DESC
         `, params),
         pool.query(`SELECT COUNT(*)::int AS count FROM dead_letters WHERE status = 'FAILED_PERMANENT'${dlqShopFilter}`, params),
         pool.query(`SELECT COUNT(*)::int AS count FROM shops WHERE status = 'active'${shopFilter}`, params),
@@ -1229,11 +1422,38 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             by_status: statusResult.rows,
             emq_signals: emqSignals,
         },
+        official_meta_quality: officialQualityResult.rows.map(row => ({
+            shop_domain: row.shop_domain,
+            pixel_route_id: row.pixel_route_id,
+            pixel_id: row.pixel_id,
+            name: row.name,
+            fetched_at: row.fetched_at,
+            status: row.status,
+            metric_type: row.metric_type,
+            summary: row.summary_payload,
+            error_message: row.error_message,
+        })),
         active_shops: shopsResult.rows[0]?.count || 0,
         pixels_by_platform: pixelsResult.rows,
         dead_letters: dlqResult.rows[0]?.count || 0,
         queue: queueCounts,
         redis_pending: pendingByShop,
+    });
+}));
+
+app.post('/api/admin/meta-quality/refresh', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    if (shopId) {
+        const shopResult = await pool.query('SELECT id FROM shops WHERE id = $1 AND status = $2', [shopId, 'active']);
+        if (shopResult.rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
+    }
+
+    const results = await refreshMetaQualitySnapshots(shopId);
+    res.json({
+        success: true,
+        refreshed: results.length,
+        failed: results.filter(result => result?.status === 'FAILED').length,
+        results,
     });
 }));
 

@@ -147,6 +147,7 @@ The unit tests cover Shopify order-to-Purchase conversion, TikTok Events API pay
    - Platform: `Facebook / Meta`
    - Pixel / Dataset ID
    - System User Access Token
+   - Optional Meta Dataset Quality API token for official EMQ snapshots
    - Optional Meta Test Event Code
 6. Optional: add TikTok route:
    - Platform: `TikTok`
@@ -168,6 +169,7 @@ The unit tests cover Shopify order-to-Purchase conversion, TikTok Events API pay
     - EMQ improves as email, phone, fbp, fbc, IP, user-agent, and address become available.
 11. Watch the admin "日志与死信" page:
     - Low EMQ usually means missing email/phone/fbp/fbc/address.
+    - Meta official dataset quality appears when a Dataset Quality API-capable token is configured; this cached official snapshot can lag behind live events.
     - DLQ means token, permission, rate limit, or platform API issues need action.
    
     - shopify权限

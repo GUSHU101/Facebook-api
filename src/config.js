@@ -42,6 +42,7 @@ module.exports = {
     adminRateLimitPerWindow: readInt('ADMIN_RATE_LIMIT_PER_WINDOW', 100),
     batchCron: process.env.BATCH_CRON || '*/5 * * * * *',
     watchdogCron: process.env.WATCHDOG_CRON || '* * * * *',
+    metaQualityCron: process.env.META_QUALITY_CRON || '0 */6 * * *',
     fbRequestTimeoutMs: readInt('FB_REQUEST_TIMEOUT_MS', 15000),
     facebookBatchSize: readInt('FACEBOOK_BATCH_SIZE', 100),
     workerConcurrency: readInt('WORKER_CONCURRENCY', 20),

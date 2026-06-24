@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS pixels (
     name VARCHAR(100) NOT NULL,
     pixel_id VARCHAR(64) NOT NULL,
     access_token TEXT NOT NULL,
+    quality_access_token TEXT,
     test_event_code VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -44,6 +45,19 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     status VARCHAR(30) DEFAULT 'FAILED_PERMANENT'
 );
 
+CREATE TABLE IF NOT EXISTS meta_quality_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    pixel_route_id INTEGER REFERENCES pixels(id) ON DELETE CASCADE,
+    shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE,
+    dataset_id VARCHAR(64) NOT NULL,
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(30) DEFAULT 'SUCCESS',
+    metric_type VARCHAR(100) DEFAULT 'EVENT_MATCH_QUALITY',
+    summary_payload JSONB,
+    raw_payload JSONB,
+    error_message TEXT
+);
+
 -- Existing database reconciliation. These statements are intentionally
 -- idempotent so this one file can replace incremental migration files.
 DROP TABLE IF EXISTS schema_migrations;
@@ -59,6 +73,7 @@ ALTER TABLE shops
 
 ALTER TABLE pixels
     ADD COLUMN IF NOT EXISTS platform VARCHAR(50) DEFAULT 'facebook',
+    ADD COLUMN IF NOT EXISTS quality_access_token TEXT,
     ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100),
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
@@ -110,5 +125,11 @@ CREATE INDEX IF NOT EXISTS idx_event_store_id_desc
 
 CREATE INDEX IF NOT EXISTS idx_dead_letters_status_id
     ON dead_letters(status, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_meta_quality_snapshots_route_time
+    ON meta_quality_snapshots(pixel_route_id, fetched_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_meta_quality_snapshots_shop_time
+    ON meta_quality_snapshots(shop_id, fetched_at DESC);
 
 COMMIT;

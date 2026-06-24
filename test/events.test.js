@@ -552,8 +552,10 @@ test('admin page script parses and handles admin action failures', async () => {
                 assert.equal(typeof options.data, 'function');
                 assert.equal(typeof options.computed.generatedCode, 'function');
                 assert.equal(typeof options.computed.emqSignals, 'function');
+                assert.equal(typeof options.computed.officialMetaQuality, 'function');
                 assert.equal(typeof options.methods.addPixel, 'function');
                 assert.equal(typeof options.methods.formatPercent, 'function');
+                assert.equal(typeof options.methods.officialAverageScore, 'function');
                 return { mount: () => {} };
             },
         },
@@ -587,4 +589,7 @@ test('admin page script parses and handles admin action failures', async () => {
         'client_ip_address',
         'client_user_agent',
     ]);
+    assert.equal(appOptions.methods.officialAverageScore({ summary: { average_score: 8.64 } }), '8.6/10');
+    assert.equal(appOptions.methods.officialAverageScore({ summary: {} }), '-');
+    assert.deepEqual(JSON.parse(JSON.stringify(appOptions.computed.officialMetaQuality.call({ summary: {} }))), []);
 });
