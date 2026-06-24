@@ -1156,6 +1156,7 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
     const [
         statusResult,
         emqResult,
+        signalResult,
         dlqResult,
         shopsResult,
         pixelsResult,
@@ -1173,6 +1174,18 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             FROM event_store
             WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
         `, params),
+        pool.query(`
+            SELECT COUNT(*)::int AS total_events,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'em', false))::int AS email,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'ph', false))::int AS phone,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'external_id', false))::int AS external_id,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'fbp', false))::int AS fbp,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'fbc', false))::int AS fbc,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'client_ip_address', false))::int AS client_ip_address,
+                   COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'client_user_agent', false))::int AS client_user_agent
+            FROM event_store
+            WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
+        `, params),
         pool.query(`SELECT COUNT(*)::int AS count FROM dead_letters WHERE status = 'FAILED_PERMANENT'${dlqShopFilter}`, params),
         pool.query(`SELECT COUNT(*)::int AS count FROM shops WHERE status = 'active'${shopFilter}`, params),
         pool.query(`SELECT platform, COUNT(*)::int AS count FROM pixels ${pixelFilter} GROUP BY platform`, params),
@@ -1187,11 +1200,34 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         if (pending || processing) pendingByShop.push({ shop_id: shop.id, pending, processing });
     }
 
+    const signalLabels = [
+        ['email', 'Email'],
+        ['phone', 'Phone'],
+        ['external_id', 'External ID'],
+        ['fbp', 'FBP'],
+        ['fbc', 'FBC'],
+        ['client_ip_address', 'IP'],
+        ['client_user_agent', 'User Agent'],
+    ];
+    const signalRow = signalResult.rows[0] || {};
+    const signalTotal = Number(signalRow.total_events || 0);
+    const emqSignals = signalLabels.map(([key, label]) => {
+        const matched = Number(signalRow[key] || 0);
+        return {
+            key,
+            label,
+            matched,
+            total: signalTotal,
+            coverage: signalTotal ? Number(((matched / signalTotal) * 100).toFixed(1)) : null,
+        };
+    });
+
     res.json({
         last24h: {
             total_events: emqResult.rows[0]?.total_events || 0,
             avg_emq: emqResult.rows[0]?.avg_emq || null,
             by_status: statusResult.rows,
+            emq_signals: emqSignals,
         },
         active_shops: shopsResult.rows[0]?.count || 0,
         pixels_by_platform: pixelsResult.rows,

@@ -138,6 +138,27 @@
                         <span v-if="!summary.pixels_by_platform?.length" class="text-slate-500">No routes</span>
                     </div>
                 </div>
+                <div class="bg-white border rounded-lg p-4 text-sm">
+                    <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+                        <div>
+                            <div class="font-semibold">EMQ signal coverage</div>
+                            <div class="text-xs text-slate-500">Last 24h match signals present in queued Meta payloads</div>
+                        </div>
+                        <div class="text-xs text-slate-500">{{ summary.last24h?.total_events || 0 }} events</div>
+                    </div>
+                    <div class="grid md:grid-cols-7 gap-3">
+                        <div v-for="signal in emqSignals" :key="signal.key" class="border rounded-md p-3 bg-slate-50">
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="font-semibold">{{ signal.label }}</span>
+                                <span class="font-mono text-xs" :class="signalCoverageClass(signal.coverage)">{{ formatPercent(signal.coverage) }}</span>
+                            </div>
+                            <div class="mt-2 h-2 bg-slate-200 rounded-full overflow-hidden">
+                                <div class="h-full rounded-full" :class="signalBarClass(signal.coverage)" :style="{ width: signal.coverage === null ? '0%' : signal.coverage + '%' }"></div>
+                            </div>
+                            <div class="mt-2 text-xs text-slate-500 font-mono">{{ signal.matched || 0 }}/{{ signal.total || 0 }}</div>
+                        </div>
+                    </div>
+                </div>
                 <div class="flex flex-wrap gap-3">
                     <select v-model="selectedShopId" @change="fetchOperationalData" class="border rounded-md px-3 py-2 bg-white">
                         <option value="">All shops</option>
@@ -219,6 +240,17 @@
                         .filter(item => item.platform === 'tiktok' && String(item.shop_domain || '').toLowerCase() === shop)
                         .map(item => String(item.pixel_id))
                         .filter(Boolean);
+                },
+                emqSignals() {
+                    return this.summary.last24h?.emq_signals || [
+                        { key: 'email', label: 'Email', matched: 0, total: 0, coverage: null },
+                        { key: 'phone', label: 'Phone', matched: 0, total: 0, coverage: null },
+                        { key: 'external_id', label: 'External ID', matched: 0, total: 0, coverage: null },
+                        { key: 'fbp', label: 'FBP', matched: 0, total: 0, coverage: null },
+                        { key: 'fbc', label: 'FBC', matched: 0, total: 0, coverage: null },
+                        { key: 'client_ip_address', label: 'IP', matched: 0, total: 0, coverage: null },
+                        { key: 'client_user_agent', label: 'User Agent', matched: 0, total: 0, coverage: null },
+                    ];
                 },
                 generatedCode() {
                     return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
@@ -1102,6 +1134,21 @@ analytics.subscribe('ui_extension_errored', function (event) {
                 summarizeQuality(value) {
                     const missing = value?.missing_match_signals || [];
                     return missing.length ? missing.join(', ') : 'OK';
+                },
+                formatPercent(value) {
+                    return value === null || value === undefined ? '-' : `${Number(value).toFixed(1)}%`;
+                },
+                signalCoverageClass(value) {
+                    if (value === null || value === undefined) return 'text-slate-400';
+                    if (Number(value) >= 80) return 'text-emerald-700';
+                    if (Number(value) >= 50) return 'text-amber-700';
+                    return 'text-red-700';
+                },
+                signalBarClass(value) {
+                    if (value === null || value === undefined) return 'bg-slate-300';
+                    if (Number(value) >= 80) return 'bg-emerald-500';
+                    if (Number(value) >= 50) return 'bg-amber-500';
+                    return 'bg-red-500';
                 },
             },
             mounted() {

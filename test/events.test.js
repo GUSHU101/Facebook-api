@@ -551,7 +551,9 @@ test('admin page script parses and handles admin action failures', async () => {
                 appOptions = options;
                 assert.equal(typeof options.data, 'function');
                 assert.equal(typeof options.computed.generatedCode, 'function');
+                assert.equal(typeof options.computed.emqSignals, 'function');
                 assert.equal(typeof options.methods.addPixel, 'function');
+                assert.equal(typeof options.methods.formatPercent, 'function');
                 return { mount: () => {} };
             },
         },
@@ -573,4 +575,16 @@ test('admin page script parses and handles admin action failures', async () => {
     assert.equal(context.notice.type, 'error');
     assert.equal(context.notice.message, 'permission denied');
     assert.equal(context.busy.savePixel, false);
+    assert.equal(appOptions.methods.formatPercent(82.345), '82.3%');
+    assert.equal(appOptions.methods.formatPercent(null), '-');
+    const defaultSignalKeys = JSON.parse(JSON.stringify(appOptions.computed.emqSignals.call({ summary: {} }).map(item => item.key)));
+    assert.deepEqual(defaultSignalKeys, [
+        'email',
+        'phone',
+        'external_id',
+        'fbp',
+        'fbc',
+        'client_ip_address',
+        'client_user_agent',
+    ]);
 });
