@@ -46,7 +46,7 @@ const capiQueue = new Queue('capi-events', {
 const pixelLimiter = rateLimit({
     windowMs: 60_000,
     max: config.pixelRateLimitPerMinute,
-    keyGenerator: req => `${normalizeShopDomain(req.body?.shop_domain) || 'unknown'}:${firstForwardedIp(req)}`,
+    keyGenerator: req => `${normalizeShopDomain(shopDomainFromPixelBody(req.body)) || 'unknown'}:${firstForwardedIp(req)}`,
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -62,6 +62,7 @@ const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next
 const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEDUPE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const PURCHASE_DEDUPE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const MAX_PIXEL_BATCH_SIZE = 50;
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -118,6 +119,36 @@ function cleanKeyPart(value) {
 function firstScalar(value) {
     if (Array.isArray(value)) return value.find(item => item !== undefined && item !== null && item !== '');
     return value;
+}
+
+function primaryExternalId(payload) {
+    const externalId = firstScalar(payload.external_id);
+    return firstPresent(
+        normalizeShopifyId(externalId),
+        normalizeShopifyId(payload.customer_id),
+        normalizeShopifyId(payload.client_id),
+        normalizeShopifyId(payload.shopify_y),
+        normalizeShopifyId(payload.checkout_token),
+    );
+}
+
+function pixelPayloadsFromBody(body) {
+    if (Array.isArray(body)) return body.filter(Boolean);
+    if (Array.isArray(body?.events)) {
+        return body.events
+            .filter(Boolean)
+            .map(event => ({
+                ...event,
+                shop_domain: event.shop_domain || body.shop_domain,
+            }));
+    }
+    return [body || {}];
+}
+
+function shopDomainFromPixelBody(body) {
+    if (Array.isArray(body)) return body[0]?.shop_domain;
+    if (Array.isArray(body?.events)) return body.shop_domain || body.events[0]?.shop_domain;
+    return body?.shop_domain;
 }
 
 function normalizeEventId(value) {
@@ -282,14 +313,7 @@ function buildUserData(req, payload) {
     const state = firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state);
     const zip = firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip);
     const country = firstPresent(payload.country, payload.country_code, payload.customer_country);
-    const externalIds = [
-        payload.external_id,
-        payload.client_id,
-        payload.checkout_token,
-        payload.cart_token,
-        payload.order_id,
-        payload.shopify_y,
-    ];
+    const externalId = primaryExternalId(payload);
 
     const hashed = {
         em: hashMany([email], 'email'),
@@ -300,7 +324,7 @@ function buildUserData(req, payload) {
         st: hashMany([state], 'state'),
         zp: hashMany([zip], 'zip'),
         country: hashMany([country], 'country'),
-        external_id: hashMany(externalIds, 'default'),
+        external_id: hashMany([externalId], 'default'),
     };
 
     return compactObject({
@@ -330,6 +354,10 @@ function buildPlatformData(payload) {
         : undefined;
 
     return compactObject({
+        tenant_id: payload.tenant_id,
+        shop_domain: payload.shop_domain,
+        pixel_id: payload.pixel_id,
+        dataset_id: payload.dataset_id,
         route_hints: compactObject({
             facebook_pixel_ids: facebookPixelIds?.length ? facebookPixelIds : undefined,
             tiktok_pixel_ids: tiktokPixelIds?.length ? tiktokPixelIds : undefined,
@@ -528,7 +556,7 @@ async function restoreReplayableEvents(shopId, dbEvents) {
     return restored;
 }
 
-async function queueForOutbox(req, res, payload, shopId) {
+async function queueEventForOutbox(req, payload, shopId) {
     const eventName = requireString(payload.event_name, 'event_name');
     const proposedEventId = normalizeEventId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`;
     const attribution = await loadAttributionSnapshot(shopId, payload);
@@ -540,16 +568,16 @@ async function queueForOutbox(req, res, payload, shopId) {
     await saveAttributionSnapshot(shopId, enrichedPayload);
     const isNew = await redis.set(dedupKey, '1', 'EX', ttlSeconds, 'NX');
     if (!isNew && eventName !== 'Purchase') {
-        return res.status(200).json({ success: true, deduplicated: true });
+        return { statusCode: 200, body: { success: true, deduplicated: true, event_id: eventId } };
     }
 
     const userData = buildUserData(req, enrichedPayload);
     const fbEventData = {
         event_name: eventName,
         event_time: resolveEventTime(enrichedPayload),
-        action_source: 'website',
+        action_source: firstPresent(enrichedPayload.action_source, 'website'),
         event_id: eventId,
-        event_source_url: firstPresent(enrichedPayload.source_url, enrichedPayload.url, req.headers.referer),
+        event_source_url: firstPresent(enrichedPayload.event_source_url, enrichedPayload.source_url, enrichedPayload.url, req.headers.referer),
         user_data: userData,
         custom_data: buildCustomData(enrichedPayload),
         _emq_estimate: calculateEMQ(userData),
@@ -567,13 +595,31 @@ async function queueForOutbox(req, res, payload, shopId) {
         throw error;
     }
 
-    return res.status(202).json({ success: true, queued: true, event_id: eventId, duplicate_candidate: !isNew });
+    return { statusCode: 202, body: { success: true, queued: true, event_id: eventId, duplicate_candidate: !isNew } };
+}
+
+async function queueForOutbox(req, res, payload, shopId) {
+    const result = await queueEventForOutbox(req, payload, shopId);
+    return res.status(result.statusCode).json(result.body);
 }
 
 app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
-    const payload = req.body || {};
-    const shopDomain = normalizeShopDomain(payload.shop_domain);
+    const payloads = pixelPayloadsFromBody(req.body);
+    if (payloads.length === 0) return res.status(400).json({ error: 'Missing event payload' });
+    if (payloads.length > MAX_PIXEL_BATCH_SIZE) {
+        return res.status(413).json({ error: `Too many events. Max batch size is ${MAX_PIXEL_BATCH_SIZE}` });
+    }
+
+    const shopDomain = normalizeShopDomain(shopDomainFromPixelBody(req.body));
     if (!shopDomain) return res.status(400).json({ error: 'Missing shop_domain' });
+
+    const normalizedPayloads = payloads.map(payload => ({
+        ...payload,
+        shop_domain: normalizeShopDomain(payload.shop_domain) || shopDomain,
+    }));
+    if (normalizedPayloads.some(payload => payload.shop_domain !== shopDomain)) {
+        return res.status(400).json({ error: 'Batch events must belong to one shop_domain' });
+    }
 
     const { rows } = await pool.query(
         'SELECT id FROM shops WHERE shop_domain = $1 AND status = $2',
@@ -581,7 +627,26 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
     );
     if (rows.length === 0) return res.status(401).json({ error: 'Shop inactive' });
 
-    return queueForOutbox(req, res, { ...payload, shop_domain: shopDomain }, rows[0].id);
+    if (normalizedPayloads.length === 1) {
+        return queueForOutbox(req, res, { ...normalizedPayloads[0], shop_domain: shopDomain }, rows[0].id);
+    }
+
+    const results = [];
+    for (const payload of normalizedPayloads) {
+        const result = await queueEventForOutbox(req, { ...payload, shop_domain: shopDomain }, rows[0].id);
+        results.push(result.body);
+    }
+
+    const queued = results.filter(result => result.queued).length;
+    const deduplicated = results.filter(result => result.deduplicated).length;
+    return res.status(queued > 0 ? 202 : 200).json({
+        success: true,
+        batch: true,
+        received: normalizedPayloads.length,
+        queued,
+        deduplicated,
+        results,
+    });
 }));
 
 async function handleShopifyPurchaseWebhook(req, res) {

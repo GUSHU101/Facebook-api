@@ -48,19 +48,6 @@ function buildOrderContents(order) {
     }).filter(Boolean);
 }
 
-function uniqueValues(values) {
-    const output = [];
-    const seen = new Set();
-    for (const value of values) {
-        if (value === undefined || value === null || value === '') continue;
-        const text = String(value);
-        if (seen.has(text)) continue;
-        seen.add(text);
-        output.push(text);
-    }
-    return output;
-}
-
 function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const billingAddress = order.billing_address || {};
     const shippingAddress = order.shipping_address || {};
@@ -109,14 +96,14 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         state: address.province_code || address.province,
         zip: address.zip,
         country: address.country_code || address.country,
-        external_id: uniqueValues([
+        external_id: firstPresent(
             normalizeShopifyId(customer.id),
             normalizeShopifyId(customer.admin_graphql_api_id),
             clientId,
             checkoutToken,
             orderId,
             orderName,
-        ]),
+        ),
         client_id: clientId,
         checkout_token: checkoutToken,
         cart_token: order.cart_token,

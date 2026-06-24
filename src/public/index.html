@@ -227,7 +227,12 @@ const SHOP_DOMAIN = "${this.currentShop}";
 const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const RECENT_EVENT_TTL_MS = 5000;
+const EVENT_QUEUE_FLUSH_MS = 1000;
+const FETCH_TIMEOUT_MS = 3000;
+const KEEPALIVE_LIMIT_BYTES = 60000;
 const recentEvents = {};
+const eventQueue = [];
+var eventQueueTimer = null;
 
 async function getCookieValue(name) {
     try {
@@ -261,17 +266,6 @@ function moneyCurrency(value, fallback) {
 function firstNonEmpty() {
     return Array.prototype.slice.call(arguments).find(function (value) {
         return value !== undefined && value !== null && value !== '';
-    });
-}
-
-function uniqueValues(values) {
-    var seen = {};
-    return values.filter(function (value) {
-        if (value === undefined || value === null || value === '') return false;
-        var key = String(value);
-        if (seen[key]) return false;
-        seen[key] = true;
-        return true;
     });
 }
 
@@ -331,6 +325,26 @@ function eventIdFrom(value) {
     return normalized ? String(normalized) : undefined;
 }
 
+function stableHash(value) {
+    var text = String(value || '');
+    var hash = 2166136261;
+    for (var index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+}
+
+function fallbackEventId(eventName, event, currentUrl) {
+    return eventName + '_' + stableHash([
+        SHOP_DOMAIN,
+        event && event.clientId,
+        event && event.timestamp,
+        currentUrl,
+        eventName,
+    ].join('|'));
+}
+
 function purchaseEventId(checkout, event) {
     checkout = checkout || {};
     return firstNonEmpty(checkout.token, checkout.checkoutToken, eventIdFrom(checkout.order && checkout.order.id), checkout.order && checkout.order.name, event.id);
@@ -382,12 +396,66 @@ async function rememberTtclid(href) {
     return getCookieValue('ttclid');
 }
 
+function primaryExternalId(event, customer, checkout, shopifyY, checkoutToken) {
+    return firstNonEmpty(
+        normalizeShopifyId(customer && customer.id),
+        normalizeShopifyId(checkout && checkout.order && checkout.order.customer && checkout.order.customer.id),
+        event && event.clientId,
+        shopifyY,
+        checkoutToken
+    );
+}
+
+function enqueueEventPayload(payload) {
+    eventQueue.push(payload);
+    if (!eventQueueTimer) {
+        eventQueueTimer = setTimeout(flushEventQueue, EVENT_QUEUE_FLUSH_MS);
+    }
+}
+
+function requestOptionsForBody(body) {
+    var options = {
+        method: 'POST',
+        keepalive: body.length < KEEPALIVE_LIMIT_BYTES,
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+    };
+
+    if (typeof AbortController !== 'undefined') {
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () {
+            controller.abort();
+        }, FETCH_TIMEOUT_MS);
+        options.signal = controller.signal;
+        options._timeoutId = timeoutId;
+    }
+
+    return options;
+}
+
+async function flushEventQueue() {
+    if (eventQueueTimer) {
+        clearTimeout(eventQueueTimer);
+        eventQueueTimer = null;
+    }
+    if (!eventQueue.length) return;
+
+    var events = eventQueue.splice(0, eventQueue.length);
+    var requestPayload = events.length === 1 ? events[0] : { shop_domain: SHOP_DOMAIN, events: events };
+    var options = requestOptionsForBody(JSON.stringify(requestPayload));
+
+    try {
+        await fetch(CAPI_HUB_URL, options);
+    } catch (error) {
+    } finally {
+        if (options._timeoutId) clearTimeout(options._timeoutId);
+        delete options._timeoutId;
+    }
+}
+
 async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
     customData = customData || {};
     event = event || {};
-    var eventId = String(eventIdFrom(forcedEventId) || event.id || metaEventName + '_' + Date.now());
-    if (!shouldSendRecentEvent(metaEventName, eventId)) return;
-
     var context = event.context || {};
     var documentInfo = context.document || {};
     var navigatorInfo = context.navigator || {};
@@ -398,6 +466,9 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     var shippingAddress = checkout.shippingAddress || {};
     var address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
     var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer;
+    var eventId = String(eventIdFrom(forcedEventId) || event.id || fallbackEventId(metaEventName, event, currentUrl));
+    if (!shouldSendRecentEvent(metaEventName, eventId)) return;
+
     var fbp = await getOrCreateFbp();
     var fbc = await getOrCreateFbc(currentUrl);
     var ttp = await getOrCreateTtp();
@@ -408,27 +479,19 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     var cartToken = normalizeShopifyId(event.data && event.data.cart && event.data.cart.id || checkout.cartToken);
     var normalizedOrderId = normalizeShopifyId(checkout.order && checkout.order.id);
     var orderId = firstNonEmpty(checkout.order && checkout.order.name, normalizedOrderId);
-    var externalIds = uniqueValues([
-        event.clientId,
-        normalizeShopifyId(customer.id),
-        normalizeShopifyId(checkout.order && checkout.order.customer && checkout.order.customer.id),
-        shopifyY,
-        checkoutToken,
-        cartToken,
-        normalizedOrderId,
-        checkout.order && checkout.order.name,
-    ]);
+    var externalId = primaryExternalId(event, customer, checkout, shopifyY, checkoutToken);
 
-    fetch(CAPI_HUB_URL, {
-        method: 'POST',
-        keepalive: true,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(compact({
+    enqueueEventPayload(compact({
             shop_domain: SHOP_DOMAIN,
+            tenant_id: SHOP_DOMAIN,
+            pixel_id: META_ROUTE_PIXEL_IDS[0],
+            dataset_id: META_ROUTE_PIXEL_IDS[0],
             event_name: metaEventName,
             event_id: eventId,
+            action_source: 'website',
             timestamp: event.timestamp,
             url: currentUrl,
+            event_source_url: currentUrl,
             referrer: documentInfo.referrer,
             user_agent: navigatorInfo.userAgent,
             fbp: fbp,
@@ -453,7 +516,7 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
                 facebook_pixel_ids: META_ROUTE_PIXEL_IDS,
                 tiktok_pixel_ids: TIKTOK_ROUTE_PIXEL_IDS,
             },
-            external_id: externalIds.length ? externalIds : undefined,
+            external_id: externalId,
             value: customData.value,
             currency: customData.currency,
             content_ids: customData.content_ids,
@@ -463,8 +526,7 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
             search_string: customData.search_string,
             content_name: customData.content_name,
             content_category: customData.content_category,
-        })),
-    }).catch(function () {});
+        }));
 }
 
 analytics.subscribe('page_viewed', function (event) {

@@ -64,7 +64,7 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     assert.equal(payload.client_id, 'shopify-y-cookie');
     assert.equal(payload.checkout_token, 'checkout-token-1');
     assert.equal(payload.shopify_y, 'shopify-y-cookie');
-    assert.deepEqual(payload.external_id, ['12345', 'shopify-y-cookie', 'checkout-token-1', '987', '#1001']);
+    assert.equal(payload.external_id, '12345');
     assert.deepEqual(payload.content_ids, ['111', '222']);
     assert.deepEqual(payload.contents, [
         { id: '111', quantity: 2, item_price: 8 },
@@ -85,7 +85,7 @@ test('buildShopifyOrderPurchasePayload normalizes Shopify GIDs for Purchase dedu
 
     assert.equal(payload.event_id, '987');
     assert.equal(payload.order_id, '987');
-    assert.deepEqual(payload.external_id, ['987']);
+    assert.equal(payload.external_id, '987');
 });
 
 test('buildTikTokPayload maps Purchase to CompletePayment and preserves dedupe event_id', () => {
@@ -291,9 +291,13 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('FB_PIXEL_ID'), false);
     assert.equal(generated.includes('TIKTOK_PIXEL_ID'), false);
     assert.equal(generated.includes('META_ROUTE_PIXEL_IDS'), true);
+    assert.equal(generated.includes("metaEventName + '_' + Date.now()"), false);
+    assert.equal(generated.includes('fallbackEventId'), true);
+    assert.equal(generated.includes('AbortController'), true);
+    assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
 
     const callbacks = {};
-    const bodies = [];
+    const requests = [];
     const cookies = new Map();
     const sandbox = {
         console,
@@ -301,6 +305,8 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
         Date,
         Math,
         globalThis: {},
+        setTimeout: () => 1,
+        clearTimeout: () => {},
         analytics: {
             subscribe: (name, fn) => {
                 callbacks[name] = fn;
@@ -317,7 +323,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
             },
         },
         fetch: async (url, options) => {
-            bodies.push(JSON.parse(options.body));
+            requests.push({ url, options, body: JSON.parse(options.body) });
             return { ok: true };
         },
     };
@@ -361,13 +367,21 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     callbacks.checkout_completed(event);
 
     await new Promise(resolve => setTimeout(resolve, 0));
+    await sandbox.flushEventQueue();
 
-    const ids = Object.fromEntries(bodies.map(body => [body.event_name, body.event_id]));
-    assert.equal(bodies.filter(body => body.event_name === 'CheckoutContactInfoSubmitted').length, 1);
-    assert.deepEqual(bodies[0].route_hints, {
+    const sentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
+    const ids = Object.fromEntries(sentEvents.map(body => [body.event_name, body.event_id]));
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].options.keepalive, true);
+    assert.equal(requests[0].body.shop_domain, 'demo.myshopify.com');
+    assert.equal(sentEvents.filter(body => body.event_name === 'CheckoutContactInfoSubmitted').length, 1);
+    assert.deepEqual(sentEvents[0].route_hints, {
         facebook_pixel_ids: ['1234567890'],
         tiktok_pixel_ids: ['TT123'],
     });
+    assert.equal(sentEvents[0].action_source, 'website');
+    assert.equal(sentEvents[0].event_source_url, 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1');
+    assert.equal(sentEvents[0].external_id, 'client-1');
     assert.deepEqual(ids, {
         CheckoutContactInfoSubmitted: 'checkout-token-1:CheckoutContactInfoSubmitted',
         CheckoutAddressInfoSubmitted: 'checkout-token-1:CheckoutAddressInfoSubmitted',
