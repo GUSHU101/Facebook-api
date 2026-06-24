@@ -5,6 +5,8 @@ const Redis = require('ioredis');
 const config = require('../src/config');
 
 const checks = [];
+const runtimeTables = ['shops', 'pixels', 'event_store', 'dead_letters'];
+const runtimeSequences = ['shops_id_seq', 'pixels_id_seq', 'event_store_id_seq', 'dead_letters_id_seq'];
 
 async function check(name, fn) {
     try {
@@ -75,6 +77,47 @@ async function main() {
             throw new Error('shops.app_secret should be TEXT; run npm run migrate');
         }
         return 'required columns present';
+    });
+
+    await check('postgres privileges', async () => {
+        const { rows: [identity] } = await pool.query('SELECT current_user, current_database()');
+        const user = identity.current_user;
+        const database = identity.current_database;
+
+        const schemaPrivileges = await pool.query(
+            `SELECT
+                has_schema_privilege(current_user, 'public', 'USAGE') AS usage,
+                has_schema_privilege(current_user, 'public', 'CREATE') AS create`,
+        );
+        if (!schemaPrivileges.rows[0].usage || !schemaPrivileges.rows[0].create) {
+            throw new Error(`Database user ${user} needs USAGE and CREATE on schema public in ${database}`);
+        }
+
+        const tablePrivileges = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
+        for (const table of runtimeTables) {
+            const privilegeChecks = tablePrivileges.map(privilege => (
+                `has_table_privilege(current_user, 'public.${table}', '${privilege}') AS ${privilege.toLowerCase()}`
+            )).join(', ');
+            const { rows: [privileges] } = await pool.query(`SELECT ${privilegeChecks}`);
+            const missing = tablePrivileges.filter(privilege => !privileges[privilege.toLowerCase()]);
+            if (missing.length > 0) {
+                throw new Error(`Database user ${user} missing ${missing.join(', ')} on table ${table}`);
+            }
+        }
+
+        const sequencePrivileges = ['USAGE', 'SELECT', 'UPDATE'];
+        for (const sequence of runtimeSequences) {
+            const privilegeChecks = sequencePrivileges.map(privilege => (
+                `has_sequence_privilege(current_user, 'public.${sequence}', '${privilege}') AS ${privilege.toLowerCase()}`
+            )).join(', ');
+            const { rows: [privileges] } = await pool.query(`SELECT ${privilegeChecks}`);
+            const missing = sequencePrivileges.filter(privilege => !privileges[privilege.toLowerCase()]);
+            if (missing.length > 0) {
+                throw new Error(`Database user ${user} missing ${missing.join(', ')} on sequence ${sequence}`);
+            }
+        }
+
+        return `user=${user}, database=${database}, tables=${runtimeTables.length}, sequences=${runtimeSequences.length}`;
     });
 
     await check('redis connection', async () => {

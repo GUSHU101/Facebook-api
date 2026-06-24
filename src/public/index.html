@@ -707,7 +707,7 @@ analytics.subscribe('ui_extension_errored', function (event) {
                         return result;
                     } catch (error) {
                         this.setNotice('error', error.message || String(error));
-                        throw error;
+                        return null;
                     } finally {
                         this.busy[name] = false;
                     }

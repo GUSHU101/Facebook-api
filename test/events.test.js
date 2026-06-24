@@ -363,15 +363,17 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     });
 });
 
-test('admin page script parses without runtime syntax errors', () => {
+test('admin page script parses and handles admin action failures', async () => {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
     const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match => match[1]);
     const adminScript = scripts.find(script => script.includes('createApp'));
     assert.ok(adminScript, 'admin Vue script should exist');
 
+    let appOptions;
     const sandbox = {
         Vue: {
             createApp: options => {
+                appOptions = options;
                 assert.equal(typeof options.data, 'function');
                 assert.equal(typeof options.computed.generatedCode, 'function');
                 assert.equal(typeof options.methods.addPixel, 'function');
@@ -382,4 +384,18 @@ test('admin page script parses without runtime syntax errors', () => {
         console,
     };
     vm.runInNewContext(adminScript, sandbox);
+
+    const context = {
+        notice: null,
+        busy: {},
+        setNotice: appOptions.methods.setNotice,
+    };
+    const result = await appOptions.methods.runAction.call(context, 'savePixel', async () => {
+        throw new Error('permission denied');
+    });
+
+    assert.equal(result, null);
+    assert.equal(context.notice.type, 'error');
+    assert.equal(context.notice.message, 'permission denied');
+    assert.equal(context.busy.savePixel, false);
 });
