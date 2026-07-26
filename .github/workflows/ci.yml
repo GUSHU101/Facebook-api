@@ -8,6 +8,37 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/capi_test
+      REDIS_URL: redis://127.0.0.1:6379
+      AES_SECRET_KEY: ci_aes_secret_key_at_least_32_characters
+      INGEST_TOKEN_SECRET: ci_ingest_secret_key_at_least_32_chars
+      ADMIN_USERNAME: ci-admin
+      ADMIN_PASSWORD: ci_admin_password_at_least_16_chars
+      REQUIRE_INGEST_TOKEN: "true"
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: capi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d capi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout
@@ -31,7 +62,16 @@ jobs:
         run: npm run check
 
       - name: Deployment shell syntax check
-        run: bash -n deploy/install_ubuntu.sh scripts/backup.sh scripts/restore.sh
+        run: bash -n deploy/install_ubuntu.sh scripts/dotenv.sh scripts/backup.sh scripts/restore.sh
+
+      - name: Verify safe dotenv loading
+        run: |
+          bash -c '. scripts/dotenv.sh; load_dotenv_file .env.example; test "$CLEANUP_CRON" = "17 * * * *"; test "$SHOPIFY_WEBHOOK_INBOX_CRON" = "*/5 * * * * *"; test "$SHOPIFY_RECONCILE_CRON" = "23 */15 * * * *"'
+
+      - name: Verify database migration and runtime dependencies
+        run: |
+          npm run migrate
+          npm run doctor
 
       - name: Unit tests
         run: npm test

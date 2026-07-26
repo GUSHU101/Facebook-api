@@ -122,6 +122,10 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const customer = order.customer || {};
     const address = Object.keys(billingAddress).length ? billingAddress : shippingAddress;
     const contents = buildOrderContents(order);
+    const reportedItemQuantity = Number(firstPresent(
+        order.current_subtotal_line_items_quantity,
+        order.subtotal_line_items_quantity,
+    ));
     const sourceUrl = toAbsoluteShopUrl(shopDomain, order.landing_site);
     const checkoutToken = firstPresent(order.checkout_token, order.cart_token, order.token);
     const fbp = firstPresent(
@@ -169,6 +173,7 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
 
     return {
         event_name: 'Purchase',
+        action_source: order._reconciled === true ? 'system_generated' : 'website',
         // Never invent a Purchase ID: a random fallback would turn every
         // Shopify webhook retry into a distinct conversion. The authenticated
         // webhook handler rejects payloads that lack this stable identity.
@@ -205,7 +210,9 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         content_ids: contents.map(item => item.id),
         contents,
         content_type: 'product',
-        num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+        num_items: Number.isFinite(reportedItemQuantity) && reportedItemQuantity >= 0
+            ? reportedItemQuantity
+            : contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
         order_id: orderName,
         customer_segmentation: shopifyCustomerSegmentation(customer),
         source_url: sourceUrl,

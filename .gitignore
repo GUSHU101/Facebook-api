@@ -7,3 +7,4 @@ backups/
 Thumbs.db
 *.tmp
 *.bak
+.maintenance

@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const fs = require('fs');
 const { Queue, Worker } = require('bullmq');
 const axios = require('axios');
 
@@ -8,7 +9,7 @@ const config = require('./config');
 const pool = require('./utils/db');
 const redis = require('./utils/redis');
 const workerRedis = redis.createBullMqWorkerConnection();
-const { decryptTokenIfPossible } = require('./utils/crypto');
+const { credentialFingerprint, decryptTokenIfPossible } = require('./utils/crypto');
 const { stripPrivateFields } = require('./events/common');
 const { prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const {
@@ -404,7 +405,7 @@ async function scheduleShopContinuation(shopId) {
     await capiQueue.add(
         'send-fb-batch',
         { shopId },
-        { jobId: `drain-${shopId}-${crypto.randomUUID()}` },
+        { delay: config.shopContinuationDelayMs, jobId: `drain-${shopId}-${crypto.randomUUID()}` },
     );
     return true;
 }
@@ -421,6 +422,10 @@ function eventIds(dbEvents) {
     return dbEvents.map(event => event.request_payload?.event_id).filter(Boolean);
 }
 
+function eventStoreIds(dbEvents) {
+    return dbEvents.map(event => Number(event.id)).filter(Number.isInteger);
+}
+
 function mergeDeliveriesFromEvents(dbEvents) {
     const merged = [];
     const seen = new Set();
@@ -435,6 +440,7 @@ function mergeDeliveriesFromEvents(dbEvents) {
                 delivery.code,
                 delivery.message,
                 delivery.event_ids,
+                delivery.event_store_ids,
             ]);
             if (seen.has(key)) continue;
             seen.add(key);
@@ -457,6 +463,23 @@ function chunkItems(items, size) {
     return chunks;
 }
 
+async function reserveCredentialRequest(credentialScope) {
+    const intervalMs = Math.max(10, Math.ceil(1000 / config.platformRequestsPerSecondPerCredential));
+    const waitMs = Number(await redis.eval(
+        `local now = redis.call('TIME')
+         local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
+         local next_ms = tonumber(redis.call('GET', KEYS[1])) or now_ms
+         local scheduled_ms = math.max(now_ms, next_ms)
+         redis.call('SET', KEYS[1], scheduled_ms + tonumber(ARGV[1]), 'PX', tonumber(ARGV[2]))
+         return scheduled_ms - now_ms`,
+        1,
+        `pacing:delivery-credential:${credentialScope}`,
+        intervalMs,
+        Math.max(60_000, intervalMs * 1000),
+    ));
+    if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
 function platformFailureResult(pixel, dbEvents, classification) {
     return {
         platform: pixel.platform || 'facebook',
@@ -466,6 +489,7 @@ function platformFailureResult(pixel, dbEvents, classification) {
         code: classification.code,
         message: classification.message,
         event_ids: eventIds(dbEvents),
+        event_store_ids: eventStoreIds(dbEvents),
     };
 }
 
@@ -480,6 +504,7 @@ function buildFacebookResult(pixel, successes, failures) {
         events_received: successes.reduce((sum, item) => sum + Number(item.events_received || 0), 0),
         results: successes,
         successful_event_ids: successes.flatMap(item => item.event_ids || []),
+        successful_event_store_ids: successes.flatMap(item => item.event_store_ids || []),
         permanent_failures: failures,
         rate_control: {
             maxUsagePercent: maxUsagePercent || undefined,
@@ -501,6 +526,7 @@ async function postFacebookBatch(pixel, token, dbEvents) {
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
 
     const url = `https://graph.facebook.com/${config.fbApiVersion}/${pixel.pixel_id}/events`;
+    await reserveCredentialRequest(pixel.credential_scope);
     const response = await axios.post(
         url,
         requestBody,
@@ -521,6 +547,7 @@ async function postFacebookBatch(pixel, token, dbEvents) {
         fbtrace_id: response.data.fbtrace_id,
         events_received: Number(response.data.events_received || 0),
         event_ids: eventIds(dbEvents),
+        event_store_ids: eventStoreIds(dbEvents),
         rate_control: metaRateControlFromHeaders(response.headers),
     };
 }
@@ -594,6 +621,7 @@ async function sendToFacebookPixel(pixel, dbEvents) {
             error.partialDelivery = {
                 result: buildFacebookResult(pixel, successes, failures),
                 retryable_event_ids: eventIds(batches.slice(index).flat()),
+                retryable_event_store_ids: eventStoreIds(batches.slice(index).flat()),
             };
             throw error;
         }
@@ -610,8 +638,20 @@ async function sendToTikTokPixel(pixel, dbEvents) {
 
     for (let index = 0; index < dbEvents.length; index += 1) {
         const event = dbEvents[index];
+        const eventAgeSeconds = Math.max(
+            0,
+            Math.floor(Date.now() / 1000) - Number(event.request_payload?.event_time || 0),
+        );
+        if (eventAgeSeconds > config.tiktokMaxEventAgeSeconds) {
+            failures.push(platformFailureResult(pixel, [event], {
+                code: 'LOCAL_EVENT_EXPIRED',
+                message: `Event age ${eventAgeSeconds}s exceeds TikTok retry window`,
+            }));
+            continue;
+        }
         const payload = buildTikTokPayload(pixel, event);
         try {
+            await reserveCredentialRequest(pixel.credential_scope);
             const response = await axios.post(url, payload, {
                 timeout: config.fbRequestTimeoutMs,
                 headers: {
@@ -631,6 +671,7 @@ async function sendToTikTokPixel(pixel, dbEvents) {
             }
             results.push({
                 event_id: event.request_payload.event_id,
+                event_store_id: Number(event.id),
                 event: payload.event,
                 code: responseCode,
                 message: response.data.message,
@@ -647,10 +688,12 @@ async function sendToTikTokPixel(pixel, dbEvents) {
                         events_received: results.length,
                         results,
                         successful_event_ids: results.map(item => item.event_id),
+                        successful_event_store_ids: results.map(item => item.event_store_id),
                         permanent_failures: failures,
                     },
                     // The current event and all later events were not confirmed.
                     retryable_event_ids: eventIds(dbEvents.slice(index)),
+                    retryable_event_store_ids: eventStoreIds(dbEvents.slice(index)),
                 };
                 throw error;
             }
@@ -665,6 +708,7 @@ async function sendToTikTokPixel(pixel, dbEvents) {
         events_received: results.length,
         results,
         successful_event_ids: results.map(item => item.event_id),
+        successful_event_store_ids: results.map(item => item.event_store_id),
         permanent_failures: failures,
     };
 }
@@ -674,45 +718,56 @@ async function sendToPlatform(pixel, dbEvents) {
     return sendToFacebookPixel(pixel, dbEvents);
 }
 
-async function credentialCooldownSeconds(credentialId) {
-    const { rows } = await pool.query(
-        `SELECT GREATEST(
+async function credentialCooldownSeconds(credentialId, credentialScope) {
+    const [{ rows }, sharedTtlMs] = await Promise.all([
+        pool.query(`SELECT GREATEST(
                     0,
                     CEIL(EXTRACT(EPOCH FROM (rate_limit_until - NOW())))
                 )::int AS seconds
          FROM pixels
-         WHERE id = $1`,
-        [credentialId],
-    );
-    return Number(rows[0]?.seconds || 0);
+         WHERE id = $1 OR credential_scope = $2
+         ORDER BY seconds DESC
+         LIMIT 1`,
+        [credentialId, credentialScope]),
+        redis.pttl(`cooldown:delivery-credential:${credentialScope}`).catch(() => -1),
+    ]);
+    return Math.max(Number(rows[0]?.seconds || 0), Math.ceil(Math.max(0, Number(sharedTtlMs)) / 1000));
 }
 
-async function recordCredentialSuccess(credentialId, rateControl = {}) {
+async function recordCredentialSuccess(credentialId, credentialScope, rateControl = {}) {
     const cooldownSeconds = Math.max(0, Math.ceil(Number(rateControl.cooldownSeconds || 0)));
     await pool.query(
         `UPDATE pixels
          SET consecutive_failures = 0,
              last_delivery_at = NOW(),
              last_usage_pct = COALESCE($2, last_usage_pct),
-             rate_limit_until = CASE
-                 WHEN $3::int > 0
-                 THEN GREATEST(
-                     COALESCE(rate_limit_until, NOW()),
-                     NOW() + ($3::int * INTERVAL '1 second')
-                 )
-                 ELSE NULL
-             END,
+              rate_limit_until = CASE
+                  WHEN $3::int > 0
+                  THEN GREATEST(
+                      COALESCE(rate_limit_until, NOW()),
+                      NOW() + ($3::int * INTERVAL '1 second')
+                  )
+                  -- A successful request may finish after another in-flight
+                  -- request has already rate-limited the same shared scope.
+                  -- Never let that late success erase an active group cooldown.
+                  WHEN rate_limit_until <= NOW() THEN NULL
+                  ELSE rate_limit_until
+              END,
              last_rate_limit_at = CASE WHEN $3::int > 0 THEN NOW() ELSE last_rate_limit_at END
-         WHERE id = $1`,
+         WHERE id = $1 OR credential_scope = $4`,
         [
             credentialId,
             rateControl.maxUsagePercent === undefined ? null : Number(rateControl.maxUsagePercent),
             cooldownSeconds,
+            credentialScope,
         ],
     );
+    if (cooldownSeconds > 0) {
+        await redis.set(`cooldown:delivery-credential:${credentialScope}`, '1', 'EX', cooldownSeconds);
+    }
 }
 
-async function recordCredentialFailure(credentialId, classification) {
+async function recordCredentialFailure(credentialId, credentialScope, classification) {
     const isRateLimit = Number(classification.code) === 429
         || [4, 17, 32, 613, 80004].includes(Number(classification.code));
     const cooldownSeconds = classification.retryable
@@ -735,15 +790,24 @@ async function recordCredentialFailure(credentialId, classification) {
                  ELSE rate_limit_until
              END,
              last_rate_limit_at = CASE WHEN $3::int > 0 THEN NOW() ELSE last_rate_limit_at END
-         WHERE id = $1`,
+         WHERE id = $1 OR credential_scope = $4`,
         [
             credentialId,
             classification.rateControl?.maxUsagePercent === undefined
                 ? null
                 : Number(classification.rateControl.maxUsagePercent),
             Math.ceil(cooldownSeconds),
+            credentialScope,
         ],
     );
+    if (cooldownSeconds > 0) {
+        await redis.set(
+            `cooldown:delivery-credential:${credentialScope}`,
+            '1',
+            'EX',
+            Math.ceil(cooldownSeconds),
+        );
+    }
     return Math.ceil(cooldownSeconds);
 }
 
@@ -776,8 +840,8 @@ async function acquireRedisLease(key, minimumTtlMs = config.credentialLeaseMs) {
     };
 }
 
-async function acquireCredentialLease(credentialId) {
-    return acquireRedisLease(`lock:delivery-credential:${credentialId}`);
+async function acquireCredentialLease(credentialScope) {
+    return acquireRedisLease(`lock:delivery-credential:${credentialScope}`);
 }
 
 function startRedisLeaseHeartbeat(lease, label) {
@@ -834,14 +898,18 @@ function startLeaseHeartbeat(credentialLease, routeId, claims) {
 async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliveries) {
     const {
         successful_event_ids: successfulEventIds = [],
+        successful_event_store_ids: successfulEventStoreIds = [],
         permanent_failures: resultFailures = [],
         rate_control: rateControl,
         ...deliveryResult
     } = result;
 
-    const successIds = successfulEventIds.map(String);
+    const successStoreIds = new Set(successfulEventStoreIds.map(String));
+    const successIds = new Set(successfulEventIds.map(String));
     const successDbEvents = dbEvents.filter(event => (
-        successIds.includes(String(event.request_payload?.event_id))
+        successStoreIds.size > 0
+            ? successStoreIds.has(String(event.id))
+            : successIds.has(String(event.request_payload?.event_id))
     ));
     if (successDbEvents.length > 0) {
         const successDelivery = {
@@ -849,6 +917,7 @@ async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliv
             route_id: pixel.route_id,
             status: 'SUCCESS',
             event_ids: successfulEventIds,
+            event_store_ids: successfulEventStoreIds,
             rate_control: rateControl,
         };
         const updatedIds = await markDeliverySuccess(
@@ -860,9 +929,12 @@ async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliv
     }
 
     for (const failure of resultFailures) {
+        const failedStoreIds = new Set((failure.event_store_ids || []).map(String));
         const failedIds = (failure.event_ids || []).map(String);
         const failedDbEvents = dbEvents.filter(event => (
-            failedIds.includes(String(event.request_payload?.event_id))
+            failedStoreIds.size > 0
+                ? failedStoreIds.has(String(event.id))
+                : failedIds.includes(String(event.request_payload?.event_id))
         ));
         const failureClaims = claimsForEvents(failedDbEvents, claimedEvents);
         const maxAttempt = Math.max(1, ...failureClaims.map(item => item.attemptCount));
@@ -878,13 +950,24 @@ async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliv
 }
 
 const worker = new Worker('capi-events', async job => {
+    if (fs.existsSync(config.maintenanceFile)) {
+        throw new RetryableError('Service is in maintenance mode', {
+            code: 'LOCAL_MAINTENANCE',
+            retryAfterSeconds: 60,
+        });
+    }
     const { shopId, dbEvents } = job.data || {};
     if (!Number.isInteger(Number(shopId)) || Number(shopId) <= 0 || (dbEvents !== undefined && !Array.isArray(dbEvents))) {
         throw new Error('Invalid job payload');
     }
     const normalizedShopId = Number(shopId);
     const shopLease = await acquireRedisLease(`lock:delivery-shop:${normalizedShopId}`);
-    if (!shopLease) return;
+    if (!shopLease) {
+        throw new RetryableError('Shop delivery lease is busy', {
+            code: 'LOCAL_SHOP_BUSY',
+            retryAfterSeconds: config.credentialBusyDelaySeconds,
+        });
+    }
     const shopLeaseHeartbeat = startRedisLeaseHeartbeat(shopLease, `Shop ${normalizedShopId}`);
 
     try {
@@ -908,13 +991,19 @@ const worker = new Worker('capi-events', async job => {
                 p.name,
                 p.pixel_id,
                 p.access_token,
+                p.credential_scope,
+                p.rate_limit_group,
                 p.test_event_code
          FROM shop_pixel_routes r
          JOIN pixels p ON p.id = r.pixel_id
+         JOIN event_deliveries snapshot_delivery
+           ON snapshot_delivery.route_id = r.id
+          AND snapshot_delivery.event_store_id = ANY($2::bigint[])
          WHERE r.shop_id = $1
            AND r.status = 'active'
+         GROUP BY r.id, p.id
          ORDER BY r.id ASC`,
-        [normalizedShopId],
+        [normalizedShopId, idsToUpdate],
     );
 
     if (pixels.length === 0) {
@@ -932,7 +1021,20 @@ const worker = new Worker('capi-events', async job => {
         // or scheduled for the future before contending on a shared lock.
         if (!await hasClaimableRouteEvents(pixel.route_id, idsToUpdate)) continue;
 
-        const credentialLease = await acquireCredentialLease(pixel.credential_id);
+        const decryptedCredential = decryptTokenIfPossible(pixel.access_token);
+        const credentialScope = credentialFingerprint(
+            pixel.platform,
+            decryptedCredential,
+            pixel.rate_limit_group,
+        ) || String(pixel.credential_id);
+        if (pixel.credential_scope !== credentialScope) {
+            await pool.query(
+                'UPDATE pixels SET credential_scope = $2 WHERE id = $1',
+                [pixel.credential_id, credentialScope],
+            );
+        }
+        pixel.credential_scope = credentialScope;
+        const credentialLease = await acquireCredentialLease(credentialScope);
         if (!credentialLease) {
             const delaySeconds = config.credentialBusyDelaySeconds;
             const deferred = await deferRouteEvents(
@@ -961,7 +1063,7 @@ const worker = new Worker('capi-events', async job => {
         let claimedEvents = new Map();
         let claims = [];
         try {
-            const cooldownSeconds = await credentialCooldownSeconds(pixel.credential_id);
+            const cooldownSeconds = await credentialCooldownSeconds(pixel.credential_id, credentialScope);
             if (cooldownSeconds > 0) {
                 const deferred = await deferRouteEvents(
                     pixel.route_id,
@@ -999,7 +1101,7 @@ const worker = new Worker('capi-events', async job => {
             }
 
             await applyPlatformResult(pixel, pixelDbEvents, claimedEvents, result, deliveries);
-            await recordCredentialSuccess(pixel.credential_id, result.rate_control);
+            await recordCredentialSuccess(pixel.credential_id, credentialScope, result.rate_control);
         } catch (error) {
             if (error.partialDelivery) {
                 await applyPlatformResult(
@@ -1012,8 +1114,13 @@ const worker = new Worker('capi-events', async job => {
                 const retryableIds = new Set(
                     (error.partialDelivery.retryable_event_ids || []).map(String),
                 );
+                const retryableStoreIds = new Set(
+                    (error.partialDelivery.retryable_event_store_ids || []).map(String),
+                );
                 pixelDbEvents = pixelDbEvents.filter(event => (
-                    retryableIds.has(String(event.request_payload?.event_id))
+                    retryableStoreIds.size > 0
+                        ? retryableStoreIds.has(String(event.id))
+                        : retryableIds.has(String(event.request_payload?.event_id))
                 ));
                 claims = claimsForEvents(pixelDbEvents, claimedEvents);
                 if (claims.length === 0) continue;
@@ -1037,7 +1144,7 @@ const worker = new Worker('capi-events', async job => {
                 classification.message = `Retry limit reached: ${classification.message}`;
             }
             classification.attempt = maxAttempt;
-            const credentialDelay = await recordCredentialFailure(pixel.credential_id, classification);
+            const credentialDelay = await recordCredentialFailure(pixel.credential_id, credentialScope, classification);
             classification.retryAfterSeconds = Math.max(
                 Number(classification.retryAfterSeconds || 0),
                 credentialDelay,
@@ -1051,6 +1158,7 @@ const worker = new Worker('capi-events', async job => {
                 code: classification.code,
                 message: classification.message,
                 event_ids: eventIds(pixelDbEvents),
+                event_store_ids: eventStoreIds(pixelDbEvents),
             };
 
             const updatedIds = await markDeliveryFailure(pixel.route_id, claims, classification);
@@ -1076,9 +1184,11 @@ const worker = new Worker('capi-events', async job => {
 
     const permanentFailures = deliveries.filter(delivery => delivery.status === 'FAILED');
     if (permanentFailures.length > 0) {
+        const failedStoreIds = new Set(permanentFailures.flatMap(item => item.event_store_ids || []).map(String));
+        const failedEvents = sendableDbEvents.filter(event => failedStoreIds.has(String(event.id)));
         await insertDeadLetter(
             normalizedShopId,
-            sendableDbEvents.map(event => ({ ...event, fb_response: fbResponse })),
+            failedEvents.map(event => ({ ...event, fb_response: fbResponse })),
             `Permanent route failures: ${permanentFailures.map(item => item.route_id).join(', ')}`,
         );
     }

@@ -127,15 +127,32 @@ worker restarted.
 37. Dispatch coalescing detects a retained terminal BullMQ job and creates a
     unique follow-up, closing the same-second arrival gap without removing the
     PostgreSQL rescue fallback.
+38. Verified Shopify paid-order webhooks are committed to a PostgreSQL inbox
+    before acknowledgment. Leased `SKIP LOCKED` processing, bounded retries,
+    and a scheduler recover work after crashes without extending Shopify's
+    five-second response path.
+39. Platform outcomes carry internal `event_store_id` values. Public event IDs
+    remain stable deduplication keys but cannot accidentally update a different
+    event name that reused the same external identifier.
+40. Delivery routes are read through ledger rows created for that worker
+    snapshot. A concurrently activated route cannot appear without its own
+    idempotency row or cause a false terminal parent state.
+41. Delivery leases, pacing, and Redis cooldowns are keyed by a SHA-256 scope
+    of platform plus decrypted access token. The scope and cooldown are also
+    persisted on every matching credential row, so database rows sharing one
+    token retain the same throttle after Redis or process restarts.
+42. Backup and restore scripts parse dotenv without shell evaluation. Restore
+    enters maintenance, stops/drains writers, restores in one database
+    transaction, validates the migrated database and credential key, then
+    reloads the runtime. A failed restore remains stopped in maintenance mode.
 
-## Why the system does not return ingestion 429 by default
+## Storefront ingestion abuse boundary
 
-`PIXEL_RATE_LIMIT_PER_MINUTE=0` disables the Express limiter only for the
-authenticated `/api/pixel-event` data path. Payload-size and batch-size limits,
-shop-scoped tokens, body parsing limits, and the upstream reverse proxy remain
-active. Abuse controls belong at a CDN/WAF because rejecting a valid tracking
-event after authentication creates measurement loss. If an operator enables a
-positive application limit, HTTP 429 is an intentional configuration outcome.
+The generated shop token is a public routing capability embedded in Shopify's
+custom pixel; it must not be treated as user authentication. The default
+`PIXEL_RATE_LIMIT_PER_MINUTE=600` provides a generous per-shop/per-IP ceiling,
+and the browser retries HTTP 429 with stable event IDs. Set it to `0` only when
+a distributed CDN/WAF limiter is verified in front of every API instance.
 
 Meta can still issue a rate-limit response. The worker classifies it as
 retryable, honors `Retry-After`, persists the cooldown on the pixel credential,

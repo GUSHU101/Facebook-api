@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 const config = require('../src/config');
+const { credentialFingerprint, decryptTokenIfPossible } = require('../src/utils/crypto');
 
 async function main() {
     const pool = new Pool({
@@ -30,6 +31,18 @@ async function main() {
         }
         console.log('Applying unified schema init.sql');
         await client.query(sql);
+        console.log('Backfilling stable credential throttle scopes');
+        const credentials = await client.query(
+            `SELECT id, platform, access_token, rate_limit_group
+             FROM pixels
+             ORDER BY id`,
+        );
+        for (const credential of credentials.rows) {
+            const token = decryptTokenIfPossible(credential.access_token);
+            const scope = credentialFingerprint(credential.platform, token, credential.rate_limit_group);
+            if (!scope) throw new Error(`Pixel ${credential.id} has no usable credential scope`);
+            await client.query('UPDATE pixels SET credential_scope = $2 WHERE id = $1', [credential.id, scope]);
+        }
         console.log('Applying online scale indexes');
         for (const statement of onlineIndexStatements) {
             const indexName = statement.match(

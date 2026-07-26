@@ -1,5 +1,7 @@
 require('dotenv').config();
 
+const path = require('path');
+
 function readRequired(name) {
     const value = process.env[name];
     if (!value || !String(value).trim()) {
@@ -91,9 +93,26 @@ function readFacebookApiVersion() {
     return value;
 }
 
+function readShopifyApiVersion() {
+    const value = String(process.env.SHOPIFY_API_VERSION || '2026-07').trim();
+    if (!/^\d{4}-(01|04|07|10)$/.test(value)) {
+        throw new Error('SHOPIFY_API_VERSION must look like 2026-07');
+    }
+    return value;
+}
+
 const aesSecretKey = readRequired('AES_SECRET_KEY');
 if (aesSecretKey.length < 32) {
     throw new Error('AES_SECRET_KEY must be at least 32 characters');
+}
+
+const ingestTokenSecret = process.env.INGEST_TOKEN_SECRET || aesSecretKey;
+if (ingestTokenSecret.length < 32) {
+    throw new Error('INGEST_TOKEN_SECRET must be at least 32 characters');
+}
+const ingestTokenPreviousSecret = String(process.env.INGEST_TOKEN_PREVIOUS_SECRET || '').trim();
+if (ingestTokenPreviousSecret && ingestTokenPreviousSecret.length < 32) {
+    throw new Error('INGEST_TOKEN_PREVIOUS_SECRET must be empty or at least 32 characters');
 }
 
 const httpRequestTimeoutMs = readInt('HTTP_REQUEST_TIMEOUT_MS', 30000);
@@ -115,10 +134,17 @@ module.exports = {
     databaseUrl: readRequired('DATABASE_URL'),
     redisUrl: readRequired('REDIS_URL'),
     aesSecretKey,
+    ingestTokenSecret,
+    ingestTokenPreviousSecret,
+    maintenanceFile: process.env.MAINTENANCE_FILE || path.join(process.cwd(), '.maintenance'),
     adminUsername: readRequired('ADMIN_USERNAME'),
     adminPassword: readRequired('ADMIN_PASSWORD'),
     requireIngestToken: readBool('REQUIRE_INGEST_TOKEN', true),
     shopifyWebOrderSources: readCsv('SHOPIFY_WEB_ORDER_SOURCES', 'web'),
+    shopifyApiVersion: readShopifyApiVersion(),
+    shopifyReconcileCron: process.env.SHOPIFY_RECONCILE_CRON || '23 */15 * * * *',
+    shopifyReconcileLookbackHours: readBoundedInt('SHOPIFY_RECONCILE_LOOKBACK_HOURS', 48, 24 * 30),
+    shopifyReconcileMaxOrders: readBoundedInt('SHOPIFY_RECONCILE_MAX_ORDERS', 1000, 10000),
     fbApiVersion: readFacebookApiVersion(),
     corsOrigin: readCorsOrigin(),
     jsonLimit: readJsonLimit(),
@@ -139,18 +165,24 @@ module.exports = {
     workerEventBatchSize: readBoundedInt('WORKER_EVENT_BATCH_SIZE', 100, 1000),
     queueAttempts: readBoundedInt('QUEUE_ATTEMPTS', 5, 100),
     queueBackoffMs: readInt('QUEUE_BACKOFF_MS', 5000),
-    // Authenticated ingestion is loss-sensitive. Disabled by default so a
-    // legitimate traffic spike is buffered instead of being answered with 429.
-    pixelRateLimitPerMinute: readNonNegativeInt('PIXEL_RATE_LIMIT_PER_MINUTE', 0),
+    // The browser token identifies a shop configuration but is intentionally
+    // public. Keep a generous abuse ceiling enabled unless an upstream WAF
+    // already enforces a stricter distributed policy.
+    pixelRateLimitPerMinute: readNonNegativeInt('PIXEL_RATE_LIMIT_PER_MINUTE', 600),
     adminRateLimitPerWindow: readInt('ADMIN_RATE_LIMIT_PER_WINDOW', 100),
     batchCron: process.env.BATCH_CRON || '*/5 * * * * *',
     watchdogCron: process.env.WATCHDOG_CRON || '* * * * *',
+    shopifyWebhookInboxCron: process.env.SHOPIFY_WEBHOOK_INBOX_CRON || '*/5 * * * * *',
+    shopifyWebhookInboxBatchSize: readBoundedInt('SHOPIFY_WEBHOOK_INBOX_BATCH_SIZE', 200, 1000),
+    shopifyWebhookInboxMaxAttempts: readBoundedInt('SHOPIFY_WEBHOOK_INBOX_MAX_ATTEMPTS', 20, 100),
+    shopifyWebhookInboxLeaseSeconds: readBoundedInt('SHOPIFY_WEBHOOK_INBOX_LEASE_SECONDS', 60, 600),
     metaQualityCron: process.env.META_QUALITY_CRON || '0 */6 * * *',
     fbRequestTimeoutMs: readInt('FB_REQUEST_TIMEOUT_MS', 15000),
     facebookBatchSize: readBoundedInt('FACEBOOK_BATCH_SIZE', 100, 1000),
     workerConcurrency: readBoundedInt('WORKER_CONCURRENCY', 20, 200),
     workerRateLimitMax: readInt('WORKER_RATE_LIMIT_MAX', 100),
     workerRateLimitDurationMs: readInt('WORKER_RATE_LIMIT_DURATION_MS', 1000),
+    platformRequestsPerSecondPerCredential: readBoundedInt('PLATFORM_REQUESTS_PER_SECOND_PER_CREDENTIAL', 20, 100),
     deliveryRetryBaseSeconds: readInt('DELIVERY_RETRY_BASE_SECONDS', 5),
     deliveryRetryMaxSeconds: readInt('DELIVERY_RETRY_MAX_SECONDS', 900),
     deliveryRetryAfterMaxSeconds: readInt('DELIVERY_RETRY_AFTER_MAX_SECONDS', 86400),
@@ -159,7 +191,9 @@ module.exports = {
     deliveryMaxAttempts: readNonNegativeInt('DELIVERY_MAX_ATTEMPTS', 0),
     credentialLeaseMs: readInt('CREDENTIAL_LEASE_MS', 60000),
     credentialBusyDelaySeconds: readInt('CREDENTIAL_BUSY_DELAY_SECONDS', 2),
+    shopContinuationDelayMs: readInt('SHOP_CONTINUATION_DELAY_MS', 500),
     facebookIsolationMaxRequests: readInt('FACEBOOK_ISOLATION_MAX_REQUESTS', 16),
+    tiktokMaxEventAgeSeconds: readInt('TIKTOK_MAX_EVENT_AGE_SECONDS', 7 * 24 * 60 * 60),
     deliveryRescueMinutes: readInt('DELIVERY_RESCUE_MINUTES', 1),
     deliveryRescueShopLimit: readBoundedInt('DELIVERY_RESCUE_SHOP_LIMIT', 500, 5000),
     aggregateReconcileBatchSize: readBoundedInt('AGGREGATE_RECONCILE_BATCH_SIZE', 5000, 50000),

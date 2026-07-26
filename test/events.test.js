@@ -50,9 +50,11 @@ const {
 } = require('../src/platforms/rate-control');
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
+const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
 const {
     boundedScalarValues,
     collectHashedUserData,
+    credentialFingerprint,
     decryptTokenIfPossible,
     encryptToken,
     normalizeForHash,
@@ -287,6 +289,7 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     });
 
     assert.equal(payload.event_name, 'Purchase');
+    assert.equal(payload.action_source, 'website');
     assert.equal(payload.event_id, 'demo.myshopify.com:checkout-token-1');
     assert.equal(payload.source_url, 'https://demo.myshopify.com/products/socks?fbclid=fb-click-1&ttclid=tt-click-1');
     assert.equal(payload.fbp, 'fb.1.browser');
@@ -385,6 +388,37 @@ test('Shopify Purchase payload never invents a random dedupe identity', () => {
         line_items: [],
     }, 'demo.myshopify.com');
     assert.equal(payload.event_id, undefined);
+});
+
+test('Shopify webhook JSON preserves 64-bit commerce identifiers exactly', () => {
+    const parsed = parseJsonPreservingLargeIntegers(
+        '{"id":9007199254740993,"line_items":[{"product_id":9223372036854775807,"quantity":2}]}',
+    );
+    assert.equal(parsed.id, '9007199254740993');
+    assert.equal(parsed.line_items[0].product_id, '9223372036854775807');
+    assert.equal(parsed.line_items[0].quantity, 2);
+    assert.throws(
+        () => parseJsonPreservingLargeIntegers('{"id":1,"id":2}'),
+        error => /Duplicate key/.test(String(error?.message)),
+    );
+});
+
+test('Shopify reconciliation marks recovered orders as system generated', () => {
+    const payload = buildShopifyOrderPurchasePayload({
+        _reconciled: true,
+        id: 'gid://shopify/Order/9007199254740993',
+        name: '#9001',
+        financial_status: 'paid',
+        source_name: 'web',
+        current_total_price: '25.00',
+        currency: 'USD',
+        processed_at: '2026-07-26T01:00:00Z',
+        current_subtotal_line_items_quantity: 257,
+        line_items: [],
+    }, 'demo.myshopify.com');
+    assert.equal(payload.action_source, 'system_generated');
+    assert.equal(payload.event_id, 'demo.myshopify.com:9007199254740993');
+    assert.equal(payload.num_items, 257);
 });
 
 test('buildTikTokPayload uses the current Purchase event name and preserves dedupe event_id', () => {
@@ -521,6 +555,25 @@ test('encrypted secret helper remains backward compatible with plaintext values'
     const encrypted = encryptToken('shopify-secret-1');
     assert.equal(decryptTokenIfPossible(encrypted), 'shopify-secret-1');
     assert.equal(decryptTokenIfPossible('legacy-plaintext-secret'), 'legacy-plaintext-secret');
+    assert.throws(
+        () => decryptTokenIfPossible(`${'00'.repeat(16)}:${'00'.repeat(16)}:00`),
+        /verify AES_SECRET_KEY/,
+    );
+});
+
+test('credential throttle scope is stable and platform isolated', () => {
+    assert.equal(
+        credentialFingerprint('facebook', 'shared-token'),
+        credentialFingerprint('facebook', 'shared-token'),
+    );
+    assert.notEqual(
+        credentialFingerprint('facebook', 'shared-token'),
+        credentialFingerprint('tiktok', 'shared-token'),
+    );
+    assert.equal(
+        credentialFingerprint('facebook', 'token-a', 'business-1'),
+        credentialFingerprint('facebook', 'token-b', 'BUSINESS-1'),
+    );
 });
 
 test('shop ingestion token comparison is exact and timing safe', () => {
@@ -769,11 +822,13 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.doesNotMatch(schema, /DROP TABLE IF EXISTS schema_migrations/);
     assert.match(schema, /indexdef NOT LIKE '%\(shop_id, event_name, event_id\)%'/);
     assert.match(schema, /rate_limit_until TIMESTAMPTZ/);
+    assert.match(schema, /credential_scope VARCHAR\(64\)/);
     assert.match(schema, /ALTER TABLE event_store SET \([\s\S]*?autovacuum_vacuum_scale_factor = 0\.02/);
     assert.match(scaleIndexes, /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_store_pending_shop_time/);
     assert.match(scaleIndexes, /WHERE status = 'PENDING'/);
     assert.match(scaleIndexes, /idx_event_store_terminal_retention/);
     assert.match(scaleIndexes, /CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_pixels_platform_external_id[\s\S]*?ON pixels\(platform, pixel_id\)/);
+    assert.match(scaleIndexes, /idx_pixels_credential_scope/);
     assert.match(workerSource, /ed\.attempt_count = c\.attempt_count/);
     assert.match(workerSource, /redis\.call\("pexpire"/);
     assert.match(workerSource, /config\.deliveryMaxAttempts > 0/);
@@ -785,7 +840,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(workerSource, /status IN \('PENDING', 'RETRYABLE_FAILED'\)[\s\S]*?next_attempt_at <= NOW\(\)/);
     assert.match(workerSource, /const token = `\$\{process\.pid\}:\$\{crypto\.randomUUID\(\)\}`/);
     assert.match(workerSource, /lock:delivery-shop:\$\{normalizedShopId\}/);
-    assert.match(workerSource, /lock:delivery-credential:\$\{credentialId\}/);
+    assert.match(workerSource, /lock:delivery-credential:\$\{credentialScope\}/);
+    assert.match(workerSource, /credentialFingerprint\(\s*pixel\.platform,\s*decryptedCredential,\s*pixel\.rate_limit_group,?\s*\)/);
+    assert.match(workerSource, /snapshot_delivery\.event_store_id = ANY\(\$2::bigint\[\]\)/);
+    assert.match(workerSource, /successful_event_store_ids/);
     assert.match(workerSource, /LEFT JOIN event_deliveries delivery[\s\S]*?delivery\.next_attempt_at <= NOW\(\)/);
     assert.match(workerSource, /const responseCode = Number\(response\.data\?\.code \?\? 0\)/);
     assert.doesNotMatch(schema, /ON event_store\(shop_id, event_name, md5\(event_id\)\)/);
@@ -793,6 +851,8 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /AWAITING_PAYMENT/);
     assert.match(serverSource, /webhookTopic !== 'orders\/paid'/);
     assert.match(serverSource, /paymentConfirmed: true/);
+    assert.match(serverSource, /INSERT INTO shopify_webhook_inbox/);
+    assert.match(serverSource, /updated_at:<'?='?\$\{cutoff\}/);
     assert.match(serverSource, /ON CONFLICT \(shop_id, event_name, event_id\) DO NOTHING/);
     assert.match(serverSource, /SELECT id, shop_id, event_name, event_id, request_payload,[\s\S]*?FOR UPDATE/);
     assert.match(serverSource, /existing\.status === 'SUCCESS'/);
@@ -837,12 +897,14 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(migrateSource, /indisunique/);
     assert.match(migrateSource, /Duplicate external Pixel credentials must be consolidated/);
     assert.match(migrateSource, /DROP INDEX CONCURRENTLY IF EXISTS/);
-    const webhookPersistIndex = serverSource.indexOf('const result = await queueEventForOutbox(req, {');
-    const webhookReceiptIndex = serverSource.indexOf("'Shopify webhook receipt save'");
-    assert.ok(
-        webhookPersistIndex >= 0 && webhookReceiptIndex > webhookPersistIndex,
-        'webhook receipt must be saved only after durable outbox persistence',
-    );
+    assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_webhook_inbox/);
+    assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_reconcile_state/);
+    assert.match(serverSource, /INSERT INTO shopify_webhook_inbox/);
+    assert.match(serverSource, /financial_status:paid/);
+    assert.match(serverSource, /shopify_reconcile_state/);
+    assert.match(serverSource, /FOR UPDATE SKIP LOCKED/);
+    assert.match(serverSource, /res\.status\(200\)\.json\(\{ success: true, accepted: true, durable: true/);
+    assert.match(serverSource, /setImmediate\(\(\) => void drainShopifyWebhookInbox/);
 });
 
 test('runtime config rejects weak encryption keys and malformed CORS origins', () => {
@@ -865,6 +927,10 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
     const malformedApiVersion = probeConfig({ FB_API_VERSION: '../latest' });
     assert.notEqual(malformedApiVersion.status, 0);
     assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v25\.0/);
+
+    const malformedShopifyVersion = probeConfig({ SHOPIFY_API_VERSION: 'latest' });
+    assert.notEqual(malformedShopifyVersion.status, 0);
+    assert.match(malformedShopifyVersion.stderr, /SHOPIFY_API_VERSION must look like 2026-07/);
 
     const valid = probeConfig({
         CORS_ORIGIN: 'https://shop.example.com,http://localhost:3000',
@@ -1119,7 +1185,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v10');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v11');
     assert.equal(generated.includes('getOrCreateTtp'), false);
     assert.equal(generated.includes('getOrCreateFbp'), false);
     assert.equal(generated.includes("return getCookieValue('_fbp')"), true);
@@ -1405,6 +1471,7 @@ test('deployment workflow preserves production secrets and verifies runtime read
         'utf8',
     );
     const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+    const restore = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'restore.sh'), 'utf8');
 
     assert.match(installer, /FORCE_ENV_REWRITE="\$\{FORCE_ENV_REWRITE:-0\}"/);
     assert.match(installer, /Preserving existing \.env and database credentials/);
@@ -1419,4 +1486,6 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaTemplate, /proxy_read_timeout 35s/);
     assert.match(ci, /npm run build:admin/);
     assert.match(ci, /npm ci --omit=dev --ignore-scripts/);
+    assert.match(restore, /--single-transaction/);
+    assert.match(restore, /runtime remains stopped and maintenance mode stays enabled/);
 });

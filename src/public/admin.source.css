@@ -545,6 +545,11 @@ button:disabled {
     background: #e8faf4;
 }
 
+.status-pill.pending {
+    color: #9a5b07;
+    background: #fff7df;
+}
+
 .text-action {
     padding: 5px 0;
     border: 0;

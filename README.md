@@ -60,8 +60,6 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - `checkout_contact_info_submitted` → `CheckoutContactInfoSubmitted`
 - `checkout_address_info_submitted` → `CheckoutAddressInfoSubmitted`
 - `checkout_shipping_info_submitted` → `CheckoutShippingInfoSubmitted`
-- `alert_displayed` → `ShopifyAlertDisplayed`
-- `ui_extension_errored` → `ShopifyUiExtensionErrored`
 
 ### TikTok 事件映射
 
@@ -77,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 ## 准确性与可靠性说明
 
 - Meta 服务端去重依赖 Shopify Customer Events 和订单 webhook 之间保持一致的 `event_name` 与 `event_id`。
-- 新生成的 `shopify-pixel-v10` 会给所有事件 ID 加入店铺域名命名空间，服务端发送的 `order_id` 也按店铺隔离。多个店铺共用同一个 Meta Dataset 时，即使 Shopify 局部 ID 或订单号相同，也不会在 Dataset 侧互相去重或混淆。旧 Purchase 仍通过原始 checkout/order/cart 别名与新版 ID 汇合，升级不会切断已有付款候选。
+- 新生成的 `shopify-pixel-v11` 会给所有事件 ID 加入店铺域名命名空间，服务端发送的 `order_id` 也按店铺隔离。多个店铺共用同一个 Meta Dataset 时，即使 Shopify 局部 ID 或订单号相同，也不会在 Dataset 侧互相去重或混淆。旧 Purchase 仍通过原始 checkout/order/cart 别名与新版 ID 汇合，升级不会切断已有付款候选。
 - TikTok 服务端投递保留相同的 `event_id`，并使用当前标准事件名 `Purchase`。
 - `Purchase` 使用持久化别名注册表：PostgreSQL 事务锁统一 checkout、order、cart 标识，即使 Redis 重启也不会丢失关联。浏览器和 webhook 数据在投递前会合并到准确的 `(shop_id, event_name, event_id)`；不存在可能与数据库权威状态分叉的只写 Redis 去重副本。
 - 重复事件在行锁事务内合并：邮箱、电话、姓名、地址和 `external_id` 哈希数组取并集并重新计算 EMQ；付款确认数据优先于未确认浏览器副本，晚到的重复请求不能降低已确认金额、订单号或付款时间。
@@ -93,7 +91,13 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - 手动重放死信先使用同一套事务合并规则吸收载荷，只重置当前启用且永久失败的路由；成功路由保持不可变，停用路由保持停用，未确认付款的 Purchase 也不能通过重放绕过付款门禁。
 - 共享凭证使用可续期的分布式投递租约和逐次尝试隔离。过期 Worker 不能覆盖较新的尝试，共用凭证的多个店铺也不会并发冲击同一个平台凭证。
 - Meta 响应头 `Retry-After`、`X-Business-Use-Case-Usage`、`X-App-Usage`、`X-Ad-Account-Usage` 会形成持久化的凭证冷却。使用率过高时会提前减缓后续发送，收到 429 后会暂停所有共用该凭证的店铺。
-- 认证后的像素采集限流默认关闭（`PIXEL_RATE_LIMIT_PER_MINUTE=0`），合法流量高峰会进入缓冲，不会直接返回 `429 Too Many Requests`。滥用防护应放在 WAF/CDN；启用正数限制表示明确接受采集接口返回 429。
+- 店铺采集 Token 是嵌入 Shopify 自定义像素的公开路由凭据，不等同于用户身份认证。默认启用较宽松的店铺/IP 限流（`PIXEL_RATE_LIMIT_PER_MINUTE=600`），浏览器会对 `429` 使用稳定事件 ID 重试；如果前置 CDN/WAF 已提供可靠的分布式限流，可显式设为 `0`。
+- Shopify `orders/paid` 在 HMAC 验证后先持久化到 PostgreSQL 收件箱并立即确认，随后通过租约、指数退避和定时扫描生成 Purchase；外部平台或 Redis 短暂故障不会阻塞 Shopify 的确认窗口。
+- webhook 原始 JSON 会以大整数安全模式重新解析，Shopify 64 位订单、商品和变体 ID 不会先被 JavaScript 浮点数改写末位数字。
+- 店铺可选保存具备 `read_orders` 的 Admin API Token。系统按 Shopify 官方 `orders` 查询的 `updated_at`、`financial_status:paid` 过滤器分页对账，并通过持久游标处理超大店铺；对账订单仍进入同一收件箱和 Purchase 去重事务。
+- 平台回写以内部 `event_store.id` 为准，公开 `event_id` 只承担平台去重；即使不同事件名称偶然复用同一个公开 ID，也不会互相覆盖投递状态。
+- 相同平台访问令牌会映射到同一分布式凭据作用域，共享租约、请求节奏和冷却状态；作用域与冷却同时保存在 PostgreSQL，Redis 或进程重启后也不会让多个店铺/像素立即同时冲击同一平台额度。
+- 如果不同 Token 仍属于同一 Meta App、Business Use Case 或其他共享平台额度，可在后台填写相同“平台限流组”；系统会让这些 Token 共用租约、节奏和冷却。不同业务额度必须使用不同组名，避免无关像素互相限速。
 - 浏览器 `checkout_completed` 会持久保存包含归因与结账数据的 `AWAITING_PAYMENT` Purchase 候选。在相同 checkout/order/cart 别名的 HMAC 验证 `orders/paid` 确认付款前，不会向广告平台发送，避免把未付款、延期付款、付款失败或货到付款订单计为已付款购买。
 - Shopify 测试订单会被排除，已付款订单使用网站来源正向白名单。`SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值；只有确认某个 Headless/自定义销售渠道属于被跟踪网站时，才应加入对应来源。来源缺失、POS、移动 App、草稿订单和未知来源不会创建网站 Purchase。缺少稳定订单标识或金额/币种无效的付款数据会被拒绝，让 Shopify 进行重试，而不是静默创建不可用转化。
 - 已确认 Purchase 保留短暂合并窗口（`PURCHASE_SETTLE_MS`，默认 8000 毫秒），让时间接近的浏览器数据与 webhook 数据在平台投递前完成合并。
@@ -145,6 +149,10 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    FB_API_VERSION=v25.0
    REQUIRE_INGEST_TOKEN=true
    SHOPIFY_WEB_ORDER_SOURCES=web
+   SHOPIFY_API_VERSION=2026-07
+   SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
+   SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
+   SHOPIFY_RECONCILE_MAX_ORDERS=1000
    HTTP_REQUEST_TIMEOUT_MS=30000
    HTTP_HEADERS_TIMEOUT_MS=15000
    HTTP_KEEP_ALIVE_TIMEOUT_MS=5000
@@ -159,7 +167,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    CREDENTIAL_LEASE_MS=60000
    CREDENTIAL_BUSY_DELAY_SECONDS=2
    FACEBOOK_ISOLATION_MAX_REQUESTS=16
-   PIXEL_RATE_LIMIT_PER_MINUTE=0
+   PIXEL_RATE_LIMIT_PER_MINUTE=600
    # 只有所有店铺来源都允许提交事件时才使用 *，否则填写准确 Origin。
    CORS_ORIGIN=https://shop.example.com,https://www.shop.example.com
    TRUST_PROXY_HOPS=1
@@ -171,7 +179,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    LEGACY_REDIS_DRAIN_ENABLED=false
    WORKER_EVENT_BATCH_SIZE=100
    DELIVERY_RESCUE_SHOP_LIMIT=500
-   CLEANUP_CRON=17 * * * *
+   CLEANUP_CRON="17 * * * *"
    CLEANUP_BATCH_SIZE=10000
    CLEANUP_MAX_BATCHES=2
    EVENT_RETENTION_DAYS=90
@@ -181,11 +189,12 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    API_INSTANCES=1
    WORKER_INSTANCES=1
    AES_SECRET_KEY=replace-with-a-long-random-secret
+   INGEST_TOKEN_SECRET=replace-with-a-different-long-random-secret
    ADMIN_USERNAME=admin
    ADMIN_PASSWORD=replace-with-a-strong-password
    ```
 
-   `AES_SECRET_KEY` 至少需要 32 个字符。`CORS_ORIGIN` 接受 `*` 或以英文逗号分隔的准确 HTTP(S) Origin，不能包含路径或末尾斜杠。CORS 只对 `/api/pixel-event` 开放，管理接口保持同源。Node 直接接收请求、前面没有反向代理时应设置 `TRUST_PROXY_HOPS=0`。
+   `AES_SECRET_KEY` 与 `INGEST_TOKEN_SECRET` 均至少需要 32 个字符，生产环境应使用不同值并分别备份。`INGEST_TOKEN_PREVIOUS_SECRET` 可在轮换采集密钥时临时兼容已安装的旧像素代码。`CORS_ORIGIN` 接受 `*` 或以英文逗号分隔的准确 HTTP(S) Origin，不能包含路径或末尾斜杠。CORS 只对 `/api/pixel-event` 开放，管理接口保持同源。Node 直接接收请求、前面没有反向代理时应设置 `TRUST_PROXY_HOPS=0`。
 
 4. 运行自检并启动 API 与 Worker：
 
@@ -196,7 +205,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    ```
 
 5. 打开管理后台。避免使用公网 `443` 时，可使用 `https://capi.example.com:8443/admin`。
-6. 添加 Shopify 店铺，再添加一条或多条平台路由。路由表单支持让同一个凭证同时关联多个店铺：
+6. 添加 Shopify 店铺；建议同时填写具备 `read_orders` 的 Admin API Token，以启用支付订单对账。再添加一条或多条平台路由，路由表单支持让同一个凭证同时关联多个店铺：
    - Facebook / Meta：Pixel 或 Dataset ID，以及 System User Access Token。
    - TikTok：Pixel Code，以及 Events API Access Token。
 7. 把生成代码作为自定义像素粘贴到 Shopify Customer events，确认其中的 API 地址包含相同的公网 HTTPS 端口，例如 `https://capi.example.com:8443`。
@@ -236,14 +245,14 @@ npm run doctor
 
 水平扩容时逐步增加 `API_INSTANCES` 和 `WORKER_INSTANCES`。PostgreSQL 最大连接数近似为 `(API_INSTANCES + WORKER_INSTANCES) × DB_POOL_MAX`，必须低于数据库可用连接预算。逐店铺租约防止重复排空，共享凭证租约会串行调用同一个外部像素，逐次尝试隔离会拒绝过期结果。
 
-升级后打开管理后台，把最新生成的 Shopify Customer Events 代码（当前 `shopify-pixel-v10`）复制到每个已连接店铺。v10 增加店铺级事件 ID 命名空间、离线重复事件富化合并和高价值事件存储优先级，并保留 v9 的 Unicode 姓名、电话、国家和邮编规范化修复；旧代码不会自动更新。生成代码包含店铺级采集 Token；默认 `REQUIRE_INGEST_TOKEN=true` 时，仅伪造其他 `shop_domain` 的事件会在路由前被拒绝。
+升级后打开管理后台，把最新生成的 Shopify Customer Events 代码（当前 `shopify-pixel-v11`）复制到每个已连接店铺。v11 按 UTF-8 字节计算浏览器 `keepalive` 上限，避免中文及其他多字节内容被错误估算；同时保留 v10 的店铺级事件 ID、离线富化合并和高价值事件存储优先级。旧代码不会自动更新。生成代码包含店铺级采集 Token；默认 `REQUIRE_INGEST_TOKEN=true` 时，仅伪造其他 `shop_domain` 的事件会在路由前被拒绝。
 
 ## 使用教程
 
 1. 将项目上传到 GitHub，并确认 CI 通过。
 2. 按 [Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md) 或 [宝塔部署指南](DEPLOY_BAOTA_UBUNTU.md) 部署。
 3. 打开 `https://你的域名:8443/admin`。
-4. 使用 `myshopify.com` 域名和 webhook secret 添加 Shopify 店铺。
+4. 使用 `myshopify.com` 域名和 webhook secret 添加 Shopify 店铺；可选填写 `read_orders` Admin API Token 作为漏投 webhook 的对账兜底。
 5. 添加 Facebook / Meta 路由：
    - 平台：`Facebook / Meta`
    - 像素/数据集 ID
@@ -279,7 +288,7 @@ npm run doctor
 
 | 权限 | 建议 | 原因 |
 |---|---|---|
-| `read_orders` | 需要 | 读取订单金额、币种、商品和客户信息，用于 `Purchase` 与 webhook |
+| `read_orders` | 强烈建议 | Admin API Token 启用已付款订单分页对账；webhook 正常时仍是低延迟权威入口 |
 | `write_orders` | 不需要 | 项目不创建或修改订单 |
 | `read_assigned_fulfillment_orders` | 不需要 | 项目不处理履约或发货 |
 | `write_assigned_fulfillment_orders` | 不需要 | 项目不创建或修改履约单 |

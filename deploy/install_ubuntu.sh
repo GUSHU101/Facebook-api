@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 APP_NAME="${APP_NAME:-capi-saas}"
 APP_DIR="${APP_DIR:-/www/wwwroot/${APP_NAME}}"
+APP_USER="${APP_USER:-capi-saas}"
+APP_HOME="${APP_HOME:-/var/lib/${APP_NAME}}"
 REPO_URL="${REPO_URL:-}"
 BRANCH="${BRANCH:-main}"
 INTERNAL_PORT="${INTERNAL_PORT:-3000}"
@@ -15,6 +17,7 @@ REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 AES_SECRET_KEY="${AES_SECRET_KEY:-}"
+INGEST_TOKEN_SECRET="${INGEST_TOKEN_SECRET:-}"
 FB_API_VERSION="${FB_API_VERSION:-v25.0}"
 SKIP_APT="${SKIP_APT:-0}"
 CERT_FULLCHAIN="${CERT_FULLCHAIN:-}"
@@ -43,6 +46,10 @@ fail() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+run_as_app() {
+  runuser -u "$APP_USER" -- env HOME="$APP_HOME" "$@"
 }
 
 need_root() {
@@ -96,6 +103,12 @@ validate_slug() {
   local value="$2"
   if ! printf '%s' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
     fail "${name} contains unsafe characters: ${value}"
+  fi
+}
+
+validate_linux_user() {
+  if ! printf '%s' "$APP_USER" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'; then
+    fail "APP_USER must be a valid lowercase Linux system user name"
   fi
 }
 
@@ -208,6 +221,18 @@ install_apt_deps() {
   fi
 }
 
+ensure_app_user() {
+  if ! id "$APP_USER" >/dev/null 2>&1; then
+    log "Creating restricted application user ${APP_USER}"
+    useradd --system --home-dir "$APP_HOME" --create-home --shell /usr/sbin/nologin "$APP_USER"
+  fi
+  install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$APP_HOME"
+  install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$APP_DIR"
+  # Existing Baota/manual installations may be root-owned. The validated
+  # application path is transferred before the non-root backup/git workflow.
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+}
+
 open_firewall_port() {
   if [ "$ENABLE_UFW" != "1" ]; then
     log "Skipping UFW configuration because ENABLE_UFW=${ENABLE_UFW}"
@@ -270,19 +295,20 @@ clone_or_update_repo() {
     log "Updating existing repository in $APP_DIR"
     if [ -f "$APP_DIR/.env" ] && [ -f "$APP_DIR/scripts/backup.sh" ]; then
       log "Creating a pre-upgrade database and environment backup"
-      (cd "$APP_DIR" && bash scripts/backup.sh)
+      (cd "$APP_DIR" && run_as_app bash scripts/backup.sh)
     fi
-    git -C "$APP_DIR" fetch origin "$BRANCH"
-    git -C "$APP_DIR" checkout "$BRANCH"
-    git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
+    run_as_app git -C "$APP_DIR" fetch origin "$BRANCH"
+    run_as_app git -C "$APP_DIR" checkout "$BRANCH"
+    run_as_app git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
   else
     log "Cloning repository to $APP_DIR"
     mkdir -p "$(dirname "$APP_DIR")"
     if [ -e "$APP_DIR" ] && [ -n "$(find "$APP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
       fail "APP_DIR exists and is not an empty Git repository: ${APP_DIR}"
     fi
-    git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+    run_as_app git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
   fi
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 }
 
 setup_database() {
@@ -316,6 +342,7 @@ SQL
 write_env() {
   ADMIN_PASSWORD="${ADMIN_PASSWORD:-$(random_secret)}"
   AES_SECRET_KEY="${AES_SECRET_KEY:-$(random_secret)}"
+  INGEST_TOKEN_SECRET="${INGEST_TOKEN_SECRET:-$(random_secret)}"
 
   log "Writing new .env"
   cat > "$APP_DIR/.env" <<ENV
@@ -325,11 +352,16 @@ REDIS_URL=${REDIS_URL}
 
 FB_API_VERSION=${FB_API_VERSION}
 AES_SECRET_KEY=${AES_SECRET_KEY}
+INGEST_TOKEN_SECRET=${INGEST_TOKEN_SECRET}
 
 ADMIN_USERNAME=${ADMIN_USERNAME}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
 REQUIRE_INGEST_TOKEN=true
 SHOPIFY_WEB_ORDER_SOURCES=${SHOPIFY_WEB_ORDER_SOURCES}
+SHOPIFY_API_VERSION=2026-07
+SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
+SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
+SHOPIFY_RECONCILE_MAX_ORDERS=1000
 
 CORS_ORIGIN=${CORS_ORIGIN}
 TRUST_PROXY_HOPS=1
@@ -348,17 +380,21 @@ LEGACY_REDIS_DRAIN_ENABLED=false
 WORKER_EVENT_BATCH_SIZE=100
 QUEUE_ATTEMPTS=5
 QUEUE_BACKOFF_MS=5000
-# 0 keeps authenticated tracking lossless during legitimate traffic spikes.
-# Use an upstream WAF for abuse protection; set a positive value only if you
-# intentionally accept HTTP 429 responses from the ingestion endpoint.
-PIXEL_RATE_LIMIT_PER_MINUTE=0
+# Generous per-shop/per-IP abuse ceiling; use 0 only behind a distributed WAF.
+PIXEL_RATE_LIMIT_PER_MINUTE=600
 ADMIN_RATE_LIMIT_PER_WINDOW=100
+SHOPIFY_WEBHOOK_INBOX_CRON="*/5 * * * * *"
+SHOPIFY_WEBHOOK_INBOX_BATCH_SIZE=200
+SHOPIFY_WEBHOOK_INBOX_MAX_ATTEMPTS=20
+SHOPIFY_WEBHOOK_INBOX_LEASE_SECONDS=60
 FB_REQUEST_TIMEOUT_MS=15000
 FACEBOOK_BATCH_SIZE=100
 FACEBOOK_ISOLATION_MAX_REQUESTS=16
+TIKTOK_MAX_EVENT_AGE_SECONDS=604800
 WORKER_CONCURRENCY=20
 WORKER_RATE_LIMIT_MAX=100
 WORKER_RATE_LIMIT_DURATION_MS=1000
+PLATFORM_REQUESTS_PER_SECOND_PER_CREDENTIAL=20
 DELIVERY_RETRY_BASE_SECONDS=5
 DELIVERY_RETRY_MAX_SECONDS=900
 DELIVERY_RETRY_AFTER_MAX_SECONDS=86400
@@ -366,21 +402,24 @@ DELIVERY_RETRY_AFTER_MAX_SECONDS=86400
 DELIVERY_MAX_ATTEMPTS=0
 CREDENTIAL_LEASE_MS=60000
 CREDENTIAL_BUSY_DELAY_SECONDS=2
+SHOP_CONTINUATION_DELAY_MS=500
 DELIVERY_RESCUE_MINUTES=1
 DELIVERY_RESCUE_SHOP_LIMIT=500
 AGGREGATE_RECONCILE_BATCH_SIZE=5000
 PURCHASE_SETTLE_MS=8000
-CLEANUP_CRON=17 * * * *
+CLEANUP_CRON="17 * * * *"
 CLEANUP_BATCH_SIZE=10000
 CLEANUP_MAX_BATCHES=2
 EVENT_RETENTION_DAYS=90
 DEAD_LETTER_RETENTION_DAYS=90
 ALIAS_RETENTION_DAYS=120
 QUALITY_RETENTION_DAYS=30
+BACKUP_RETENTION_DAYS=30
 API_INSTANCES=${API_INSTANCES}
 WORKER_INSTANCES=${WORKER_INSTANCES}
 ENV
 
+  chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
 }
 
@@ -394,12 +433,15 @@ configure_database_and_env() {
     [ -n "$DB_PASSWORD" ] || fail "DB_PASSWORD is required when FORCE_ENV_REWRITE=1"
     [ -n "$ADMIN_PASSWORD" ] || fail "ADMIN_PASSWORD is required when FORCE_ENV_REWRITE=1"
     [ -n "$AES_SECRET_KEY" ] || fail "AES_SECRET_KEY is required when FORCE_ENV_REWRITE=1"
+    [ -n "$INGEST_TOKEN_SECRET" ] || fail "INGEST_TOKEN_SECRET is required when FORCE_ENV_REWRITE=1"
   fi
 
   [ -z "$AES_SECRET_KEY" ] || [ "${#AES_SECRET_KEY}" -ge 32 ] || fail "AES_SECRET_KEY must contain at least 32 characters"
+  [ -z "$INGEST_TOKEN_SECRET" ] || [ "${#INGEST_TOKEN_SECRET}" -ge 32 ] || fail "INGEST_TOKEN_SECRET must contain at least 32 characters"
   validate_dotenv_value ADMIN_USERNAME "$ADMIN_USERNAME"
   validate_dotenv_value ADMIN_PASSWORD "$ADMIN_PASSWORD"
   validate_dotenv_value AES_SECRET_KEY "$AES_SECRET_KEY"
+  validate_dotenv_value INGEST_TOKEN_SECRET "$INGEST_TOKEN_SECRET"
   validate_dotenv_value REDIS_URL "$REDIS_URL"
   validate_dotenv_value CORS_ORIGIN "$CORS_ORIGIN"
   validate_dotenv_value SHOPIFY_WEB_ORDER_SOURCES "$SHOPIFY_WEB_ORDER_SOURCES"
@@ -414,20 +456,20 @@ configure_database_and_env() {
 install_app() {
   log "Installing Node dependencies"
   cd "$APP_DIR"
-  npm ci --omit=dev
-  npm run check
+  run_as_app npm ci --omit=dev
+  run_as_app npm run check
 
   log "Initializing/migrating database"
-  npm run migrate
-  npm run doctor
+  run_as_app npm run migrate
+  run_as_app npm run doctor
 }
 
 setup_pm2() {
   log "Starting PM2 processes"
   cd "$APP_DIR"
-  pm2 startOrReload ecosystem.config.js --update-env
-  pm2 save
-  pm2 startup systemd -u root --hp /root >/tmp/${APP_NAME}-pm2-startup.log 2>&1 || true
+  run_as_app pm2 startOrReload ecosystem.config.js --update-env
+  run_as_app pm2 save
+  pm2 startup systemd -u "$APP_USER" --hp "$APP_HOME" >/tmp/${APP_NAME}-pm2-startup.log 2>&1 || true
 }
 
 verify_runtime() {
@@ -441,8 +483,8 @@ verify_runtime() {
     fi
     sleep 2
   done
-  pm2 status || true
-  pm2 logs capi-api --lines 50 --nostream || true
+  run_as_app pm2 status || true
+  run_as_app pm2 logs capi-api --lines 50 --nostream || true
   fail "API did not become ready on 127.0.0.1:${INTERNAL_PORT}"
 }
 
@@ -545,6 +587,7 @@ print_summary() {
 Deployment complete.
 
 App directory: ${APP_DIR}
+Runtime user:  ${APP_USER}
 Internal API:  http://127.0.0.1:${INTERNAL_PORT}
 Admin URL:     ${admin_url}
 Username:      ${ADMIN_USERNAME}
@@ -559,10 +602,10 @@ Next steps:
    This is required: browser Purchase candidates remain AWAITING_PAYMENT until the verified webhook confirms payment.
 
 Useful commands:
-pm2 status
-pm2 logs capi-api
-pm2 logs capi-worker
-cd ${APP_DIR} && npm run doctor
+sudo -u ${APP_USER} env HOME=${APP_HOME} pm2 status
+sudo -u ${APP_USER} env HOME=${APP_HOME} pm2 logs capi-api
+sudo -u ${APP_USER} env HOME=${APP_HOME} pm2 logs capi-worker
+sudo -u ${APP_USER} env HOME=${APP_HOME} npm --prefix ${APP_DIR} run doctor
 
 SUMMARY
 }
@@ -571,6 +614,7 @@ main() {
   need_root
   detect_ubuntu
   validate_slug APP_NAME "$APP_NAME"
+  validate_linux_user
   validate_branch
   validate_app_dir
   validate_port INTERNAL_PORT "$INTERNAL_PORT"
@@ -588,6 +632,7 @@ main() {
   validate_bool FORCE_ENV_REWRITE "$FORCE_ENV_REWRITE"
   validate_domain
   install_apt_deps
+  ensure_app_user
   open_firewall_port
   clone_or_update_repo
   configure_database_and_env

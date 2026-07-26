@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const fs = require('fs');
 const axios = require('axios');
 const express = require('express');
 const helmet = require('helmet');
@@ -19,6 +20,7 @@ const pool = require('./utils/db');
 const redis = require('./utils/redis');
 const {
     collectHashedUserData,
+    credentialFingerprint,
     encryptToken,
     decryptTokenIfPossible,
     timingSafeCompare,
@@ -31,6 +33,7 @@ const {
     missingCommerceSignals,
     normalizeEventId,
     normalizeShopifyId,
+    stripPrivateFields,
     tenantScopedExternalId,
     tenantScopedIdentifier,
 } = require('./events/common');
@@ -47,7 +50,8 @@ const {
     mergeUserData,
 } = require('./events/merge');
 const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
-const { normalizeMetaCookie } = require('./platforms/meta');
+const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
+const { parseJsonPreservingLargeIntegers } = require('./utils/json');
 
 const app = express();
 app.set('trust proxy', config.trustProxy);
@@ -80,6 +84,18 @@ app.use(express.json({
         req.rawBody = buf;
     },
 }));
+
+app.use((req, res, next) => {
+    if (!fs.existsSync(config.maintenanceFile)) return next();
+    if (req.path === '/healthz') {
+        return res.json({ status: 'maintenance', uptime: process.uptime() });
+    }
+    res.set('Retry-After', '60');
+    return res.status(503).json({
+        error: 'Service temporarily unavailable for maintenance',
+        retryable: true,
+    });
+});
 
 const capiQueue = new Queue('capi-events', {
     connection: redis,
@@ -130,9 +146,20 @@ function normalizeShopDomain(domain) {
 
 function shopIngestToken(shopDomain) {
     return crypto
-        .createHmac('sha256', config.aesSecretKey)
+        .createHmac('sha256', config.ingestTokenSecret)
         .update(`shop-ingest:${normalizeShopDomain(shopDomain)}`)
         .digest('hex');
+}
+
+function validShopIngestToken(shopDomain, suppliedToken) {
+    const candidates = [config.ingestTokenSecret, config.ingestTokenPreviousSecret].filter(Boolean);
+    return candidates.some(secret => {
+        const expected = crypto
+            .createHmac('sha256', secret)
+            .update(`shop-ingest:${normalizeShopDomain(shopDomain)}`)
+            .digest('hex');
+        return timingSafeStringCompare(expected, suppliedToken);
+    });
 }
 
 function requireMyshopifyDomain(value) {
@@ -851,6 +878,16 @@ function buildPlatformData(payload) {
 }
 
 function buildCustomData(payload) {
+    if (Array.isArray(payload.contents) && payload.contents.length > 200) {
+        const error = new Error('contents must contain 200 items or fewer');
+        error.statusCode = 422;
+        throw error;
+    }
+    if (Array.isArray(payload.content_ids) && payload.content_ids.length > 200) {
+        const error = new Error('content_ids must contain 200 items or fewer');
+        error.statusCode = 422;
+        throw error;
+    }
     const contents = Array.isArray(payload.contents)
         ? payload.contents
             .filter(Boolean)
@@ -1134,6 +1171,21 @@ async function cleanupExpiredOperationalData() {
          WHERE target.id = expired.id`,
         config.aliasRetentionDays,
     );
+    const webhookInbox = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT id
+             FROM shopify_webhook_inbox
+             WHERE status IN ('SUCCESS', 'FAILED_PERMANENT')
+               AND COALESCE(processed_at, created_at) < NOW() - ($1::int * INTERVAL '1 day')
+             ORDER BY COALESCE(processed_at, created_at), id
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM shopify_webhook_inbox target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.eventRetentionDays,
+    );
     const deadLetters = await deleteRetentionBatches(
         `WITH expired AS (
              SELECT id
@@ -1162,7 +1214,7 @@ async function cleanupExpiredOperationalData() {
          WHERE target.id = expired.id`,
         config.qualityRetentionDays,
     );
-    return { eventStore, aliases, deadLetters, qualitySnapshots };
+    return { eventStore, aliases, webhookInbox, deadLetters, qualitySnapshots };
 }
 
 async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
@@ -1310,6 +1362,18 @@ async function persistOutboxEvent(shopId, payload) {
 
         const paymentUnlocked = existing.status === 'AWAITING_PAYMENT'
             && purePayload._payment_confirmed === true;
+        const recoverableValidationFailure = existing.status !== 'AWAITING_PAYMENT'
+            && ['FAILED', 'PARTIAL_FAILED'].includes(existing.status)
+            && (await client.query(
+                `SELECT 1
+                 FROM event_deliveries
+                 WHERE event_store_id = $1
+                   AND status = 'FAILED_PERMANENT'
+                   AND error_code = 'LOCAL_VALIDATION'
+                 LIMIT 1`,
+                [existing.id],
+            )).rowCount > 0;
+        const reopenForDelivery = paymentUnlocked || recoverableValidationFailure;
         const mergedPayload = mergePersistedEventPayload(existing.request_payload, purePayload);
         const emqCandidates = [
             existing.emq_estimate,
@@ -1328,8 +1392,24 @@ async function persistOutboxEvent(shopId, payload) {
              WHERE id = $1
              RETURNING id, shop_id, event_name, event_id, request_payload,
                        emq_estimate, status, fb_response`,
-            [existing.id, paymentUnlocked, mergedEmq, JSON.stringify(mergedPayload)],
+            [existing.id, reopenForDelivery, mergedEmq, JSON.stringify(mergedPayload)],
         );
+        if (recoverableValidationFailure) {
+            await client.query(
+                `UPDATE event_deliveries
+                 SET status = 'PENDING',
+                     attempt_count = 0,
+                     next_attempt_at = NOW(),
+                     lease_expires_at = NULL,
+                     error_code = NULL,
+                     error_message = NULL,
+                     updated_at = NOW()
+                 WHERE event_store_id = $1
+                   AND status = 'FAILED_PERMANENT'
+                   AND error_code = 'LOCAL_VALIDATION'`,
+                [existing.id],
+            );
+        }
         await client.query('COMMIT');
         return updated.rows[0];
     } catch (error) {
@@ -1443,6 +1523,15 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         _received_at: Date.now(),
     };
 
+    const validationErrors = validateMetaEvent(
+        prepareMetaEvent(stripPrivateFields({ ...fbEventData })),
+    );
+    if (validationErrors.length > 0) {
+        const error = new Error(`Event validation failed: ${validationErrors.join('; ')}`);
+        error.statusCode = 422;
+        throw error;
+    }
+
     const dbEvent = await persistOutboxEvent(shopId, fbEventData);
     if (!dbEvent) {
         return {
@@ -1523,7 +1612,7 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
         || req.body?.events?.[0]?.ingest_token
         || '',
     ).trim();
-    if (config.requireIngestToken && !timingSafeStringCompare(shopIngestToken(shopDomain), suppliedIngestToken)) {
+    if (config.requireIngestToken && !validShopIngestToken(shopDomain, suppliedIngestToken)) {
         return res.status(401).json({ error: 'Invalid shop ingest token' });
     }
 
@@ -1594,38 +1683,17 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
     });
 }));
 
-async function handleShopifyPurchaseWebhook(req, res) {
-    const shopDomain = normalizeShopDomain(req.headers['x-shopify-shop-domain']);
-    const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-    const webhookId = req.headers['x-shopify-webhook-id'];
-    const webhookTopic = String(req.headers['x-shopify-topic'] || '').trim().toLowerCase();
-    const triggeredAt = req.headers['x-shopify-triggered-at'];
-    if (!shopDomain || !hmacHeader) return res.status(400).send('Missing Headers');
-
-    const { rows } = await pool.query(
-        'SELECT id, app_secret FROM shops WHERE shop_domain = $1 AND status = $2',
-        [shopDomain, 'active'],
-    );
-    if (rows.length === 0) return res.status(401).send('Unauthorized');
-
-    const appSecret = decryptTokenIfPossible(rows[0].app_secret);
-    const generatedHash = crypto.createHmac('sha256', appSecret).update(req.rawBody).digest('base64');
-    if (!timingSafeCompare(generatedHash, hmacHeader)) return res.status(401).send('HMAC Failed');
-    if (webhookTopic !== 'orders/paid') {
-        return res.status(400).send('Unexpected webhook topic');
-    }
-
-    const order = req.body || {};
+async function processShopifyWebhookInboxRow(row) {
+    const order = row.payload || {};
     const ignoreReason = paidOrderIgnoreReason(order, config.shopifyWebOrderSources);
     if (ignoreReason) {
-        return res.status(200).json({ success: true, ignored: true, reason: ignoreReason });
+        return { ignored: true, reason: ignoreReason };
     }
     const financialStatus = String(order.financial_status || '').trim().toLowerCase();
     if (financialStatus && financialStatus !== 'paid') {
-        return res.status(422).json({
-            success: false,
-            error: `orders/paid payload has unexpected financial_status: ${financialStatus}`,
-        });
+        const error = new Error(`orders/paid payload has unexpected financial_status: ${financialStatus}`);
+        error.statusCode = 422;
+        throw error;
     }
     const hasStableOrderIdentity = firstPresent(
         order.checkout_token,
@@ -1636,50 +1704,338 @@ async function handleShopifyPurchaseWebhook(req, res) {
         order.order_number,
     );
     if (!hasStableOrderIdentity) {
-        return res.status(422).json({ success: false, error: 'Missing stable order identity' });
+        const error = new Error('Missing stable order identity');
+        error.statusCode = 422;
+        throw error;
     }
-    const payload = buildShopifyOrderPurchasePayload(order, shopDomain, {
-        eventTimestamp: Number.isFinite(Date.parse(String(triggeredAt || ''))) ? triggeredAt : undefined,
+    const payload = buildShopifyOrderPurchasePayload(order, row.shop_domain, {
+        eventTimestamp: row.triggered_at || undefined,
     });
     const purchaseValue = Number(payload.value);
     if (!Number.isFinite(purchaseValue) || purchaseValue < 0 || !/^[A-Z]{3}$/.test(String(payload.currency || '').toUpperCase())) {
-        return res.status(422).json({ success: false, error: 'Invalid paid order value or currency' });
+        const error = new Error('Invalid paid order value or currency');
+        error.statusCode = 422;
+        throw error;
     }
-
-    // This v2 receipt namespace is written only after the PostgreSQL outbox is
-    // durable. Therefore a cache hit can never represent an event that was
-    // acknowledged before persistence.
-    let deliveryKey;
-    if (webhookId) {
-        deliveryKey = `shopify:webhook:v2:${shopDomain}:${webhookId}`;
-        const existingReceipt = await optionalRedis(
-            () => redis.get(deliveryKey),
-            undefined,
-            'Shopify webhook delivery cache',
-        );
-        if (existingReceipt === '1') {
-            return res.status(200).json({ success: true, duplicate_webhook: true });
-        }
-    }
-
-    const result = await queueEventForOutbox(req, {
+    const backgroundRequest = { headers: {}, socket: {} };
+    return queueEventForOutbox(backgroundRequest, {
         ...payload,
-        shop_domain: shopDomain,
-        tenant_id: shopDomain,
-    }, rows[0].id, {
+        shop_domain: row.shop_domain,
+        tenant_id: row.shop_domain,
+    }, Number(row.shop_id), {
         allowRequestIdentifiers: false,
         paymentConfirmed: true,
     });
-    if (deliveryKey) {
-        // PostgreSQL is already committed, so this best-effort optimization
-        // must not delay Shopify's five-second acknowledgment deadline.
-        void optionalRedis(
-            () => redis.set(deliveryKey, '1', 'EX', 7 * 24 * 60 * 60),
-            undefined,
-            'Shopify webhook receipt save',
-        );
+}
+
+async function claimShopifyWebhookInboxRow() {
+    const { rows } = await pool.query(
+        `WITH candidate AS (
+             SELECT id
+             FROM shopify_webhook_inbox
+             WHERE next_attempt_at <= NOW()
+               AND (
+                   status IN ('PENDING', 'RETRYABLE_FAILED')
+                   OR (status = 'PROCESSING' AND lease_expires_at < NOW())
+               )
+             ORDER BY next_attempt_at, id
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+         )
+         UPDATE shopify_webhook_inbox inbox
+         SET status = 'PROCESSING',
+             attempt_count = attempt_count + 1,
+             lease_expires_at = NOW() + ($1::int * INTERVAL '1 second'),
+             error_message = NULL
+         FROM candidate
+         WHERE inbox.id = candidate.id
+         RETURNING inbox.*,
+                   (SELECT shop_domain FROM shops WHERE id = inbox.shop_id) AS shop_domain`,
+        [config.shopifyWebhookInboxLeaseSeconds],
+    );
+    return rows[0] || null;
+}
+
+let drainingShopifyInbox = false;
+async function drainShopifyWebhookInbox(limit = config.shopifyWebhookInboxBatchSize) {
+    if (drainingShopifyInbox || fs.existsSync(config.maintenanceFile)) return 0;
+    drainingShopifyInbox = true;
+    let processed = 0;
+    try {
+        while (processed < limit) {
+            const row = await claimShopifyWebhookInboxRow();
+            if (!row) break;
+            try {
+                await processShopifyWebhookInboxRow(row);
+                await pool.query(
+                    `UPDATE shopify_webhook_inbox
+                     SET status = 'SUCCESS', processed_at = NOW(), lease_expires_at = NULL, error_message = NULL
+                     WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $2`,
+                    [row.id, row.attempt_count],
+                );
+            } catch (error) {
+                const statusCode = Number(error.statusCode || 500);
+                const permanent = (statusCode >= 400 && statusCode < 500)
+                    || Number(row.attempt_count) >= config.shopifyWebhookInboxMaxAttempts;
+                const delaySeconds = Math.min(900, 2 ** Math.min(9, Number(row.attempt_count)));
+                await pool.query(
+                    `UPDATE shopify_webhook_inbox
+                     SET status = $2,
+                         next_attempt_at = NOW() + ($3::int * INTERVAL '1 second'),
+                         lease_expires_at = NULL,
+                         processed_at = CASE WHEN $2 = 'FAILED_PERMANENT' THEN NOW() ELSE NULL END,
+                         error_message = $4
+                     WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $5`,
+                    [row.id, permanent ? 'FAILED_PERMANENT' : 'RETRYABLE_FAILED', delaySeconds, String(error.message).slice(0, 4000), row.attempt_count],
+                );
+                console.error(`[ShopifyInbox] webhook ${row.id} ${permanent ? 'failed permanently' : 'deferred'}:`, error.message);
+            }
+            processed += 1;
+        }
+    } finally {
+        drainingShopifyInbox = false;
     }
-    return res.status(result.statusCode).json(result.body);
+    return processed;
+}
+
+const SHOPIFY_RECONCILE_QUERY = `
+    query ReconcilePaidOrders($first: Int!, $after: String, $query: String!) {
+        orders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
+            edges {
+                cursor
+                node {
+                    id name createdAt processedAt updatedAt sourceName test
+                    currentSubtotalLineItemsQuantity
+                    displayFinancialStatus
+                    currentTotalPriceSet { shopMoney { amount currencyCode } }
+                    lineItems(first: 200) {
+                        nodes {
+                            id quantity sku
+                            product { id }
+                            variant { id }
+                            discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } }
+                        }
+                    }
+                }
+            }
+            pageInfo { hasNextPage endCursor }
+        }
+    }
+`;
+
+function reconciledGraphqlOrder(node) {
+    return {
+        _reconciled: true,
+        id: node.id,
+        name: node.name,
+        created_at: node.createdAt,
+        processed_at: node.processedAt,
+        updated_at: node.updatedAt,
+        source_name: node.sourceName,
+        test: node.test,
+        current_subtotal_line_items_quantity: node.currentSubtotalLineItemsQuantity,
+        financial_status: String(node.displayFinancialStatus || '').toLowerCase(),
+        current_total_price: node.currentTotalPriceSet?.shopMoney?.amount,
+        currency: node.currentTotalPriceSet?.shopMoney?.currencyCode,
+        line_items: (node.lineItems?.nodes || []).map(item => ({
+            id: item.id,
+            product_id: item.product?.id,
+            variant_id: item.variant?.id,
+            sku: item.sku,
+            quantity: item.quantity,
+            discountedUnitPriceAfterAllDiscountsSet: item.discountedUnitPriceAfterAllDiscountsSet,
+        })),
+    };
+}
+
+async function reconcilePaidOrdersForShop(shop, db = pool) {
+    const state = await db.query(
+        `SELECT COALESCE(
+                    state.scan_since,
+                    state.last_successful_at,
+                    NOW() - ($2::int * INTERVAL '1 hour')
+                ) AS since,
+                state.scan_cutoff,
+                state.after_cursor
+         FROM shops
+         LEFT JOIN shopify_reconcile_state state ON state.shop_id = shops.id
+         WHERE shops.id = $1`,
+        [shop.id, config.shopifyReconcileLookbackHours],
+    );
+    const since = new Date(state.rows[0].since).toISOString();
+    const scanCutoff = state.rows[0].scan_cutoff
+        ? new Date(state.rows[0].scan_cutoff)
+        : new Date(Date.now() - (5 * 60 * 1000));
+    const cutoff = scanCutoff.toISOString();
+    const token = decryptTokenIfPossible(shop.admin_access_token);
+    const url = `https://${shop.shop_domain}/admin/api/${config.shopifyApiVersion}/graphql.json`;
+    let after = state.rows[0].after_cursor || null;
+    let received = 0;
+    do {
+        const first = Math.min(100, config.shopifyReconcileMaxOrders - received);
+        if (first <= 0) break;
+        const response = await axios.post(url, {
+            query: SHOPIFY_RECONCILE_QUERY,
+            variables: {
+                first,
+                after,
+                // Freeze both ends of the scan window. Without the upper
+                // bound, orders updated while pagination is in progress can
+                // move between pages and invalidate Shopify cursors.
+                query: `updated_at:>'${since}' updated_at:<='${cutoff}' financial_status:paid`,
+            },
+        }, {
+            timeout: config.fbRequestTimeoutMs,
+            headers: {
+                'X-Shopify-Access-Token': token,
+                'Content-Type': 'application/json',
+            },
+        });
+        if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
+            throw new Error(`Shopify GraphQL: ${response.data.errors.map(item => item.message).join('; ')}`);
+        }
+        const cost = response.data?.extensions?.cost;
+        const available = Number(cost?.throttleStatus?.currentlyAvailable);
+        const restoreRate = Number(cost?.throttleStatus?.restoreRate);
+        const queryCost = Number(cost?.actualQueryCost || cost?.requestedQueryCost);
+        if (Number.isFinite(available) && Number.isFinite(restoreRate) && restoreRate > 0
+            && Number.isFinite(queryCost) && available < queryCost) {
+            const delayMs = Math.min(5000, Math.ceil(((queryCost - available) / restoreRate) * 1000));
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+        const connection = response.data?.data?.orders;
+        if (!connection) throw new Error('Shopify GraphQL response is missing orders');
+        for (const edge of connection.edges || []) {
+            const node = edge.node;
+            if (!node?.id || String(node.displayFinancialStatus).toUpperCase() !== 'PAID') continue;
+            const payload = reconciledGraphqlOrder(node);
+            const identity = crypto.createHash('sha256')
+                .update(`${node.id}\0${node.updatedAt || ''}`)
+                .digest('hex');
+            await db.query(
+                `INSERT INTO shopify_webhook_inbox
+                    (shop_id, webhook_id, topic, triggered_at, payload)
+                 VALUES ($1, $2, 'orders/paid', $3, $4::jsonb)
+                 ON CONFLICT (shop_id, webhook_id) DO NOTHING`,
+                [shop.id, `reconcile:${identity}`, node.updatedAt || scanCutoff, JSON.stringify(payload)],
+            );
+            received += 1;
+        }
+        after = connection.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+        if (after) {
+            await db.query(
+                `INSERT INTO shopify_reconcile_state
+                    (shop_id, scan_since, scan_cutoff, after_cursor, last_error, updated_at)
+                 VALUES ($1, $2, $3, $4, NULL, NOW())
+                 ON CONFLICT (shop_id) DO UPDATE
+                 SET scan_since = EXCLUDED.scan_since,
+                     scan_cutoff = EXCLUDED.scan_cutoff,
+                     after_cursor = EXCLUDED.after_cursor,
+                     last_error = NULL,
+                     updated_at = NOW()`,
+                [shop.id, since, scanCutoff, after],
+            );
+        }
+    } while (after && received < config.shopifyReconcileMaxOrders);
+
+    if (!after) await db.query(
+        `INSERT INTO shopify_reconcile_state (shop_id, last_successful_at, last_error, updated_at)
+         VALUES ($1, $2, NULL, NOW())
+         ON CONFLICT (shop_id) DO UPDATE
+         SET last_successful_at = EXCLUDED.last_successful_at,
+             scan_since = NULL,
+             scan_cutoff = NULL,
+             after_cursor = NULL,
+             last_error = NULL,
+             updated_at = NOW()`,
+        [shop.id, scanCutoff],
+    );
+    return received;
+}
+
+async function reconcilePaidOrders() {
+    if (fs.existsSync(config.maintenanceFile)) return 0;
+    const { rows: shops } = await pool.query(
+        `SELECT id, shop_domain, admin_access_token
+         FROM shops
+         WHERE status = 'active'
+           AND admin_access_token IS NOT NULL
+           AND admin_access_token <> ''
+         ORDER BY id`,
+    );
+    let total = 0;
+    for (const shop of shops) {
+        const client = await pool.connect();
+        let acquired = false;
+        try {
+            const lock = await client.query(
+                "SELECT pg_try_advisory_lock(hashtext($1)) AS acquired",
+                [`capi-saas-pro:shopify-reconcile:${shop.id}`],
+            );
+            acquired = lock.rows[0]?.acquired === true;
+            if (!acquired) continue;
+            total += await reconcilePaidOrdersForShop(shop, client);
+        } catch (error) {
+            await client.query(
+                `INSERT INTO shopify_reconcile_state (shop_id, last_error, updated_at)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (shop_id) DO UPDATE SET last_error = EXCLUDED.last_error, updated_at = NOW()`,
+                [shop.id, String(error.message).slice(0, 4000)],
+            ).catch(() => {});
+            console.error(`[ShopifyReconcile] ${shop.shop_domain}:`, error.message);
+        } finally {
+            if (acquired) {
+                await client.query(
+                    "SELECT pg_advisory_unlock(hashtext($1))",
+                    [`capi-saas-pro:shopify-reconcile:${shop.id}`],
+                ).catch(() => {});
+            }
+            client.release();
+        }
+    }
+    if (total > 0) await drainShopifyWebhookInbox();
+    return total;
+}
+
+async function handleShopifyPurchaseWebhook(req, res) {
+    const shopDomain = normalizeShopDomain(req.headers['x-shopify-shop-domain']);
+    const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+    const webhookTopic = String(req.headers['x-shopify-topic'] || '').trim().toLowerCase();
+    const triggeredAtHeader = String(req.headers['x-shopify-triggered-at'] || '');
+    if (!shopDomain || !hmacHeader) return res.status(400).send('Missing Headers');
+    if (webhookTopic !== 'orders/paid') return res.status(400).send('Unexpected webhook topic');
+
+    const { rows } = await pool.query(
+        'SELECT id, app_secret FROM shops WHERE shop_domain = $1 AND status = $2',
+        [shopDomain, 'active'],
+    );
+    if (rows.length === 0) return res.status(401).send('Unauthorized');
+
+    const appSecret = decryptTokenIfPossible(rows[0].app_secret);
+    const generatedHash = crypto.createHmac('sha256', appSecret).update(req.rawBody).digest('base64');
+    if (!timingSafeCompare(generatedHash, hmacHeader)) return res.status(401).send('HMAC Failed');
+
+    let precisePayload;
+    try {
+        precisePayload = parseJsonPreservingLargeIntegers(req.rawBody.toString('utf8'));
+    } catch (error) {
+        return res.status(400).send('Invalid JSON payload');
+    }
+
+    const suppliedWebhookId = String(req.headers['x-shopify-webhook-id'] || '').trim();
+    const webhookId = (suppliedWebhookId || crypto.createHash('sha256').update(req.rawBody).digest('hex')).slice(0, 255);
+    const triggeredAt = Number.isFinite(Date.parse(triggeredAtHeader)) ? triggeredAtHeader : null;
+    const insert = await pool.query(
+        `INSERT INTO shopify_webhook_inbox (shop_id, webhook_id, topic, triggered_at, payload)
+         VALUES ($1, $2, $3, $4, $5::jsonb)
+         ON CONFLICT (shop_id, webhook_id) DO NOTHING
+         RETURNING id`,
+        [rows[0].id, webhookId, webhookTopic, triggeredAt, JSON.stringify(precisePayload || {})],
+    );
+    res.status(200).json({ success: true, accepted: true, durable: true, duplicate: insert.rowCount === 0 });
+    setImmediate(() => void drainShopifyWebhookInbox().catch(error => {
+        console.error('[ShopifyInbox] immediate drain failed:', error.message);
+    }));
 }
 
 app.post('/api/webhook/purchase', asyncHandler(handleShopifyPurchaseWebhook));
@@ -1708,6 +2064,23 @@ app.get('/readyz', asyncHandler(async (req, res) => {
         durable_ingestion: true,
     });
 }));
+
+cron.schedule(config.shopifyWebhookInboxCron, async () => {
+    try {
+        await drainShopifyWebhookInbox();
+    } catch (error) {
+        console.error('[ShopifyInbox] scheduled drain failed:', error);
+    }
+});
+
+cron.schedule(config.shopifyReconcileCron, async () => {
+    try {
+        const reconciled = await reconcilePaidOrders();
+        if (reconciled > 0) console.warn(`[ShopifyReconcile] queued ${reconciled} paid orders`);
+    } catch (error) {
+        console.error('[ShopifyReconcile] scheduled run failed:', error);
+    }
+});
 
 cron.schedule(config.batchCron, async () => {
     if (!config.legacyRedisDrainEnabled) return;
@@ -1921,19 +2294,28 @@ app.use('/admin/queue', serverAdapter.getRouter());
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 app.get('/api/admin/shops', asyncHandler(async (req, res) => {
-    const { rows } = await pool.query('SELECT id, shop_domain, status, created_at FROM shops ORDER BY id DESC');
+    const { rows } = await pool.query(
+        `SELECT id, shop_domain, status, created_at,
+                (admin_access_token IS NOT NULL AND admin_access_token <> '') AS has_admin_access_token
+         FROM shops
+         ORDER BY id DESC`,
+    );
     res.json(rows.map(row => ({ ...row, ingest_token: shopIngestToken(row.shop_domain) })));
 }));
 
 app.post('/api/admin/shops', asyncHandler(async (req, res) => {
     const shopDomain = requireMyshopifyDomain(req.body.shop_domain);
     const appSecret = requireBoundedString(req.body.app_secret, 'app_secret', 2048);
+    const adminAccessToken = optionalBoundedString(req.body.admin_access_token, 'admin_access_token', 10000);
 
     await pool.query(
-        `INSERT INTO shops (shop_domain, app_secret)
-         VALUES ($1, $2)
-         ON CONFLICT (shop_domain) DO UPDATE SET app_secret = EXCLUDED.app_secret, status = 'active'`,
-        [shopDomain, encryptToken(appSecret)],
+        `INSERT INTO shops (shop_domain, app_secret, admin_access_token)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (shop_domain) DO UPDATE
+         SET app_secret = EXCLUDED.app_secret,
+             admin_access_token = COALESCE(EXCLUDED.admin_access_token, shops.admin_access_token),
+             status = 'active'`,
+        [shopDomain, encryptToken(appSecret), adminAccessToken ? encryptToken(adminAccessToken) : null],
     );
     res.status(201).json({ success: true });
 }));
@@ -1983,6 +2365,7 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
 app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
         SELECT p.id, p.shop_id, owner.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code,
+               p.rate_limit_group,
                p.rate_limit_until, p.last_usage_pct, p.consecutive_failures, p.last_delivery_at,
                (p.quality_access_token IS NOT NULL AND p.quality_access_token <> '') AS has_quality_token,
                COALESCE(
@@ -2021,6 +2404,7 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     const accessToken = requireBoundedString(req.body.access_token, 'access_token', 10000);
     const qualityAccessToken = optionalBoundedString(req.body.quality_access_token, 'quality_access_token', 10000);
     const testEventCode = optionalBoundedString(req.body.test_event_code, 'test_event_code', 100);
+    const rateLimitGroup = optionalBoundedString(req.body.rate_limit_group, 'rate_limit_group', 100);
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
 
@@ -2038,7 +2422,7 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
         await client.query('BEGIN');
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${platform}:${pixelId}`]);
         const existing = await client.query(
-            `SELECT id
+            `SELECT id, rate_limit_group
              FROM pixels
              WHERE platform = $1 AND pixel_id = $2
              ORDER BY id ASC
@@ -2051,13 +2435,16 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
         if (existing.rowCount > 0) {
             credentialId = existing.rows[0].id;
             reused = true;
+            const effectiveRateLimitGroup = rateLimitGroup || existing.rows[0].rate_limit_group || null;
             await client.query(
                 `UPDATE pixels
                  SET shop_id = COALESCE(shop_id, $2),
                      name = $3,
                      access_token = $4,
                      quality_access_token = COALESCE($5, quality_access_token),
-                     test_event_code = $6
+                     test_event_code = $6,
+                     credential_scope = $7,
+                     rate_limit_group = $8
                  WHERE id = $1`,
                 [
                     credentialId,
@@ -2066,14 +2453,27 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
                     encryptToken(accessToken),
                     qualityAccessToken ? encryptToken(qualityAccessToken) : null,
                     testEventCode,
+                    credentialFingerprint(platform, accessToken, effectiveRateLimitGroup),
+                    effectiveRateLimitGroup,
                 ],
             );
         } else {
             const inserted = await client.query(
-                `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token, quality_access_token, test_event_code)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                `INSERT INTO pixels
+                    (shop_id, platform, name, pixel_id, access_token, quality_access_token, test_event_code, credential_scope, rate_limit_group)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  RETURNING id`,
-                [shopId, platform, name, pixelId, encryptToken(accessToken), qualityAccessToken ? encryptToken(qualityAccessToken) : null, testEventCode],
+                [
+                    shopId,
+                    platform,
+                    name,
+                    pixelId,
+                    encryptToken(accessToken),
+                    qualityAccessToken ? encryptToken(qualityAccessToken) : null,
+                    testEventCode,
+                    credentialFingerprint(platform, accessToken, rateLimitGroup),
+                    rateLimitGroup,
+                ],
             );
             credentialId = inserted.rows[0].id;
         }
@@ -2422,6 +2822,15 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                 FROM event_store
                 WHERE status = 'PENDING'
                   ${shopId ? 'AND shop_id = $1' : ''}
+            ),
+            webhook_inbox AS (
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')
+                    )::int AS outstanding,
+                    COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT')::int AS permanent_failed
+                FROM shopify_webhook_inbox
+                WHERE TRUE ${shopId ? 'AND shop_id = $1' : ''}
             )
             SELECT
                 COUNT(*) FILTER (
@@ -2446,6 +2855,8 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                 (SELECT oldest_seconds FROM awaiting_payment)::bigint AS oldest_awaiting_payment_seconds,
                 (SELECT count FROM pending_backlog)::int AS pending_backlog,
                 (SELECT oldest_seconds FROM pending_backlog)::bigint AS oldest_pending_seconds,
+                (SELECT outstanding FROM webhook_inbox)::int AS webhook_inbox_outstanding,
+                (SELECT permanent_failed FROM webhook_inbox)::int AS webhook_inbox_permanent_failed,
                 (SELECT COUNT(*) FROM scoped_pixels WHERE rate_limit_until > NOW())::int AS active_cooldowns,
                 (SELECT MAX(last_usage_pct) FROM scoped_pixels) AS max_usage_pct,
                 (SELECT COALESCE(SUM(consecutive_failures), 0) FROM scoped_pixels)::int AS consecutive_failures
@@ -2610,7 +3021,7 @@ app.use((err, req, res, next) => {
     if (err.code === '42501') {
         console.error(err);
         return res.status(500).json({
-            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, shop_pixel_routes, event_store, event_deliveries, dead_letters, and their sequences.',
+            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, shop_pixel_routes, event_store, shopify_webhook_inbox, event_deliveries, dead_letters, and their sequences.',
             code: err.code,
         });
     }

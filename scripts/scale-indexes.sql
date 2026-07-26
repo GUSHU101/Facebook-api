@@ -20,8 +20,16 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_dead_letters_failed_at
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_meta_quality_snapshots_retention
     ON meta_quality_snapshots(fetched_at, id);
 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopify_webhook_inbox_due
+    ON shopify_webhook_inbox(next_attempt_at, id)
+    WHERE status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING');
+
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_pixels_platform_external_id
     ON pixels(platform, pixel_id);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pixels_credential_scope
+    ON pixels(credential_scope)
+    WHERE credential_scope IS NOT NULL;
 
 -- Redundant/low-selectivity legacy indexes amplify every high-volume insert
 -- and status update. Their useful access paths are covered by the composite,
