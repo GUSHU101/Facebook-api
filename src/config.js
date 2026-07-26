@@ -71,6 +71,26 @@ function readCsv(name, fallback) {
     return [...new Set(values)];
 }
 
+function readJsonLimit() {
+    const raw = String(process.env.JSON_LIMIT || '1mb').trim().toLowerCase();
+    const match = raw.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb)?$/);
+    if (!match) throw new Error('JSON_LIMIT must be a byte size such as 512kb or 1mb');
+    const multiplier = { b: 1, kb: 1024, mb: 1024 * 1024 }[match[2] || 'b'];
+    const bytes = Number(match[1]) * multiplier;
+    if (!Number.isFinite(bytes) || bytes < 1024 || bytes > 16 * 1024 * 1024) {
+        throw new Error('JSON_LIMIT must be between 1kb and 16mb');
+    }
+    return raw;
+}
+
+function readFacebookApiVersion() {
+    const value = String(process.env.FB_API_VERSION || 'v25.0').trim();
+    if (!/^v\d+\.\d+$/.test(value)) {
+        throw new Error('FB_API_VERSION must look like v25.0');
+    }
+    return value;
+}
+
 const aesSecretKey = readRequired('AES_SECRET_KEY');
 if (aesSecretKey.length < 32) {
     throw new Error('AES_SECRET_KEY must be at least 32 characters');
@@ -91,7 +111,7 @@ if (shutdownTimeoutMs <= httpRequestTimeoutMs) {
 }
 
 module.exports = {
-    port: readInt('PORT', 3000),
+    port: readBoundedInt('PORT', 3000, 65535),
     databaseUrl: readRequired('DATABASE_URL'),
     redisUrl: readRequired('REDIS_URL'),
     aesSecretKey,
@@ -99,9 +119,9 @@ module.exports = {
     adminPassword: readRequired('ADMIN_PASSWORD'),
     requireIngestToken: readBool('REQUIRE_INGEST_TOKEN', true),
     shopifyWebOrderSources: readCsv('SHOPIFY_WEB_ORDER_SOURCES', 'web'),
-    fbApiVersion: process.env.FB_API_VERSION || 'v25.0',
+    fbApiVersion: readFacebookApiVersion(),
     corsOrigin: readCorsOrigin(),
-    jsonLimit: process.env.JSON_LIMIT || '1mb',
+    jsonLimit: readJsonLimit(),
     trustProxy: readNonNegativeInt('TRUST_PROXY_HOPS', 1),
     httpRequestTimeoutMs,
     httpHeadersTimeoutMs,

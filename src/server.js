@@ -17,7 +17,13 @@ const { ExpressAdapter } = require('@bull-board/express');
 const config = require('./config');
 const pool = require('./utils/db');
 const redis = require('./utils/redis');
-const { hashUserData, encryptToken, decryptTokenIfPossible, timingSafeCompare, timingSafeStringCompare } = require('./utils/crypto');
+const {
+    collectHashedUserData,
+    encryptToken,
+    decryptTokenIfPossible,
+    timingSafeCompare,
+    timingSafeStringCompare,
+} = require('./utils/crypto');
 const { calculateEMQ, missingMatchSignals } = require('./utils/emq');
 const {
     compactObject,
@@ -26,9 +32,22 @@ const {
     normalizeEventId,
     normalizeShopifyId,
     tenantScopedExternalId,
+    tenantScopedIdentifier,
 } = require('./events/common');
 const { buildShopifyOrderPurchasePayload, paidOrderIgnoreReason } = require('./events/shopify');
+const {
+    browserAttributionIdentity,
+    sanitizeStoredAttribution,
+    snapshotForAttributionKey,
+} = require('./events/attribution');
+const {
+    mergeCustomData,
+    mergePersistedEventPayload,
+    mergePlatformData,
+    mergeUserData,
+} = require('./events/merge');
 const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
+const { normalizeMetaCookie } = require('./platforms/meta');
 
 const app = express();
 app.set('trust proxy', config.trustProxy);
@@ -93,6 +112,17 @@ const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next
 const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_PIXEL_BATCH_SIZE = 50;
 const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
+const META_CUSTOMER_SEGMENTS = new Set([
+    'new_customer_to_business',
+    'new_customer_to_business_line',
+    'new_customer_to_product_area',
+    'new_customer_to_medium',
+    'existing_customer_to_business',
+    'existing_customer_to_business_line',
+    'existing_customer_to_product_area',
+    'existing_customer_to_medium',
+    'customer_in_loyalty_program',
+]);
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -177,24 +207,6 @@ function firstForwardedIp(req) {
     return req.socket?.remoteAddress;
 }
 
-function isSha256Hex(value) {
-    return /^[a-f0-9]{64}$/.test(String(value || '').trim().toLowerCase());
-}
-
-function hashOrKeepMany(values, type = 'default') {
-    const hashes = [];
-    const seen = new Set();
-    for (const value of values.flat()) {
-        const normalized = String(value || '').trim().toLowerCase();
-        const hash = isSha256Hex(normalized) ? normalized : hashUserData(value, type);
-        if (hash && !seen.has(hash)) {
-            seen.add(hash);
-            hashes.push(hash);
-        }
-    }
-    return hashes.length ? hashes : undefined;
-}
-
 function cleanKeyPart(value) {
     if (value === undefined || value === null || value === '') return undefined;
     return String(value).trim().slice(0, 256);
@@ -221,10 +233,18 @@ function normalizeActionSource(value) {
     return allowed.has(normalized) ? normalized : 'website';
 }
 
+function normalizeCustomerSegmentation(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return META_CUSTOMER_SEGMENTS.has(normalized) ? normalized : undefined;
+}
+
 function normalizeUrl(value) {
     try {
         const parsed = new URL(String(value || '').trim());
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+        parsed.username = '';
+        parsed.password = '';
+        parsed.hash = '';
         return parsed.toString();
     } catch (error) {
         return undefined;
@@ -355,9 +375,9 @@ async function resolveCanonicalEventIdDurably(shopId, eventName, proposedEventId
     }
 }
 
-function attributionKeys(shopId, payload) {
+function attributionKeyEntries(shopId, payload) {
     const candidates = [
-        ['client', firstPresent(payload.client_id, payload.shopify_y, firstScalar(payload.external_id))],
+        ['client', browserAttributionIdentity(payload)],
         ['checkout', payload.checkout_token],
         ['cart', payload.cart_token],
         ['order', payload.order_id],
@@ -371,69 +391,44 @@ function attributionKeys(shopId, payload) {
         const key = `attr:${shopId}:${type}:${value}`;
         if (!seen.has(key)) {
             seen.add(key);
-            keys.push(key);
+            keys.push({ type, key });
         }
     }
     return keys;
 }
 
-function attributionSnapshot(payload) {
-    return compactObject({
-        fbp: firstPresent(payload.fbp, payload._fbp),
-        fbc: firstPresent(payload.fbc, payload._fbc),
-        ttp: payload.ttp,
-        ttclid: payload.ttclid,
-        source_url: firstPresent(payload.source_url, payload.url),
-        referrer: payload.referrer,
-        client_ip: payload.client_ip,
-        user_agent: payload.user_agent,
-        email_hash: firstPresent(payload.email_hash, payload.email_sha256, payload.em, hashUserData(firstPresent(payload.email, payload.customer_email), 'email')),
-        phone_hash: firstPresent(payload.phone_hash, payload.phone_sha256, payload.ph, hashUserData(firstPresent(payload.phone, payload.customer_phone), 'phone')),
-        first_name_hash: firstPresent(payload.first_name_hash, payload.fn, hashUserData(firstPresent(payload.firstName, payload.first_name, payload.customer_first_name), 'name')),
-        last_name_hash: firstPresent(payload.last_name_hash, payload.ln, hashUserData(firstPresent(payload.lastName, payload.last_name, payload.customer_last_name), 'name')),
-        city_hash: firstPresent(payload.city_hash, payload.ct, hashUserData(firstPresent(payload.city, payload.customer_city), 'city')),
-        state_hash: firstPresent(payload.state_hash, payload.st, hashUserData(firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state), 'state')),
-        zip_hash: firstPresent(payload.zip_hash, payload.zp, hashUserData(firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip), 'zip')),
-        country_hash: firstPresent(payload.country_hash, payload.country_sha256, hashUserData(firstPresent(payload.country, payload.country_code, payload.customer_country), 'country')),
-        client_id: firstPresent(payload.client_id, payload.shopify_y),
-        external_id: payload.external_id,
-        checkout_token: payload.checkout_token,
-        cart_token: payload.cart_token,
-        shopify_y: payload.shopify_y,
-        shopify_s: payload.shopify_s,
-        updated_at: Date.now(),
-    });
-}
-
 async function loadAttributionSnapshot(shopId, payload) {
-    const keys = attributionKeys(shopId, payload);
-    if (keys.length === 0) return {};
+    const entries = attributionKeyEntries(shopId, payload);
+    if (entries.length === 0) return {};
 
-    const values = await redis.mget(keys);
+    const values = await redis.mget(entries.map(entry => entry.key));
     const snapshots = values
-        .filter(Boolean)
-        .map(value => {
+        .map((value, index) => {
             try {
-                return JSON.parse(value);
+                return value
+                    ? sanitizeStoredAttribution(JSON.parse(value), entries[index].type)
+                    : {};
             } catch (error) {
                 return {};
             }
         })
+        .filter(snapshot => Object.keys(snapshot).length > 0)
         .sort((left, right) => Number(left.updated_at || 0) - Number(right.updated_at || 0));
 
     return Object.assign({}, ...snapshots);
 }
 
 async function saveAttributionSnapshot(shopId, payload) {
-    const keys = attributionKeys(shopId, payload);
-    if (keys.length === 0) return;
+    const entries = attributionKeyEntries(shopId, payload);
+    if (entries.length === 0) return;
 
-    const snapshot = attributionSnapshot(payload);
-    if (Object.keys(snapshot).length === 0) return;
-
-    const serialized = JSON.stringify(snapshot);
     const pipeline = redis.pipeline();
-    for (const key of keys) pipeline.set(key, serialized, 'EX', ATTRIBUTION_TTL_SECONDS);
+    for (const entry of entries) {
+        const snapshot = snapshotForAttributionKey(payload, entry.type);
+        if (Object.keys(snapshot).length > 0) {
+            pipeline.set(entry.key, JSON.stringify(snapshot), 'EX', ATTRIBUTION_TTL_SECONDS);
+        }
+    }
     const results = await pipeline.exec();
     const failed = results.find(([error]) => error);
     if (failed) throw failed[0];
@@ -770,14 +765,27 @@ function buildUserData(req, payload, options = {}) {
     );
 
     const hashed = {
-        em: hashOrKeepMany([payload.email_hash, payload.email_sha256, payload.em, email], 'email'),
-        ph: hashOrKeepMany([payload.phone_hash, payload.phone_sha256, payload.ph, phone], 'phone'),
-        fn: hashOrKeepMany([payload.first_name_hash, payload.fn, firstName], 'name'),
-        ln: hashOrKeepMany([payload.last_name_hash, payload.ln, lastName], 'name'),
-        ct: hashOrKeepMany([payload.city_hash, payload.ct, city], 'city'),
-        st: hashOrKeepMany([payload.state_hash, payload.st, state], 'state'),
-        zp: hashOrKeepMany([payload.zip_hash, payload.zp, zip], 'zip'),
-        country: hashOrKeepMany([payload.country_hash, payload.country_sha256, payload.country_hashed, country], 'country'),
+        em: collectHashedUserData(
+            [payload.email_hash, payload.email_sha256],
+            [payload.em, email],
+            'email',
+        ),
+        ph: collectHashedUserData(
+            [payload.phone_hash, payload.phone_sha256],
+            [payload.ph, phone],
+            'phone',
+            { country },
+        ),
+        fn: collectHashedUserData([payload.first_name_hash], [payload.fn, firstName], 'name'),
+        ln: collectHashedUserData([payload.last_name_hash], [payload.ln, lastName], 'name'),
+        ct: collectHashedUserData([payload.city_hash], [payload.ct, city], 'city'),
+        st: collectHashedUserData([payload.state_hash], [payload.st, state], 'state', { country }),
+        zp: collectHashedUserData([payload.zip_hash], [payload.zp, zip], 'zip', { country }),
+        country: collectHashedUserData(
+            [payload.country_hash, payload.country_sha256],
+            [payload.country_hashed, country],
+            'country',
+        ),
         external_id: scopedExternalId ? [scopedExternalId] : undefined,
     };
 
@@ -792,8 +800,8 @@ function buildUserData(req, payload, options = {}) {
             payload.user_agent,
             options.allowRequestIdentifiers ? req.headers['user-agent'] : undefined,
         ),
-        fbc: firstPresent(payload.fbc, payload._fbc),
-        fbp: firstPresent(payload.fbp, payload._fbp),
+        fbc: normalizeMetaCookie(firstPresent(payload.fbc, payload._fbc)),
+        fbp: normalizeMetaCookie(firstPresent(payload.fbp, payload._fbp)),
         em: hashed.em,
         ph: hashed.ph,
         fn: hashed.fn,
@@ -858,9 +866,14 @@ function buildCustomData(payload) {
             }))
             .filter(item => item.id)
         : undefined;
-    const contentIds = Array.isArray(payload.content_ids)
-        ? payload.content_ids.filter(Boolean).map(String)
-        : contents?.map(item => String(item.id));
+    // Item-level contents are the authoritative cart snapshot. Deriving IDs
+    // from them prevents a stale caller-supplied content_ids list from
+    // referring to products that are not present in the event contents.
+    const contentIds = contents?.length
+        ? contents.map(item => String(item.id))
+        : (Array.isArray(payload.content_ids)
+            ? payload.content_ids.filter(Boolean).map(String)
+            : undefined);
     const numItems = Number.isFinite(Number(payload.num_items))
         ? Number(payload.num_items)
         : contents?.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
@@ -876,60 +889,11 @@ function buildCustomData(payload) {
         content_name: payload.content_name,
         content_category: payload.content_category,
         num_items: numItems > 0 ? numItems : undefined,
-        order_id: payload.order_id,
+        order_id: tenantScopedIdentifier(
+            firstPresent(payload.tenant_id, payload.shop_domain),
+            payload.order_id,
+        ),
         search_string: payload.search_string,
-    });
-}
-
-function mergeUniqueArrays(left, right) {
-    const output = [];
-    const seen = new Set();
-    for (const value of [...(Array.isArray(left) ? left : []), ...(Array.isArray(right) ? right : [])]) {
-        const key = JSON.stringify(value);
-        if (!seen.has(key)) {
-            seen.add(key);
-            output.push(value);
-        }
-    }
-    return output.length ? output : undefined;
-}
-
-function mergeUserData(left = {}, right = {}) {
-    const arrayFields = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'];
-    const merged = { ...left, ...right };
-    for (const field of arrayFields) {
-        merged[field] = mergeUniqueArrays(left[field], right[field]);
-    }
-    return compactObject({
-        ...merged,
-        client_ip_address: firstPresent(right.client_ip_address, left.client_ip_address),
-        client_user_agent: firstPresent(right.client_user_agent, left.client_user_agent),
-        fbc: firstPresent(right.fbc, left.fbc),
-        fbp: firstPresent(right.fbp, left.fbp),
-    });
-}
-
-function mergeCustomData(left = {}, right = {}) {
-    return compactObject({
-        ...left,
-        ...right,
-        content_ids: mergeUniqueArrays(left.content_ids, right.content_ids),
-        contents: Array.isArray(right.contents) && right.contents.length ? right.contents : left.contents,
-        value: firstPresent(right.value, left.value),
-        currency: firstPresent(right.currency, left.currency),
-        order_id: firstPresent(right.order_id, left.order_id),
-        num_items: firstPresent(right.num_items, left.num_items),
-    });
-}
-
-function mergePlatformData(left = {}, right = {}) {
-    return compactObject({
-        ...left,
-        ...right,
-        tiktok: compactObject({
-            ...(left.tiktok || {}),
-            ...(right.tiktok || {}),
-        }),
     });
 }
 
@@ -967,10 +931,12 @@ function mergeReadyEvents(events) {
 
 function resolveEventTime(payload) {
     const now = Math.floor(Date.now() / 1000);
-    const fromPayload = Date.parse(payload.timestamp);
-    if (!Number.isFinite(fromPayload)) return now;
-
-    const seconds = Math.floor(fromPayload / 1000);
+    const raw = firstPresent(payload.timestamp, payload.event_time);
+    const numeric = Number(raw);
+    const seconds = Number.isFinite(numeric) && String(raw).trim() !== ''
+        ? Math.floor(numeric > 10_000_000_000 ? numeric / 1000 : numeric)
+        : Math.floor(Date.parse(raw) / 1000);
+    if (!Number.isInteger(seconds) || seconds <= 0) return now;
     if (seconds > now + 300) return now;
     return seconds;
 }
@@ -1135,7 +1101,7 @@ async function cleanupExpiredOperationalData() {
         `WITH expired AS (
              SELECT id
              FROM event_store
-             WHERE status IN ('SUCCESS', 'FAILED', 'PARTIAL_FAILED')
+             WHERE status IN ('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT')
                AND timestamp < NOW() - ($1::int * INTERVAL '1 day')
              ORDER BY timestamp ASC, id ASC
              FOR UPDATE SKIP LOCKED
@@ -1221,19 +1187,32 @@ async function restoreReplayableEvents(shopId, dbEvents) {
         if (!eventName || !eventId) continue;
 
         const emqEstimate = event.emq_estimate || payload._emq_estimate || null;
-        const { rows } = await pool.query(
-            `INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload, fb_response)
-             VALUES ($1, $2, $3, 'PENDING', $4, $5::jsonb, NULL)
-             ON CONFLICT (shop_id, event_name, event_id) DO UPDATE SET
-                 status = 'PENDING',
-                 request_payload = EXCLUDED.request_payload,
-                 emq_estimate = COALESCE(event_store.emq_estimate, EXCLUDED.emq_estimate),
-                 fb_response = NULL
-             WHERE event_store.status <> 'SUCCESS'
-             RETURNING id, request_payload, status, fb_response`,
-            [shopId, eventName, eventId, emqEstimate, JSON.stringify(payload)],
-        );
-        if (rows.length > 0) {
+        const persisted = await persistOutboxEvent(shopId, {
+            ...payload,
+            _emq_estimate: emqEstimate,
+        });
+        if (persisted) {
+            const mergedPayload = persisted.request_payload || payload;
+            const isAwaitingPayment = mergedPayload._requires_payment_confirmation === true
+                && mergedPayload._payment_confirmed !== true;
+            if (isAwaitingPayment) {
+                await pool.query(
+                    `UPDATE event_store
+                     SET status = 'AWAITING_PAYMENT', fb_response = NULL
+                     WHERE id = $1 AND status <> 'SUCCESS'`,
+                    [persisted.id],
+                );
+                continue;
+            }
+
+            const { rows } = await pool.query(
+                `UPDATE event_store
+                 SET status = 'PENDING', timestamp = NOW(), fb_response = NULL
+                 WHERE id = $1 AND status <> 'SUCCESS'
+                 RETURNING id, request_payload, status, fb_response`,
+                [persisted.id],
+            );
+            if (rows.length === 0) continue;
             const restoredIds = rows.map(row => row.id);
             // Manual DLQ replay is an explicit retry decision. Reset only
             // permanently failed deliveries on routes that are still active;
@@ -1289,82 +1268,76 @@ async function persistOutboxEvent(shopId, payload) {
         && !purePayload._payment_confirmed
         ? 'AWAITING_PAYMENT'
         : 'PENDING';
-    const { rows } = await pool.query(
-        `INSERT INTO event_store
-            (shop_id, event_name, event_id, status, emq_estimate, request_payload)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-         ON CONFLICT (shop_id, event_name, event_id) DO UPDATE SET
-             status = CASE
-                 WHEN event_store.status = 'AWAITING_PAYMENT'
-                  AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                 THEN 'PENDING'
-                 ELSE event_store.status
-             END,
-             timestamp = CASE
-                 WHEN event_store.status = 'AWAITING_PAYMENT'
-                  AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                 THEN NOW()
-                 ELSE event_store.timestamp
-             END,
-             emq_estimate = GREATEST(event_store.emq_estimate, EXCLUDED.emq_estimate),
-             request_payload =
-                 event_store.request_payload ||
-                 EXCLUDED.request_payload ||
-                 jsonb_build_object(
-                      'event_time',
-                      CASE
-                          WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                          THEN (EXCLUDED.request_payload->>'event_time')::bigint
-                          WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
-                          THEN (event_store.request_payload->>'event_time')::bigint
-                          ELSE LEAST(
-                              (event_store.request_payload->>'event_time')::bigint,
-                              (EXCLUDED.request_payload->>'event_time')::bigint
-                          )
-                      END,
-                     'event_source_url',
-                     CASE
-                         WHEN LENGTH(COALESCE(EXCLUDED.request_payload->>'event_source_url', ''))
-                            > LENGTH(COALESCE(event_store.request_payload->>'event_source_url', ''))
-                         THEN EXCLUDED.request_payload->'event_source_url'
-                         ELSE event_store.request_payload->'event_source_url'
-                     END,
-                     'user_data',
-                     COALESCE(event_store.request_payload->'user_data', '{}'::jsonb) ||
-                     COALESCE(EXCLUDED.request_payload->'user_data', '{}'::jsonb),
-                     'custom_data',
-                     CASE
-                         WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                         THEN COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
-                              COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
-                         WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
-                         THEN COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb) ||
-                              COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb)
-                         ELSE COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
-                              COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
-                     END,
-                     '_platform_data',
-                     COALESCE(event_store.request_payload->'_platform_data', '{}'::jsonb) ||
-                     COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb),
-                     '_requires_payment_confirmation',
-                     COALESCE(event_store.request_payload->>'_requires_payment_confirmation', 'false')::boolean OR
-                     COALESCE(EXCLUDED.request_payload->>'_requires_payment_confirmation', 'false')::boolean,
-                     '_payment_confirmed',
-                     COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean OR
-                     COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                 )
-         WHERE event_store.status <> 'SUCCESS'
-         RETURNING id, shop_id, event_name, event_id, request_payload, emq_estimate, status, fb_response`,
-        [
-             shopId,
-             purePayload.event_name,
-             purePayload.event_id,
-             initialStatus,
-             emqEstimate,
-             JSON.stringify(purePayload),
-        ],
-    );
-    return rows[0] || null;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const inserted = await client.query(
+            `INSERT INTO event_store
+                (shop_id, event_name, event_id, status, emq_estimate, request_payload)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+             ON CONFLICT (shop_id, event_name, event_id) DO NOTHING
+             RETURNING id, shop_id, event_name, event_id, request_payload, emq_estimate, status, fb_response`,
+            [
+                shopId,
+                purePayload.event_name,
+                purePayload.event_id,
+                initialStatus,
+                emqEstimate,
+                JSON.stringify(purePayload),
+            ],
+        );
+        if (inserted.rowCount > 0) {
+            await client.query('COMMIT');
+            return inserted.rows[0];
+        }
+
+        const existingResult = await client.query(
+            `SELECT id, shop_id, event_name, event_id, request_payload,
+                    emq_estimate, status, fb_response
+             FROM event_store
+             WHERE shop_id = $1 AND event_name = $2 AND event_id = $3
+             FOR UPDATE`,
+            [shopId, purePayload.event_name, purePayload.event_id],
+        );
+        const existing = existingResult.rows[0];
+        if (!existing) {
+            throw new Error('Conflicting event disappeared before durable merge');
+        }
+        if (existing.status === 'SUCCESS') {
+            await client.query('COMMIT');
+            return null;
+        }
+
+        const paymentUnlocked = existing.status === 'AWAITING_PAYMENT'
+            && purePayload._payment_confirmed === true;
+        const mergedPayload = mergePersistedEventPayload(existing.request_payload, purePayload);
+        const emqCandidates = [
+            existing.emq_estimate,
+            emqEstimate,
+            calculateEMQ(mergedPayload.user_data || {}),
+        ]
+            .map(Number)
+            .filter(Number.isFinite);
+        const mergedEmq = emqCandidates.length ? Math.max(...emqCandidates) : null;
+        const updated = await client.query(
+            `UPDATE event_store
+             SET status = CASE WHEN $2::boolean THEN 'PENDING' ELSE status END,
+                 timestamp = CASE WHEN $2::boolean THEN NOW() ELSE timestamp END,
+                 emq_estimate = $3,
+                 request_payload = $4::jsonb
+             WHERE id = $1
+             RETURNING id, shop_id, event_name, event_id, request_payload,
+                       emq_estimate, status, fb_response`,
+            [existing.id, paymentUnlocked, mergedEmq, JSON.stringify(mergedPayload)],
+        );
+        await client.query('COMMIT');
+        return updated.rows[0];
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 async function scheduleDurableDispatch(shopId, eventName) {
@@ -1374,14 +1347,26 @@ async function scheduleDurableDispatch(shopId, eventName) {
     const timeBucket = Math.floor(Date.now() / 1000);
     const delay = isPurchase ? config.purchaseSettleMs : 0;
     return withTimeout(
-        capiQueue.add(
-            'send-fb-batch',
-            { shopId },
-            {
-                delay,
-                jobId: `dispatch-${shopId}-${queueClass}-${timeBucket}`,
-            },
-        ),
+        (async () => {
+            const jobId = `dispatch-${shopId}-${queueClass}-${timeBucket}`;
+            const job = await capiQueue.add('send-fb-batch', { shopId }, { delay, jobId });
+            const state = await job.getState();
+            // BullMQ retains completed jobs for diagnostics. If a same-second
+            // event reuses an already completed/failed coalescing ID, adding it
+            // alone does not create new work and the event would wait for the
+            // rescue scan. A unique follow-up closes that high-traffic gap.
+            if (state === 'completed' || state === 'failed') {
+                return capiQueue.add(
+                    'send-fb-batch',
+                    { shopId },
+                    {
+                        delay,
+                        jobId: `${jobId}-${crypto.randomUUID()}`,
+                    },
+                );
+            }
+            return job;
+        })(),
         1500,
         'BullMQ dispatch',
     );
@@ -1399,15 +1384,25 @@ async function wakeShopOutboxes(shopIds) {
 }
 
 async function queueEventForOutbox(req, payload, shopId, options = {}) {
-    const eventName = requireBoundedString(payload.event_name, 'event_name', 50);
-    const rawEventId = requireBoundedString(payload.event_id, 'event_id', 4096);
+    const trustedPayload = options.allowRequestIdentifiers
+        ? {
+            ...payload,
+            // For browser ingestion, the network request is authoritative.
+            // Never let JSON override the actual request IP/UA and then cache
+            // the spoofed values into a later paid Purchase.
+            client_ip: firstForwardedIp(req),
+            user_agent: firstPresent(req.headers['user-agent'], payload.user_agent),
+        }
+        : payload;
+    const eventName = requireBoundedString(trustedPayload.event_name, 'event_name', 50);
+    const rawEventId = requireBoundedString(trustedPayload.event_id, 'event_id', 4096);
     const proposedEventId = normalizeEventId(rawEventId);
     const attribution = await optionalRedis(
-        () => loadAttributionSnapshot(shopId, payload),
+        () => loadAttributionSnapshot(shopId, trustedPayload),
         {},
         'attribution lookup',
     );
-    const enrichedPayload = { ...attribution, ...payload };
+    const enrichedPayload = { ...attribution, ...trustedPayload };
     const eventId = await resolveCanonicalEventIdDurably(
         shopId,
         eventName,
@@ -1431,6 +1426,9 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         action_source: normalizeActionSource(enrichedPayload.action_source),
         event_id: eventId,
         event_source_url: eventSourceUrlForPayload(req, enrichedPayload),
+        referrer_url: normalizeUrl(enrichedPayload.referrer),
+        customer_segmentation: normalizeCustomerSegmentation(enrichedPayload.customer_segmentation),
+        opt_out: typeof enrichedPayload.opt_out === 'boolean' ? enrichedPayload.opt_out : undefined,
         user_data: userData,
         custom_data: customData,
         _emq_estimate: calculateEMQ(userData),
@@ -1764,91 +1762,11 @@ cron.schedule(config.batchCron, async () => {
                 }
 
                 const mergedReadyEvents = mergeReadyEvents(readyEvents);
-                const shopIds = [];
-                const eventNames = [];
-                const eventIds = [];
-                const statuses = [];
-                const emqs = [];
-                const payloads = [];
-
-                mergedReadyEvents.forEach(event => {
-                    const purePayload = { ...event };
-                    delete purePayload._emq_estimate;
-                    shopIds.push(shop.id);
-                    eventNames.push(event.event_name);
-                    eventIds.push(event.event_id);
-                    statuses.push(
-                        event._requires_payment_confirmation && !event._payment_confirmed
-                            ? 'AWAITING_PAYMENT'
-                            : 'PENDING',
-                    );
-                    emqs.push(event._emq_estimate);
-                    payloads.push(JSON.stringify(purePayload));
-                });
-
-                const outboxQuery = `
-                    INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload)
-                    SELECT * FROM UNNEST ($1::int[], $2::text[], $3::text[], $4::text[], $5::numeric[], $6::jsonb[])
-                    ON CONFLICT (shop_id, event_name, event_id) DO UPDATE SET
-                        status = CASE
-                            WHEN event_store.status = 'AWAITING_PAYMENT'
-                             AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                            THEN 'PENDING'
-                            ELSE event_store.status
-                        END,
-                        timestamp = CASE
-                            WHEN event_store.status = 'AWAITING_PAYMENT'
-                             AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                            THEN NOW()
-                            ELSE event_store.timestamp
-                        END,
-                        emq_estimate = GREATEST(event_store.emq_estimate, EXCLUDED.emq_estimate),
-                        request_payload =
-                            event_store.request_payload ||
-                            EXCLUDED.request_payload ||
-                            jsonb_build_object(
-                                'event_time',
-                                CASE
-                                    WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                                    THEN (EXCLUDED.request_payload->>'event_time')::bigint
-                                    WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
-                                    THEN (event_store.request_payload->>'event_time')::bigint
-                                    ELSE LEAST(
-                                        (event_store.request_payload->>'event_time')::bigint,
-                                        (EXCLUDED.request_payload->>'event_time')::bigint
-                                    )
-                                END,
-                                'user_data',
-                                COALESCE(event_store.request_payload->'user_data', '{}'::jsonb) ||
-                                COALESCE(EXCLUDED.request_payload->'user_data', '{}'::jsonb),
-                                'custom_data',
-                                CASE
-                                    WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                                    THEN COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
-                                         COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
-                                    WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
-                                    THEN COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb) ||
-                                         COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb)
-                                    ELSE COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
-                                         COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
-                                END,
-                                '_platform_data',
-                                COALESCE(event_store.request_payload->'_platform_data', '{}'::jsonb) ||
-                                COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb),
-                                '_requires_payment_confirmation',
-                                COALESCE(event_store.request_payload->>'_requires_payment_confirmation', 'false')::boolean OR
-                                COALESCE(EXCLUDED.request_payload->>'_requires_payment_confirmation', 'false')::boolean,
-                                '_payment_confirmed',
-                                COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean OR
-                                COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
-                            )
-                    WHERE event_store.status <> 'SUCCESS'
-                    RETURNING id, request_payload, status, fb_response;
-                `;
-                const { rows: validDbEvents } = await pool.query(
-                    outboxQuery,
-                    [shopIds, eventNames, eventIds, statuses, emqs, payloads],
-                );
+                const validDbEvents = [];
+                for (const event of mergedReadyEvents) {
+                    const persisted = await persistOutboxEvent(shop.id, event);
+                    if (persisted) validDbEvents.push(persisted);
+                }
 
                 const eventsToSend = validDbEvents.filter(event => event.status === 'PENDING');
                 if (eventsToSend.length > 0) {

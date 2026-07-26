@@ -24,6 +24,20 @@ function normalizeEventId(value, maxLength = 255) {
     return `${text.slice(0, prefixLength)}-${digest}`.slice(0, maxLength);
 }
 
+function tenantScopedIdentifier(tenantId, value, maxLength = 255) {
+    const normalizedTenant = String(tenantId || '').trim().toLowerCase();
+    const normalizedValue = normalizeShopifyId(value);
+    if (!normalizedTenant || !normalizedValue) return undefined;
+    const prefix = `${normalizedTenant}:`;
+    const text = String(normalizedValue).trim();
+    return normalizeEventId(
+        text.toLowerCase().startsWith(prefix)
+            ? `${prefix}${text.slice(prefix.length)}`
+            : `${prefix}${text}`,
+        maxLength,
+    );
+}
+
 function tenantScopedExternalId(tenantId, externalId) {
     const normalizedTenant = String(tenantId || '').trim().toLowerCase();
     const normalizedExternalId = normalizeShopifyId(externalId);
@@ -63,4 +77,5 @@ module.exports = {
     normalizeShopifyId,
     stripPrivateFields,
     tenantScopedExternalId,
+    tenantScopedIdentifier,
 };

@@ -58,15 +58,19 @@ worker restarted.
 16. A renewable per-shop lease allows only one active drain for a shop, while a
     renewable per-credential lease serializes shops sharing a credential.
     Bounded batches and continuation jobs preserve throughput and fairness.
-17. Retention cleanup deletes only terminal rows in bounded `SKIP LOCKED`
-    batches. Pending delivery and payment-confirmation states are preserved.
+17. Retention cleanup deletes terminal rows and payment candidates that remain
+    unconfirmed beyond `EVENT_RETENTION_DAYS` in bounded `SKIP LOCKED` batches.
+    Delivery-ready `PENDING` rows are never deleted. This bounds abandoned
+    checkout growth without weakening the payment-confirmation window.
 18. Worker continuation and rescue queries select only active routes that are
     missing a ledger row or whose retry/expired lease is due. Platform cooldowns
     therefore cannot create an immediate empty-job loop.
 19. Events received before a shop has an active route remain `PENDING` in
     PostgreSQL. Creating or reactivating a route wakes that shop's outbox.
-20. Manual dead-letter replay resets only `FAILED_PERMANENT` rows on currently
-    active routes. Successful routes and inactive routes are never resent.
+20. Manual dead-letter replay first uses the same row-locked merge path as live
+    ingestion, then resets only `FAILED_PERMANENT` rows on currently active
+    routes. Successful/inactive routes are never resent, and an unconfirmed
+    Purchase can never be promoted by replay.
 21. Browser storage retains both queued and in-flight batches until a response
     is confirmed. Storage writes and flushes are serialized to prevent a later
     event from overwriting an unconfirmed earlier request.
@@ -91,6 +95,38 @@ worker restarted.
 28. Browser match identifiers are provenance-safe: `_fbp` and `_ttp` are sent
     only when their real cookies exist, while `_fbc` is created only from an
     actual `fbclid`. Synthetic browser identifiers are never generated.
+29. Attribution cache key classes have different schemas. Browser/session keys
+    contain only device, click, page, and session signals; hashed customer and
+    checkout/cart identity is restricted to commerce keys. Customer
+    `external_id` is never used as a browser key, preventing cross-device cookie
+    inheritance, and cache recency timestamps are server-generated.
+30. Duplicate event payloads merge under a PostgreSQL row lock. Match-data
+    arrays are unioned, while an HMAC-confirmed payment payload wins for order
+    value, order ID, and event time. EMQ is recalculated from the unioned identity
+    set. A late browser retry cannot downgrade an already confirmed Purchase.
+31. Before contending for a shared credential lease, a worker verifies that the
+    specific route has a due, claimable delivery. Successful, terminal, leased,
+    and future-retry rows do not amplify queue work or create false busy retries.
+32. Meta-bound identifiers pass a final outbound sanitizer. Hashes must be
+    lowercase SHA-256, IP addresses must parse as IPv4/IPv6, and `fbp`/`fbc`
+    must use Meta's cookie format. Browser JSON cannot override the trusted
+    request IP, while Shopify webhook infrastructure is never mistaken for the shopper.
+33. A confirmed item-level `contents` snapshot is authoritative for
+    `content_ids`; older cart IDs are not unioned into Purchase. Meta-only
+    parameter scope is enforced before sending: `num_items` is retained only
+    for InitiateCheckout and `search_string` only for Search.
+34. Generated event IDs and outbound order IDs are store-namespaced. This
+    prevents two shops sharing one Meta Dataset from colliding on a locally
+    identical Shopify event, checkout, or order identifier.
+35. Browser queue duplicates merge richer later fields while preserving the
+    earliest occurrence time. Under storage pressure, conversion-funnel events
+    outrank old page views, so the queue does not discard Purchase first.
+36. Explicit hash fields accept only valid SHA-256 values. Raw identifiers are
+    normalized through a separate bounded scalar path, preventing malformed or
+    deeply nested input from becoming plausible but unmatchable hashes.
+37. Dispatch coalescing detects a retained terminal BullMQ job and creates a
+    unique follow-up, closing the same-second arrival gap without removing the
+    PostgreSQL rescue fallback.
 
 ## Why the system does not return ingestion 429 by default
 
@@ -159,8 +195,9 @@ Before production rollout, verify all of the following in a staging stack:
    success without creating another event.
 8. Send browser Purchase and `orders/paid` in both arrival orders. They must
     converge on the checkout token when Shopify supplies it and retain the richer
-    match/custom data. The browser-only state must remain `AWAITING_PAYMENT` and
-    must not be claimable by a worker.
+    match/custom data. Hash arrays must be unioned and confirmed payment fields
+    must win regardless of arrival order. The browser-only state must remain
+    `AWAITING_PAYMENT` and must not be claimable by a worker.
 9. Exhaust BullMQ job attempts. A later watchdog rescue must use a new job ID
    and reclaim only ledger rows whose `next_attempt_at` is due.
 10. Run `npm run check`, `npm test`, `npm audit --audit-level=moderate`,
@@ -171,7 +208,8 @@ Before production rollout, verify all of the following in a staging stack:
 12. Inject a queue job containing event IDs from two shops. The worker must
     reload and mutate only rows matching the job's `shopId`.
 13. Run retention cleanup while ingestion and delivery remain active. Terminal
-    rows should age out, pending rows must survive, and inserts must stay live.
+    rows and expired unconfirmed payment candidates should age out, delivery-ready
+    pending rows must survive, and inserts must stay live.
 14. Hold a route in `RETRYABLE_FAILED` with a future `next_attempt_at`. Verify
     continuation jobs stop until the retry becomes due instead of spinning.
 15. Ingest events before adding any Pixel route. They must remain `PENDING`;
@@ -196,6 +234,18 @@ Before production rollout, verify all of the following in a staging stack:
 23. Start the admin service with external network access blocked. `/admin`, its
     CSS, and its pinned Vue runtime must still load from authenticated local
     routes with no CDN dependency.
+24. Cache attribution for one customer on device A, then submit the same
+    `external_id` from device B without a browser client/session key. Device B
+    must not inherit device A's `fbp`, `fbc`, IP, or user agent.
+25. Replay an unconfirmed Purchase dead letter. It must remain
+    `AWAITING_PAYMENT`; replay cannot create a delivery claim until a verified
+    paid webhook arrives.
+26. Hash `Valéry`, a CJK name, a phone with international leading zeroes, and a
+    US ZIP+4 in both the generated browser pixel and the server normalizer. The
+    resulting hashes must match their official normalized forms exactly.
+27. Merge an old cart containing a removed item with a confirmed paid order.
+    The outbound Purchase `contents` and `content_ids` must contain only the
+    confirmed order items.
 
 ## Official references used
 
@@ -205,6 +255,14 @@ Before production rollout, verify all of the following in a staging stack:
   https://developers.facebook.com/documentation/ads-commerce/conversions-api/deduplicate-pixel-and-server-events
 - Meta Conversions API parameters:
   https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters
+- Meta server event parameters:
+  https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/server-event
+- Meta customer information parameters:
+  https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/customer-information-parameters
+- Meta custom data parameters:
+  https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/custom-data
+- Meta fbp/fbc parameters:
+  https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/fbp-and-fbc
 - Meta Graph API rate limits:
   https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
 - Meta Graph API error handling:

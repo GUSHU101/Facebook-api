@@ -132,6 +132,8 @@ sudo env \
 
 ## 6. 重复执行和升级安全
 
+升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v10` 代码重新复制到每个 Shopify 店铺。服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。
+
 安装器可以重复运行。只要 `${APP_DIR}/.env` 已存在且 `FORCE_ENV_REWRITE` 不是 `1`，脚本会：
 
 - 保留数据库密码、管理员密码和 AES 密钥。
@@ -172,9 +174,9 @@ https://capi.example.com:8443/admin
 5. 为每个店铺配置必需的付款 webhook：
 
 ```text
-Topic: orders/paid
-URL: https://capi.example.com:8443/api/webhook/orders/paid
-Format: JSON
+主题：orders/paid
+地址：https://capi.example.com:8443/api/webhook/orders/paid
+格式：JSON
 ```
 
 浏览器 Purchase 在付款 webhook 验证前只处于 `AWAITING_PAYMENT`，不会提前发送。重复 webhook 使用稳定身份合并，不会重复创建 Purchase。

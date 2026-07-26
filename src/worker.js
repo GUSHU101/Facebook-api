@@ -10,7 +10,7 @@ const redis = require('./utils/redis');
 const workerRedis = redis.createBullMqWorkerConnection();
 const { decryptTokenIfPossible } = require('./utils/crypto');
 const { stripPrivateFields } = require('./events/common');
-const { validateMetaEvent } = require('./platforms/meta');
+const { prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const {
     classifyFacebookError,
     classifyTikTokError,
@@ -89,6 +89,24 @@ async function claimRouteEvents(routeId, eventIds) {
         [routeId, eventIds, DELIVERY_LEASE_SECONDS],
     );
     return new Map(rows.map(row => [String(row.event_store_id), Number(row.attempt_count)]));
+}
+
+async function hasClaimableRouteEvents(routeId, eventIds) {
+    if (eventIds.length === 0) return false;
+    const { rowCount } = await pool.query(
+        `SELECT 1
+         FROM event_deliveries
+         WHERE route_id = $1
+           AND event_store_id = ANY($2::bigint[])
+           AND next_attempt_at <= NOW()
+           AND (
+               status IN ('PENDING', 'RETRYABLE_FAILED')
+               OR (status = 'IN_PROGRESS' AND lease_expires_at < NOW())
+           )
+         LIMIT 1`,
+        [routeId, eventIds],
+    );
+    return rowCount > 0;
 }
 
 function claimsForEvents(dbEvents, claimedEvents) {
@@ -196,8 +214,8 @@ async function markDeliveryFailure(routeId, claims, classification) {
 }
 
 async function deferRouteEvents(routeId, eventIds, delaySeconds, code, message) {
-    if (eventIds.length === 0) return;
-    await pool.query(
+    if (eventIds.length === 0) return 0;
+    const { rowCount } = await pool.query(
         `UPDATE event_deliveries
          SET status = 'RETRYABLE_FAILED',
              next_attempt_at = GREATEST(
@@ -209,9 +227,11 @@ async function deferRouteEvents(routeId, eventIds, delaySeconds, code, message) 
              updated_at = NOW()
          WHERE route_id = $1
            AND event_store_id = ANY($2::bigint[])
-           AND status IN ('PENDING', 'RETRYABLE_FAILED')`,
+           AND status IN ('PENDING', 'RETRYABLE_FAILED')
+           AND next_attempt_at <= NOW()`,
         [routeId, eventIds, Math.max(1, Math.ceil(delaySeconds)), code, message],
     );
+    return rowCount;
 }
 
 async function syncEventStatuses(shopId, eventIds) {
@@ -474,7 +494,9 @@ function shouldIsolateFacebookError(classification) {
 }
 
 async function postFacebookBatch(pixel, token, dbEvents) {
-    const finalEvents = dbEvents.map(event => stripPrivateFields({ ...event.request_payload }));
+    const finalEvents = dbEvents.map(event => (
+        prepareMetaEvent(stripPrivateFields({ ...event.request_payload }))
+    ));
     const requestBody = { data: finalEvents };
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
 
@@ -546,7 +568,9 @@ async function sendToFacebookPixel(pixel, dbEvents) {
     const budget = { remaining: config.facebookIsolationMaxRequests };
     const validDbEvents = [];
     for (const event of dbEvents) {
-        const validationErrors = validateMetaEvent(stripPrivateFields({ ...event.request_payload }));
+        const validationErrors = validateMetaEvent(
+            prepareMetaEvent(stripPrivateFields({ ...event.request_payload })),
+        );
         if (validationErrors.length > 0) {
             failures.push(platformFailureResult(pixel, [event], {
                 code: 'LOCAL_VALIDATION',
@@ -724,7 +748,7 @@ async function recordCredentialFailure(credentialId, classification) {
 }
 
 async function acquireRedisLease(key, minimumTtlMs = config.credentialLeaseMs) {
-    const token = `${process.pid}:${Date.now()}:${Math.random()}`;
+    const token = `${process.pid}:${crypto.randomUUID()}`;
     const ttlMs = Math.max(minimumTtlMs, config.fbRequestTimeoutMs * 3);
     const acquired = await redis.set(key, token, 'PX', ttlMs, 'NX');
     if (!acquired) return null;
@@ -903,16 +927,22 @@ const worker = new Worker('capi-events', async job => {
     let retryNeeded = false;
     let retryAfterSeconds = 0;
     for (const pixel of pixels) {
+        // loadReadyShopEvents selects an event when any route is due. Skip
+        // credentials whose own rows are already successful, terminal, leased,
+        // or scheduled for the future before contending on a shared lock.
+        if (!await hasClaimableRouteEvents(pixel.route_id, idsToUpdate)) continue;
+
         const credentialLease = await acquireCredentialLease(pixel.credential_id);
         if (!credentialLease) {
             const delaySeconds = config.credentialBusyDelaySeconds;
-            await deferRouteEvents(
+            const deferred = await deferRouteEvents(
                 pixel.route_id,
                 idsToUpdate,
                 delaySeconds,
                 'LOCAL_ROUTE_BUSY',
                 'Another worker is delivering to this shared pixel credential',
             );
+            if (deferred === 0) continue;
             deliveries.push({
                 route_id: pixel.route_id,
                 platform: pixel.platform,
@@ -933,13 +963,14 @@ const worker = new Worker('capi-events', async job => {
         try {
             const cooldownSeconds = await credentialCooldownSeconds(pixel.credential_id);
             if (cooldownSeconds > 0) {
-                await deferRouteEvents(
+                const deferred = await deferRouteEvents(
                     pixel.route_id,
                     idsToUpdate,
                     cooldownSeconds,
                     'PLATFORM_COOLDOWN',
                     'Platform usage or Retry-After cooldown is active for this credential',
                 );
+                if (deferred === 0) continue;
                 deliveries.push({
                     route_id: pixel.route_id,
                     platform: pixel.platform,

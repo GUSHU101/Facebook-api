@@ -216,9 +216,9 @@ https://capi.example.com:8443/admin
 每个店铺都必须配置：
 
 ```text
-Topic: orders/paid
-URL: https://capi.example.com:8443/api/webhook/orders/paid
-Format: JSON
+主题：orders/paid
+地址：https://capi.example.com:8443/api/webhook/orders/paid
+格式：JSON
 ```
 
 后台填写的 Shopify Webhook Secret 必须与签名 webhook 的 App Client Secret 一致。服务端验证 `X-Shopify-Hmac-Sha256`，使用 `X-Shopify-Webhook-Id` 防重复。
@@ -238,6 +238,8 @@ Format: JSON
 - `/readyz`、PM2 状态、Worker 日志和后台“投递完整性”均正常。
 
 ## 11. 安全升级、备份和回滚
+
+每次代码升级并通过健康检查后，都要进入管理后台重新复制当前生成的 Shopify Customer Events 代码到所有店铺。`shopify-pixel-v10` 的店铺级事件 ID 和离线队列修复位于店铺端，服务器更新不会自动替换 Shopify 中已粘贴的旧代码。
 
 升级前：
 

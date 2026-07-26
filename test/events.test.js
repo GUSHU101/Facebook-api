@@ -17,15 +17,31 @@ const {
     normalizeEventId,
     stripPrivateFields,
     tenantScopedExternalId,
+    tenantScopedIdentifier,
 } = require('../src/events/common');
 const {
     buildShopifyOrderPurchasePayload,
     discountedUnitPrice,
     paidOrderIgnoreReason,
+    shopifyCustomerSegmentation,
 } = require('../src/events/shopify');
+const {
+    browserAttributionIdentity,
+    buildBrowserAttributionSnapshot,
+    buildCommerceAttributionSnapshot,
+    sanitizeStoredAttribution,
+    snapshotForAttributionKey,
+} = require('../src/events/attribution');
+const { mergePersistedEventPayload } = require('../src/events/merge');
 const { eventHasSuccessfulDelivery, shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
 const { aggregateDeliveryStatus, retryDelaySeconds } = require('../src/platforms/delivery-state');
-const { validateMetaEvent } = require('../src/platforms/meta');
+const {
+    normalizeMetaCookie,
+    prepareMetaEvent,
+    sanitizeMetaCustomData,
+    sanitizeMetaUserData,
+    validateMetaEvent,
+} = require('../src/platforms/meta');
 const {
     classifyFacebookError,
     metaRateControlFromHeaders,
@@ -34,7 +50,14 @@ const {
 } = require('../src/platforms/rate-control');
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
-const { decryptTokenIfPossible, encryptToken, normalizeForHash, timingSafeStringCompare } = require('../src/utils/crypto');
+const {
+    boundedScalarValues,
+    collectHashedUserData,
+    decryptTokenIfPossible,
+    encryptToken,
+    normalizeForHash,
+    timingSafeStringCompare,
+} = require('../src/utils/crypto');
 
 function probeConfig(environment = {}) {
     return spawnSync(
@@ -60,8 +83,9 @@ function sha256(value) {
     return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
 }
 
-function hashFor(value, type = 'default') {
-    return crypto.createHash('sha256').update(normalizeForHash(value, type)).digest('hex');
+function hashFor(value, type = 'default', context = {}) {
+    const normalized = normalizeForHash(value, type, context);
+    return normalized ? crypto.createHash('sha256').update(normalized).digest('hex') : undefined;
 }
 
 test('external IDs are stable within a shop and isolated across shops sharing a dataset', () => {
@@ -73,6 +97,158 @@ test('external IDs are stable within a shop and isolated across shops sharing a 
     assert.notEqual(shopA, shopB);
     assert.match(shopA, /^[a-f0-9]{64}$/);
     assert.equal(tenantScopedExternalId('', '123'), undefined);
+    assert.equal(tenantScopedIdentifier('alpha.myshopify.com', 'gid://shopify/Order/123'), 'alpha.myshopify.com:123');
+    assert.equal(tenantScopedIdentifier('ALPHA.MYSHOPIFY.COM', 'alpha.myshopify.com:123'), 'alpha.myshopify.com:123');
+    assert.equal(tenantScopedIdentifier('alpha.myshopify.com', 'ALPHA.MYSHOPIFY.COM:123'), 'alpha.myshopify.com:123');
+    assert.notEqual(
+        tenantScopedIdentifier('alpha.myshopify.com', 'same-event'),
+        tenantScopedIdentifier('beta.myshopify.com', 'same-event'),
+    );
+});
+
+test('attribution cache cannot leak customer or checkout identity across browser sessions', () => {
+    const payload = {
+        fbp: 'fb.1.real-browser',
+        fbc: 'fb.1.real-click',
+        client_id: 'browser-client-1',
+        shopify_s: 'session-1',
+        email: 'buyer@example.com',
+        phone: '+1 212 555 1212',
+        external_id: 'customer-777',
+        checkout_token: 'checkout-old',
+        cart_token: 'cart-old',
+        updated_at: 1234,
+    };
+
+    const browserSnapshot = buildBrowserAttributionSnapshot(payload);
+    assert.equal(browserSnapshot.fbp, 'fb.1.real-browser');
+    assert.equal(browserSnapshot.client_id, 'browser-client-1');
+    assert.equal(browserSnapshot.email_hash, undefined);
+    assert.equal(browserSnapshot.phone_hash, undefined);
+    assert.equal(browserSnapshot.external_id, undefined);
+    assert.equal(browserSnapshot.checkout_token, undefined);
+    assert.equal(browserSnapshot.cart_token, undefined);
+    assert.equal(browserAttributionIdentity({ external_id: 'customer-777' }), undefined);
+    assert.equal(browserAttributionIdentity(payload), 'browser-client-1');
+
+    const commerceSnapshot = buildCommerceAttributionSnapshot(payload);
+    assert.match(commerceSnapshot.email_hash[0], /^[a-f0-9]{64}$/);
+    assert.match(commerceSnapshot.phone_hash[0], /^[a-f0-9]{64}$/);
+    assert.equal(commerceSnapshot.external_id, 'customer-777');
+    assert.equal(commerceSnapshot.checkout_token, 'checkout-old');
+    assert.equal(commerceSnapshot.cart_token, 'cart-old');
+
+    // Old deployments may still have a full snapshot under a client/session
+    // key. Reads must strip those unsafe fields immediately, before TTL expiry.
+    const sanitizedLegacyClient = sanitizeStoredAttribution(commerceSnapshot, 'client');
+    assert.equal(sanitizedLegacyClient.email_hash, undefined);
+    assert.equal(sanitizedLegacyClient.external_id, undefined);
+    assert.equal(sanitizedLegacyClient.checkout_token, undefined);
+    assert.equal(sanitizedLegacyClient.cart_token, undefined);
+    const sessionSnapshot = snapshotForAttributionKey(payload, 'session');
+    const checkoutSnapshot = snapshotForAttributionKey(payload, 'checkout');
+    assert.equal(sessionSnapshot.fbp, browserSnapshot.fbp);
+    assert.equal(sessionSnapshot.external_id, undefined);
+    assert.ok(sessionSnapshot.updated_at >= Date.now() - 1000);
+    assert.equal(checkoutSnapshot.external_id, commerceSnapshot.external_id);
+    assert.ok(checkoutSnapshot.updated_at >= Date.now() - 1000);
+});
+
+test('attribution cache rejects fake pre-hashes and applies country-aware normalization', () => {
+    const snapshot = buildCommerceAttributionSnapshot({
+        email_hash: 'not-a-sha256-hash',
+        email: 'Buyer@Example.com',
+        state: 'California',
+        zip: '94035-1234',
+        country: 'US',
+    });
+    assert.deepEqual(snapshot.email_hash, [hashFor('Buyer@Example.com', 'email')]);
+    assert.equal(snapshot.state_hash, undefined);
+    assert.deepEqual(snapshot.zip_hash, [hashFor('94035-1234', 'zip', { country: 'US' })]);
+    assert.deepEqual(collectHashedUserData(['invalid'], ['buyer@example.com'], 'email'), [
+        hashFor('buyer@example.com', 'email'),
+    ]);
+    assert.deepEqual(boundedScalarValues([['a'], { malicious: true }, ['b', ['c']]]), ['a', 'b', 'c']);
+});
+
+test('confirmed Purchase data cannot be downgraded by a later browser duplicate', () => {
+    const confirmed = {
+        event_name: 'Purchase',
+        event_id: 'purchase-order-1001',
+        event_time: 200,
+        event_source_url: 'https://shop.example/checkouts/complete',
+        user_data: {
+            em: ['confirmed-email'],
+            ph: ['confirmed-phone'],
+            fbp: 'fb.1.confirmed-browser',
+        },
+        custom_data: {
+            value: 100,
+            currency: 'USD',
+            order_id: '1001',
+            content_ids: ['paid-item'],
+            contents: [{ id: 'paid-item', quantity: 1, item_price: 100 }],
+        },
+        _received_at: 2000,
+        _requires_payment_confirmation: true,
+        _payment_confirmed: true,
+    };
+    const browserDuplicate = {
+        event_name: 'Purchase',
+        event_id: 'purchase-order-1001',
+        event_time: 100,
+        event_source_url: 'https://shop.example/checkouts/complete?utm_source=facebook',
+        user_data: {
+            em: ['browser-email'],
+            fbp: 'fb.1.late-browser',
+        },
+        custom_data: {
+            value: 80,
+            currency: 'USD',
+            content_ids: ['removed-item'],
+            contents: [{ id: 'removed-item', quantity: 1, item_price: 80 }],
+        },
+        _received_at: 1000,
+        _requires_payment_confirmation: true,
+        _payment_confirmed: false,
+    };
+
+    const merged = mergePersistedEventPayload(confirmed, browserDuplicate);
+    assert.equal(merged.event_time, 200);
+    assert.equal(merged.custom_data.value, 100);
+    assert.equal(merged.custom_data.order_id, '1001');
+    assert.deepEqual(merged.custom_data.content_ids, ['paid-item']);
+    assert.deepEqual(merged.custom_data.contents, [{ id: 'paid-item', quantity: 1, item_price: 100 }]);
+    assert.equal(merged.user_data.fbp, 'fb.1.confirmed-browser');
+    assert.deepEqual(merged.user_data.em, ['browser-email', 'confirmed-email']);
+    assert.deepEqual(merged.user_data.ph, ['confirmed-phone']);
+    assert.equal(merged._payment_confirmed, true);
+    assert.equal(merged._received_at, 1000);
+});
+
+test('payment-confirmed duplicate upgrades an awaiting Purchase without losing browser identity', () => {
+    const browser = {
+        event_name: 'Purchase',
+        event_time: 100,
+        user_data: { em: ['browser-email'], fbp: 'fb.1.browser' },
+        custom_data: { value: 80, currency: 'USD' },
+        _payment_confirmed: false,
+    };
+    const paidWebhook = {
+        event_name: 'Purchase',
+        event_time: 200,
+        user_data: { em: ['paid-email'], ph: ['paid-phone'] },
+        custom_data: { value: 100, currency: 'USD', order_id: '1001' },
+        _payment_confirmed: true,
+    };
+
+    const merged = mergePersistedEventPayload(browser, paidWebhook);
+    assert.equal(merged.event_time, 200);
+    assert.equal(merged.custom_data.value, 100);
+    assert.equal(merged.custom_data.order_id, '1001');
+    assert.equal(merged.user_data.fbp, 'fb.1.browser');
+    assert.deepEqual(merged.user_data.em, ['browser-email', 'paid-email']);
+    assert.equal(merged._payment_confirmed, true);
 });
 
 test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product contents', () => {
@@ -100,7 +276,7 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
             { name: '_ttp', value: 'ttp-cookie' },
             { name: '_shopify_y', value: 'shopify-y-cookie' },
         ],
-        customer: { id: 12345 },
+        customer: { id: 12345, orders_count: 1 },
         line_items: [
             { variant_id: 111, quantity: 2, price: '8.00' },
             { product_id: 222, quantity: 1, price: '30.00' },
@@ -111,10 +287,11 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     });
 
     assert.equal(payload.event_name, 'Purchase');
-    assert.equal(payload.event_id, 'checkout-token-1');
+    assert.equal(payload.event_id, 'demo.myshopify.com:checkout-token-1');
     assert.equal(payload.source_url, 'https://demo.myshopify.com/products/socks?fbclid=fb-click-1&ttclid=tt-click-1');
     assert.equal(payload.fbp, 'fb.1.browser');
-    assert.equal(payload.fbc, 'fb.1.1234567890.fb-click-1');
+    assert.equal(payload.fbc, 'fb.1.1234567890000.fb-click-1');
+    assert.equal(normalizeMetaCookie(payload.fbc), payload.fbc);
     assert.equal(payload.ttp, 'ttp-cookie');
     assert.equal(payload.ttclid, 'tt-click-1');
     assert.equal(payload.client_id, 'shopify-y-cookie');
@@ -128,7 +305,16 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     ]);
     assert.equal(payload.num_items, 3);
     assert.equal(payload.order_id, '#1001');
+    assert.equal(payload.customer_segmentation, 'new_customer_to_business');
     assert.equal(payload.timestamp, '2026-06-23T08:05:00Z');
+});
+
+test('Shopify customer segmentation uses explicit first-order state before order count', () => {
+    assert.equal(shopifyCustomerSegmentation({ isFirstOrder: true, orders_count: 5 }), 'new_customer_to_business');
+    assert.equal(shopifyCustomerSegmentation({ isFirstOrder: false, orders_count: 1 }), 'existing_customer_to_business');
+    assert.equal(shopifyCustomerSegmentation({ orders_count: 1 }), 'new_customer_to_business');
+    assert.equal(shopifyCustomerSegmentation({ orders_count: 2 }), 'existing_customer_to_business');
+    assert.equal(shopifyCustomerSegmentation({}), undefined);
 });
 
 test('buildShopifyOrderPurchasePayload normalizes Shopify GIDs for Purchase dedupe fallback', () => {
@@ -140,9 +326,25 @@ test('buildShopifyOrderPurchasePayload normalizes Shopify GIDs for Purchase dedu
         line_items: [],
     }, 'demo.myshopify.com');
 
-    assert.equal(payload.event_id, '987');
+    assert.equal(payload.event_id, 'demo.myshopify.com:987');
     assert.equal(payload.order_id, '987');
     assert.equal(payload.external_id, '987');
+});
+
+test('authenticated Shopify identifiers outrank storefront-controlled event attributes', () => {
+    const payload = buildShopifyOrderPurchasePayload({
+        id: 987,
+        checkout_token: 'checkout-trusted',
+        name: '#1001',
+        note_attributes: [{ name: 'event_id', value: 'reused-by-many-orders' }],
+        created_at: '2026-06-23T08:00:00Z',
+        landing_site: '/?fbclid=actual-click',
+        current_total_price: '10.00',
+        currency: 'USD',
+        line_items: [],
+    }, 'demo.myshopify.com');
+    assert.equal(payload.event_id, 'demo.myshopify.com:checkout-trusted');
+    assert.equal(payload.fbc, `fb.1.${Date.parse('2026-06-23T08:00:00Z')}.actual-click`);
 });
 
 test('Shopify webhook source URL never leaks an external referrer or private status URL', () => {
@@ -260,9 +462,59 @@ test('private event fields are removed before Meta CAPI send', () => {
 
 test('customer information normalization matches platform hashing expectations', () => {
     assert.equal(normalizeForHash(' Buyer@Example.COM ', 'email'), 'buyer@example.com');
+    assert.equal(normalizeForHash('buyer @example.com', 'email'), undefined);
     assert.equal(normalizeForHash('+1 (212) 555-1212', 'phone'), '12125551212');
+    assert.equal(normalizeForHash('0044 20 7946 0958', 'phone'), '442079460958');
+    assert.equal(normalizeForHash('(650) 555-1212', 'phone', { country: 'US' }), '16505551212');
+    assert.equal(normalizeForHash('(650) 555-1212', 'phone'), undefined);
+    assert.equal(normalizeForHash('020 7946 0958', 'phone', { country: 'GB' }), undefined);
+    assert.equal(normalizeForHash(' Valéry ', 'name'), 'valéry');
+    assert.equal(normalizeForHash('张 三', 'name'), '张三');
     assert.equal(normalizeForHash(' São Paulo ', 'city'), 'saopaulo');
+    assert.equal(normalizeForHash('CA', 'state', { country: 'US' }), 'ca');
+    assert.equal(normalizeForHash('California', 'state', { country: 'US' }), undefined);
     assert.equal(normalizeForHash(' E1 1AA ', 'zip'), 'e11aa');
+    assert.equal(normalizeForHash('94035-1234', 'zip', { country: 'US' }), '94035');
+    assert.equal(normalizeForHash('US', 'country'), 'us');
+    assert.equal(normalizeForHash('United States', 'country'), undefined);
+});
+
+test('Meta match fields are sanitized without fabricating browser identifiers', () => {
+    const hash = sha256('buyer@example.com');
+    assert.equal(normalizeMetaCookie('fb.1.1596403881668.1116446470'), 'fb.1.1596403881668.1116446470');
+    assert.equal(normalizeMetaCookie('fb.1.fake.cookie'), undefined);
+    assert.deepEqual(sanitizeMetaUserData({
+        em: [hash, hash, 'not-a-hash'],
+        client_ip_address: '203.0.113.10',
+        client_user_agent: ' Mozilla/5.0 ',
+        fbp: 'fb.1.fake.cookie',
+        fbc: 'fb.1.1554763741205.AbCdEfGhIjKlMnOp',
+    }), {
+        em: [hash],
+        client_ip_address: '203.0.113.10',
+        client_user_agent: 'Mozilla/5.0',
+        fbc: 'fb.1.1554763741205.AbCdEfGhIjKlMnOp',
+    });
+
+    const preparedPurchase = prepareMetaEvent({
+        event_name: 'Purchase',
+        user_data: { em: [hash] },
+        custom_data: { num_items: 2, search_string: 'shoes', value: 10, currency: 'USD' },
+    });
+    assert.equal(preparedPurchase.custom_data.num_items, undefined);
+    assert.equal(preparedPurchase.custom_data.search_string, undefined);
+    assert.equal(prepareMetaEvent({
+        event_name: 'InitiateCheckout',
+        user_data: { em: [hash] },
+        custom_data: { num_items: 2 },
+    }).custom_data.num_items, 2);
+    assert.deepEqual(sanitizeMetaCustomData({
+        content_ids: ['removed-item', 'paid-item'],
+        contents: [{ id: 'paid-item', quantity: 1, item_price: 10 }],
+    }, 'Purchase'), {
+        content_ids: ['paid-item'],
+        contents: [{ id: 'paid-item', quantity: 1, item_price: 10 }],
+    });
 });
 
 test('encrypted secret helper remains backward compatible with plaintext values', () => {
@@ -429,9 +681,24 @@ test('Meta website events are validated before consuming platform quota', () => 
         event_time: now,
         action_source: 'website',
         event_source_url: 'https://demo.myshopify.com/checkouts/1',
-        user_data: { client_user_agent: 'Mozilla/5.0' },
+        customer_segmentation: 'new_customer_to_business',
+        opt_out: false,
+        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
         custom_data: { value: 46, currency: 'USD' },
     }, now), []);
+    assert.deepEqual(validateMetaEvent({
+        event_name: 'PageView',
+        event_id: 'page-1',
+        event_time: now,
+        action_source: 'website',
+        event_source_url: 'https://demo.myshopify.com/',
+        customer_segmentation: 'guessed_customer',
+        opt_out: 'false',
+        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
+    }, now), [
+        'customer_segmentation must be a supported Meta segment',
+        'opt_out must be boolean',
+    ]);
     assert.deepEqual(validateMetaEvent({
         event_name: 'Purchase',
         event_id: 'checkout-1',
@@ -441,6 +708,7 @@ test('Meta website events are validated before consuming platform quota', () => 
         user_data: {},
         custom_data: { value: -1, currency: 'usd' },
     }, now), [
+        'user_data requires at least one valid matching signal',
         'event_time is older than seven days',
         'website events require client_user_agent',
         'Purchase value must be a non-negative number',
@@ -452,7 +720,7 @@ test('Meta website events are validated before consuming platform quota', () => 
         event_time: now,
         action_source: 'website',
         event_source_url: 'https://demo.myshopify.com/',
-        user_data: { client_user_agent: 'Mozilla/5.0' },
+        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
         custom_data: {},
     }, now), [
         'Purchase value is required',
@@ -464,7 +732,7 @@ test('Meta website events are validated before consuming platform quota', () => 
         event_time: now,
         action_source: 'website',
         event_source_url: 'https://demo.myshopify.com/products/1',
-        user_data: { client_user_agent: 'Mozilla/5.0' },
+        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
         custom_data: { value: 10 },
     }, now), ['AddToCart value and currency must be provided together']);
 });
@@ -513,6 +781,9 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(workerSource, /event\.status === 'PENDING' && Number\(event\.shop_id\) === normalizedShopId/);
     assert.match(workerSource, /scheduleShopContinuation\(normalizedShopId\)/);
     assert.match(workerSource, /config\.workerEventBatchSize/);
+    assert.match(workerSource, /hasClaimableRouteEvents\(pixel\.route_id, idsToUpdate\)/);
+    assert.match(workerSource, /status IN \('PENDING', 'RETRYABLE_FAILED'\)[\s\S]*?next_attempt_at <= NOW\(\)/);
+    assert.match(workerSource, /const token = `\$\{process\.pid\}:\$\{crypto\.randomUUID\(\)\}`/);
     assert.match(workerSource, /lock:delivery-shop:\$\{normalizedShopId\}/);
     assert.match(workerSource, /lock:delivery-credential:\$\{credentialId\}/);
     assert.match(workerSource, /LEFT JOIN event_deliveries delivery[\s\S]*?delivery\.next_attempt_at <= NOW\(\)/);
@@ -522,9 +793,12 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /AWAITING_PAYMENT/);
     assert.match(serverSource, /webhookTopic !== 'orders\/paid'/);
     assert.match(serverSource, /paymentConfirmed: true/);
-    assert.match(serverSource, /EXCLUDED\.request_payload->>'_payment_confirmed'/);
-    assert.match(serverSource, /event_store\.status = 'AWAITING_PAYMENT'/);
-    assert.match(serverSource, /event_store\.request_payload->>'_payment_confirmed'[\s\S]*?OR[\s\S]*?EXCLUDED\.request_payload->>'_payment_confirmed'/);
+    assert.match(serverSource, /ON CONFLICT \(shop_id, event_name, event_id\) DO NOTHING/);
+    assert.match(serverSource, /SELECT id, shop_id, event_name, event_id, request_payload,[\s\S]*?FOR UPDATE/);
+    assert.match(serverSource, /existing\.status === 'SUCCESS'/);
+    assert.match(serverSource, /mergePersistedEventPayload\(existing\.request_payload, purePayload\)/);
+    assert.match(serverSource, /calculateEMQ\(mergedPayload\.user_data \|\| \{\}\)/);
+    assert.match(serverSource, /existing\.status === 'AWAITING_PAYMENT'[\s\S]*?purePayload\._payment_confirmed === true/);
     assert.match(serverSource, /paidOrderIgnoreReason/);
     assert.match(serverSource, /Missing stable order identity/);
     assert.match(serverSource, /if \(eventName !== 'Purchase'\) return \[\]/);
@@ -532,11 +806,17 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /reconcileEventAggregateStatuses/);
     assert.match(serverSource, /capi-saas-pro:aggregate-reconcile/);
     assert.match(serverSource, /FOR UPDATE OF event SKIP LOCKED/);
-    assert.match(serverSource, /event_store\.status = 'AWAITING_PAYMENT'[\s\S]*?_payment_confirmed/);
+    assert.match(serverSource, /SET status = CASE WHEN \$2::boolean THEN 'PENDING' ELSE status END,[\s\S]*?request_payload = \$4::jsonb/);
     assert.match(serverSource, /GROUP BY e\.shop_id\s+ORDER BY e\.shop_id ASC/);
     assert.match(serverSource, /jobId: `rescue-\$\{shopId\}-\$\{rescueMinute\}`/);
+    assert.match(serverSource, /const state = await job\.getState\(\)/);
+    assert.match(serverSource, /state === 'completed' \|\| state === 'failed'/);
     assert.match(serverSource, /cleanupExpiredOperationalData/);
+    assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
+    assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
     assert.match(serverSource, /tenant_id: shopDomain/);
+    assert.match(serverSource, /order_id: tenantScopedIdentifier\(/);
+    assert.match(serverSource, /customer_segmentation: normalizeCustomerSegmentation/);
     assert.match(serverSource, /WHERE platform = \$1 AND pixel_id = \$2/);
     assert.match(serverSource, /UNNEST\(\$1::int\[\]\) AS requested\(shop_id\)/);
     assert.match(serverSource, /SET status = 'inactive'[\s\S]*?WHERE pixel_id = \$1/);
@@ -545,7 +825,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /startRedisLockHeartbeat/);
     assert.match(serverSource, /if \(!config\.legacyRedisDrainEnabled\) return/);
     assert.match(serverSource, /if \(statusCode >= 500\) throw error/);
-    assert.match(serverSource, /requireBoundedString\(payload\.event_id, 'event_id', 4096\)/);
+    assert.match(serverSource, /requireBoundedString\(trustedPayload\.event_id, 'event_id', 4096\)/);
     assert.match(serverSource, /err\.statusCode \|\| err\.status \|\| 500/);
     const redisSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'utils', 'redis.js'), 'utf8');
     assert.match(redisSource, /maxRetriesPerRequest: 1/);
@@ -573,6 +853,18 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
     const malformedOrigin = probeConfig({ CORS_ORIGIN: 'https://shop.example.com/path' });
     assert.notEqual(malformedOrigin.status, 0);
     assert.match(malformedOrigin.stderr, /CORS_ORIGIN entries must be exact http\(s\) origins/);
+
+    const invalidJsonLimit = probeConfig({ JSON_LIMIT: 'unlimited' });
+    assert.notEqual(invalidJsonLimit.status, 0);
+    assert.match(invalidJsonLimit.stderr, /JSON_LIMIT must be a byte size/);
+
+    const excessiveJsonLimit = probeConfig({ JSON_LIMIT: '17mb' });
+    assert.notEqual(excessiveJsonLimit.status, 0);
+    assert.match(excessiveJsonLimit.stderr, /JSON_LIMIT must be between 1kb and 16mb/);
+
+    const malformedApiVersion = probeConfig({ FB_API_VERSION: '../latest' });
+    assert.notEqual(malformedApiVersion.status, 0);
+    assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v25\.0/);
 
     const valid = probeConfig({
         CORS_ORIGIN: 'https://shop.example.com,http://localhost:3000',
@@ -632,12 +924,16 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     const match = html.match(/generatedCode\(\)\s*{\s*return `([\s\S]*?)`;\s*}\s*,\s*}\s*,\s*methods:/);
     assert.ok(match, 'generatedCode template should exist');
 
-    const generated = match[1]
+    const renderedTemplate = match[1]
         .replaceAll('${this.apiDomain}', 'https://nestworks.com.au:8443')
         .replaceAll('${this.currentShop}', 'demo.myshopify.com')
         .replaceAll('${this.currentShopIngestToken}', 'test-ingest-token')
         .replaceAll('${JSON.stringify(this.currentMetaPixelIds)}', '["1234567890","2222222222"]')
         .replaceAll('${JSON.stringify(this.currentTikTokPixelIds)}', '["TT123"]');
+    // The browser evaluates this as a template literal before presenting the
+    // generated pixel. Cook escape sequences here so the VM executes exactly
+    // the code a merchant copies from the admin UI.
+    const generated = Function(`return \`${renderedTemplate}\`;`)();
 
     assert.equal(generated.includes('document.createElement'), false);
     assert.equal(generated.includes('typeof document'), false);
@@ -651,6 +947,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('new URL'), false);
     assert.equal(generated.includes("metaEventName + '_' + Date.now()"), false);
     assert.equal(generated.includes('fallbackEventId'), true);
+    assert.equal(generated.includes('shopScopedIdentifier'), true);
     assert.equal(generated.includes('AbortController'), true);
     assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
     assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
@@ -717,6 +1014,42 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
 
     vm.runInNewContext(generated, sandbox);
 
+    const mergedOfflineDuplicate = sandbox.mergeQueuedEvents([
+        {
+            event_name: 'AddPaymentInfo',
+            event_id: 'demo.myshopify.com:checkout-1:AddPaymentInfo',
+            timestamp: '2026-06-24T00:00:00Z',
+            email_hash: hashFor('old@example.com', 'email'),
+            _client_first_queued_at: 100,
+            _client_retry_count: 2,
+        },
+        {
+            event_name: 'AddPaymentInfo',
+            event_id: 'demo.myshopify.com:checkout-1:AddPaymentInfo',
+            timestamp: '2026-06-24T00:01:00Z',
+            email_hash: hashFor('new@example.com', 'email'),
+            phone_hash: hashFor('+12125551212', 'phone'),
+            _client_first_queued_at: 200,
+            _client_retry_count: 1,
+        },
+    ]);
+    assert.equal(mergedOfflineDuplicate.length, 1);
+    assert.equal(mergedOfflineDuplicate[0].timestamp, '2026-06-24T00:00:00Z');
+    assert.equal(mergedOfflineDuplicate[0].email_hash, hashFor('new@example.com', 'email'));
+    assert.equal(mergedOfflineDuplicate[0].phone_hash, hashFor('+12125551212', 'phone'));
+    assert.equal(mergedOfflineDuplicate[0]._client_first_queued_at, 100);
+    assert.equal(mergedOfflineDuplicate[0]._client_retry_count, 2);
+
+    const storagePressure = Array.from({ length: 1001 }, (_, index) => ({
+        event_name: 'PageView',
+        event_id: `page-${index}`,
+    }));
+    storagePressure.push({ event_name: 'Purchase', event_id: 'critical-purchase' });
+    const boundedStorage = sandbox.boundStoredEvents(storagePressure);
+    assert.equal(boundedStorage.length, 1000);
+    assert.equal(boundedStorage.some(item => item.event_id === 'critical-purchase'), true);
+    assert.equal(boundedStorage.some(item => item.event_id === 'page-0'), false);
+
     const event = {
         id: 'shopify-event-1',
         timestamp: '2026-06-24T00:00:00Z',
@@ -732,7 +1065,16 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
             checkout: {
                 token: 'checkout-token-1',
                 totalPrice: { amount: '46.00', currencyCode: 'USD' },
-                order: { id: 'gid://shopify/Order/987' },
+                order: {
+                    id: 'gid://shopify/Order/987',
+                    customer: { isFirstOrder: true },
+                },
+                billingAddress: {
+                    city: 'São Paulo',
+                    provinceCode: 'SP',
+                    zip: '94035-1234',
+                    countryCode: 'US',
+                },
                 lineItems: [
                     {
                         merchandise: {
@@ -745,8 +1087,8 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
             },
             customer: {
                 email: 'Buyer@Example.com',
-                phone: '+1 (212) 555-1212',
-                firstName: 'Ada',
+                phone: '001 (212) 555-1212',
+                firstName: 'Valéry',
                 lastName: 'Lovelace',
             },
         },
@@ -777,25 +1119,32 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v8');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v10');
     assert.equal(generated.includes('getOrCreateTtp'), false);
     assert.equal(generated.includes('getOrCreateFbp'), false);
     assert.equal(generated.includes("return getCookieValue('_fbp')"), true);
     assert.equal(generated.includes("Math.floor(Math.random() * 10000000000)"), false);
     assert.ok(String(sentEvents[0].trace_id).startsWith('trace_uuid-'));
     assert.equal(sentEvents[0].action_source, 'website');
+    assert.equal(sentEvents[0].customer_segmentation, 'new_customer_to_business');
     assert.equal(sentEvents[0].event_source_url, 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1');
     assert.equal(sentEvents[0].external_id, 'client-1');
     assert.equal(sentEvents[0].email, undefined);
     assert.equal(sentEvents[0].phone, undefined);
     assert.equal(sentEvents[0].email_hash, hashFor('Buyer@Example.com', 'email'));
-    assert.equal(sentEvents[0].phone_hash, hashFor('+1 (212) 555-1212', 'phone'));
+    assert.equal(sentEvents[0].phone_hash, hashFor('001 (212) 555-1212', 'phone'));
+    assert.equal(sentEvents[0].first_name_hash, hashFor('Valéry', 'name'));
+    assert.notEqual(sentEvents[0].first_name_hash, hashFor('Valery', 'name'));
+    assert.equal(sentEvents[0].city_hash, hashFor('São Paulo', 'city'));
+    assert.equal(sentEvents[0].state_hash, hashFor('SP', 'state', { country: 'US' }));
+    assert.equal(sentEvents[0].zip_hash, hashFor('94035-1234', 'zip', { country: 'US' }));
+    assert.equal(sentEvents[0].country_hash, hashFor('US', 'country'));
     assert.deepEqual(ids, {
-        CheckoutContactInfoSubmitted: 'checkout-token-1:CheckoutContactInfoSubmitted',
-        CheckoutAddressInfoSubmitted: 'checkout-token-1:CheckoutAddressInfoSubmitted',
-        CheckoutShippingInfoSubmitted: 'checkout-token-1:CheckoutShippingInfoSubmitted',
-        AddPaymentInfo: 'checkout-token-1:AddPaymentInfo',
-        Purchase: 'checkout-token-1',
+        CheckoutContactInfoSubmitted: 'demo.myshopify.com:checkout-token-1:CheckoutContactInfoSubmitted',
+        CheckoutAddressInfoSubmitted: 'demo.myshopify.com:checkout-token-1:CheckoutAddressInfoSubmitted',
+        CheckoutShippingInfoSubmitted: 'demo.myshopify.com:checkout-token-1:CheckoutShippingInfoSubmitted',
+        AddPaymentInfo: 'demo.myshopify.com:checkout-token-1:AddPaymentInfo',
+        Purchase: 'demo.myshopify.com:checkout-token-1',
     });
 
     requests.length = 0;
@@ -921,7 +1270,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     await sandbox.flushEventQueue();
     const addToCart = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
     assert.equal(addToCart.event_name, 'AddToCart');
-    assert.equal(addToCart.event_id, 'add-cart-1');
+    assert.equal(addToCart.event_id, 'demo.myshopify.com:add-cart-1');
     assert.equal(addToCart.value, 30);
     assert.equal(addToCart.contents[0].item_price, 15);
     assert.equal(addToCart.content_name, 'Shirt');
@@ -971,7 +1320,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     const inFlightFlush = sandbox.flushEventQueue();
     await new Promise(resolve => setImmediate(resolve));
     const storedInFlight = JSON.parse(localStorage.get('capi_gateway_event_queue_v3:demo.myshopify.com'));
-    assert.equal(storedInFlight.some(item => item.event_id === 'in-flight-page-view'), true);
+    assert.equal(storedInFlight.some(item => item.event_id === 'demo.myshopify.com:in-flight-page-view'), true);
     releaseInFlightRequest({ ok: true });
     await inFlightFlush;
     assert.equal(localStorage.has('capi_gateway_event_queue_v3:demo.myshopify.com'), false);
@@ -988,6 +1337,7 @@ test('admin page script parses and handles admin action failures', async () => {
     assert.match(serverSource, /app\.get\('\/admin\/assets\/admin\.css'/);
     assert.match(html, /<script src="\/admin\/assets\/vue\.global\.prod\.js"><\/script>/);
     assert.doesNotMatch(html, /https:\/\/(?:unpkg\.com|cdn\.tailwindcss\.com)/);
+    assert.match(html, /只有两边的事件名称和 eventID 完全一致时 Meta 才能浏览器\/服务端去重/);
     const localVue = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'vue.global.prod.js'), 'utf8');
     assert.match(localVue, /vue v3\.5\.40/);
     assert.match(serverSource, /app\.get\('\/admin\/assets\/vue\.global\.prod\.js'/);

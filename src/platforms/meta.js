@@ -1,8 +1,124 @@
+const net = require('node:net');
+
+const HASHED_USER_FIELDS = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'];
+const META_COOKIE_PATTERN = /^fb\.\d+\.\d{13}\.[^\s]+$/;
+const ACTION_SOURCES = new Set([
+    'email', 'website', 'app', 'phone_call', 'chat', 'physical_store',
+    'system_generated', 'business_messaging', 'other',
+]);
+const CUSTOMER_SEGMENTS = new Set([
+    'new_customer_to_business',
+    'new_customer_to_business_line',
+    'new_customer_to_product_area',
+    'new_customer_to_medium',
+    'existing_customer_to_business',
+    'existing_customer_to_business_line',
+    'existing_customer_to_product_area',
+    'existing_customer_to_medium',
+    'customer_in_loyalty_program',
+]);
+
+function normalizeMetaCookie(value) {
+    const normalized = String(value || '').trim();
+    return META_COOKIE_PATTERN.test(normalized) ? normalized : undefined;
+}
+
+function validHashArray(value) {
+    const values = Array.isArray(value) ? value : [value];
+    return values.length > 0 && values.every(item => /^[a-f0-9]{64}$/.test(String(item || '')));
+}
+
+function sanitizeMetaUserData(userData = {}) {
+    const output = {};
+    for (const field of HASHED_USER_FIELDS) {
+        const values = (Array.isArray(userData[field]) ? userData[field] : [userData[field]])
+            .map(value => String(value || '').trim().toLowerCase())
+            .filter(value => /^[a-f0-9]{64}$/.test(value));
+        const unique = [...new Set(values)];
+        if (unique.length) output[field] = unique;
+    }
+
+    const ipAddress = String(userData.client_ip_address || '').trim();
+    const userAgent = String(userData.client_user_agent || '').trim();
+    const fbc = normalizeMetaCookie(userData.fbc);
+    const fbp = normalizeMetaCookie(userData.fbp);
+    if (net.isIP(ipAddress)) output.client_ip_address = ipAddress;
+    if (userAgent) output.client_user_agent = userAgent;
+    if (fbc) output.fbc = fbc;
+    if (fbp) output.fbp = fbp;
+    return output;
+}
+
+function sanitizeMetaCustomData(customData = {}, eventName) {
+    const output = { ...customData };
+    const contents = Array.isArray(output.contents) ? output.contents : [];
+    const contentIdsFromContents = contents
+        .map(item => String(item?.id || item?.content_id || '').trim())
+        .filter(Boolean);
+    const suppliedContentIds = (Array.isArray(output.content_ids) ? output.content_ids : [])
+        .map(value => String(value || '').trim())
+        .filter(Boolean);
+    const contentIds = [...new Set(
+        contentIdsFromContents.length ? contentIdsFromContents : suppliedContentIds
+    )];
+
+    // When item-level contents are available they are authoritative. Keeping
+    // an older, unrelated content_ids array would attribute the same event to
+    // products that are no longer in the confirmed checkout.
+    if (contentIds.length) output.content_ids = contentIds;
+    else delete output.content_ids;
+    if (!contents.length) delete output.contents;
+
+    if (eventName !== 'InitiateCheckout') delete output.num_items;
+    if (eventName !== 'Search') delete output.search_string;
+    return output;
+}
+
+function prepareMetaEvent(event = {}) {
+    return {
+        ...event,
+        user_data: sanitizeMetaUserData(event.user_data),
+        custom_data: sanitizeMetaCustomData(event.custom_data, event.event_name),
+    };
+}
+
 function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
     const errors = [];
     if (!event || typeof event !== 'object') return ['event must be an object'];
     if (!String(event.event_name || '').trim()) errors.push('event_name is required');
     if (!String(event.event_id || '').trim()) errors.push('event_id is required');
+    if (!ACTION_SOURCES.has(event.action_source)) errors.push('action_source is required and must be valid');
+    if (event.customer_segmentation !== undefined
+        && !CUSTOMER_SEGMENTS.has(event.customer_segmentation)) {
+        errors.push('customer_segmentation must be a supported Meta segment');
+    }
+    if (event.opt_out !== undefined && typeof event.opt_out !== 'boolean') {
+        errors.push('opt_out must be boolean');
+    }
+
+    const userData = event.user_data;
+    if (!userData || typeof userData !== 'object' || Array.isArray(userData)) {
+        errors.push('user_data is required');
+    } else {
+        const hasMatchSignal = HASHED_USER_FIELDS.some(field => validHashArray(userData[field]))
+            || net.isIP(String(userData.client_ip_address || '').trim()) > 0
+            || Boolean(normalizeMetaCookie(userData.fbc))
+            || Boolean(normalizeMetaCookie(userData.fbp));
+        if (!hasMatchSignal) errors.push('user_data requires at least one valid matching signal');
+        for (const field of HASHED_USER_FIELDS) {
+            if (userData[field] !== undefined && !validHashArray(userData[field])) {
+                errors.push(`user_data.${field} must contain SHA-256 hashes`);
+            }
+        }
+        if (userData.client_ip_address && !net.isIP(String(userData.client_ip_address).trim())) {
+            errors.push('client_ip_address must be a valid IPv4 or IPv6 address');
+        }
+        for (const field of ['fbc', 'fbp']) {
+            if (userData[field] && !normalizeMetaCookie(userData[field])) {
+                errors.push(`${field} has an invalid Meta cookie format`);
+            }
+        }
+    }
 
     const eventTime = Number(event.event_time);
     if (!Number.isInteger(eventTime) || eventTime <= 0) {
@@ -21,6 +137,15 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
         }
         if (!String(event.user_data?.client_user_agent || '').trim()) {
             errors.push('website events require client_user_agent');
+        }
+    }
+
+    if (event.referrer_url) {
+        try {
+            const referrerUrl = new URL(String(event.referrer_url));
+            if (!['http:', 'https:'].includes(referrerUrl.protocol)) throw new Error('invalid protocol');
+        } catch (error) {
+            errors.push('referrer_url must be a valid HTTP(S) URL');
         }
     }
 
@@ -48,6 +173,10 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
                 errors.push(`${event.event_name} content item_price must be non-negative`);
             }
         }
+        if (event.custom_data?.content_type
+            && !['product', 'product_group'].includes(event.custom_data.content_type)) {
+            errors.push(`${event.event_name} content_type must be product or product_group`);
+        }
     }
 
     if (event.event_name === 'Purchase') {
@@ -63,5 +192,9 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
 }
 
 module.exports = {
+    normalizeMetaCookie,
+    prepareMetaEvent,
+    sanitizeMetaCustomData,
+    sanitizeMetaUserData,
     validateMetaEvent,
 };

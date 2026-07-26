@@ -51,23 +51,118 @@ function timingSafeStringCompare(expected, supplied) {
     return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-function normalizeForHash(data, type = 'default') {
+function normalizeForHash(data, type = 'default', context = {}) {
     if (data === undefined || data === null) return undefined;
     let normalized = String(data).trim().toLowerCase();
-    if (type === 'phone') {
-        normalized = normalized.replace(/[^\d]/g, '');
-    } else if (type === 'name' || type === 'city' || type === 'state' || type === 'zip' || type === 'country') {
-        normalized = normalized.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, '');
-    } else {
+    switch (type) {
+    case 'email':
+        // Meta requires lowercase plus trimming, not removal of characters
+        // inside the address. Reject whitespace instead of hashing a value
+        // that cannot match the customer's actual email.
+        if (/\s/.test(normalized)) return undefined;
+        break;
+    case 'phone':
+        {
+            const rawPhone = String(data).trim();
+            const hasInternationalPrefix = /^\+|^00/.test(rawPhone);
+            normalized = rawPhone.replace(/[^\d]/g, '').replace(/^0+/, '');
+            const phoneCountry = String(context.country || '').trim().toLowerCase();
+            if (!hasInternationalPrefix) {
+                if (['us', 'usa', 'unitedstates', 'unitedstatesofamerica', 'ca', 'canada'].includes(phoneCountry)) {
+                    if (/^\d{10}$/.test(normalized)) normalized = `1${normalized}`;
+                    else if (!/^1\d{10}$/.test(normalized)) normalized = '';
+                } else {
+                    // Without an international prefix there is no reliable way
+                    // to infer the calling code for every market. Omitting the
+                    // value is more accurate than hashing an unmatchable local number.
+                    normalized = '';
+                }
+            }
+        }
+        break;
+    case 'name':
+        // Preserve UTF-8 letters such as é and CJK characters. Meta's own
+        // normalization example hashes "valéry", not "valery".
+        normalized = normalized.replace(/[^\p{L}\p{N}]/gu, '');
+        break;
+    case 'city':
+    case 'state':
+        normalized = normalized
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^\p{L}\p{N}]/gu, '');
+        if (type === 'state') {
+            const stateCountry = String(context.country || '').trim().toLowerCase();
+            if (['us', 'usa', 'unitedstates', 'unitedstatesofamerica'].includes(stateCountry)
+                && !/^[a-z]{2}$/.test(normalized)) {
+                normalized = '';
+            }
+        }
+        break;
+    case 'zip': {
+        normalized = normalized.replace(/[^a-z0-9]/g, '');
+        const country = String(context.country || '').trim().toLowerCase();
+        if (['us', 'usa', 'unitedstates', 'unitedstatesofamerica'].includes(country)) {
+            const usZip = normalized.match(/^\d{5}/)?.[0];
+            normalized = usZip || '';
+        }
+        break;
+    }
+    case 'country':
+        // Meta requires ISO 3166-1 alpha-2. Hashing a display name such as
+        // "United States" produces a valid SHA-256 value that can never match.
+        normalized = /^[a-z]{2}$/.test(normalized) ? normalized : '';
+        break;
+    default:
         normalized = normalized.replace(/\s+/g, '');
     }
     return normalized || undefined;
 }
 
-function hashUserData(data, type = 'default') {
-    const normalized = normalizeForHash(data, type);
+function hashUserData(data, type = 'default', context = {}) {
+    const normalized = normalizeForHash(data, type, context);
     if (!normalized) return undefined;
     return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+function isSha256Hash(value) {
+    return /^[a-f0-9]{64}$/.test(String(value || '').trim().toLowerCase());
+}
+
+function boundedScalarValues(value, maximum = 50) {
+    const output = [];
+    const stack = Array.isArray(value) ? [...value].reverse() : [value];
+    while (stack.length && output.length < maximum) {
+        const current = stack.pop();
+        if (Array.isArray(current)) {
+            for (let index = current.length - 1; index >= 0; index -= 1) stack.push(current[index]);
+        } else if (['string', 'number', 'bigint'].includes(typeof current)) {
+            output.push(current);
+        }
+    }
+    return output;
+}
+
+function collectHashedUserData(explicitHashes = [], rawValues = [], type = 'default', context = {}) {
+    const output = [];
+    const seen = new Set();
+    const append = value => {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (normalized && !seen.has(normalized)) {
+            seen.add(normalized);
+            output.push(normalized);
+        }
+    };
+
+    for (const value of boundedScalarValues(explicitHashes)) {
+        if (isSha256Hash(value)) append(value);
+    }
+    for (const value of boundedScalarValues(rawValues)) {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (isSha256Hash(normalized)) append(normalized);
+        else append(hashUserData(value, type, context));
+    }
+    return output.length ? output : undefined;
 }
 
 module.exports = {
@@ -77,5 +172,8 @@ module.exports = {
     timingSafeCompare,
     timingSafeStringCompare,
     hashUserData,
+    collectHashedUserData,
+    boundedScalarValues,
+    isSha256Hash,
     normalizeForHash,
 };
