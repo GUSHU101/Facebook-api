@@ -1,265 +1,219 @@
-# Ubuntu + 宝塔面板部署指南
+# Ubuntu + 宝塔面板生产部署指南
 
-目标：在私有 VPS 上运行 API、Worker、PostgreSQL、Redis，并通过宝塔 Nginx 反向代理 HTTPS 域名。
+本文用于在 Ubuntu VPS 上通过宝塔/aaPanel 部署本项目。生产架构为：
 
-本部署方案避免使用公网 `443` 端口。示例使用公网 `8443` 提供 HTTPS，Node.js 只在服务器内部使用 `3000`。
-
-宝塔面板不是必需依赖；如果你想使用纯 Ubuntu 一键部署，请看 `DEPLOY_UBUNTU_ONECLICK.md`。
-
-## 1. 宝塔软件
-
-建议安装：
-
-- Nginx
-- PostgreSQL
-- Redis
-- Node.js 20 或 22
-- PM2 管理器
-
-## 2. 上传项目
-
-推荐目录：
-
-```bash
-/www/wwwroot/capi-saas
+```text
+Shopify / 管理员
+        │ HTTPS :8443
+        ▼
+宝塔 Nginx
+        │ http://127.0.0.1:3000
+        ▼
+PM2: capi-api + capi-worker
+        ├── PostgreSQL：事件、路由、去重和投递账本
+        └── Redis/BullMQ：异步调度、租约和限流状态
 ```
 
-进入目录后安装依赖：
+示例使用公网 HTTPS `8443`，不占用 `443`。如果你使用标准 `443`，需同步修改 Nginx、云安全组和所有 Shopify URL。
+
+## 1. 部署前检查
+
+- Ubuntu 20.04、22.04 或 24.04，建议至少 2 核 CPU、4 GB 内存。
+- 域名 A/AAAA 记录已经指向服务器。
+- 云安全组放行 `80/tcp` 和 `8443/tcp`；不要公开 PostgreSQL `5432`、Redis `6379` 和 Node `3000`。
+- 宝塔安装 Nginx、PostgreSQL、Redis、Node.js 20/22/24 和 PM2。
+- Redis `maxmemory-policy` 必须为 `noeviction`。
+- 服务器时间和时区同步正常；事件时间统一由应用按 UTC 处理。
+
+检查版本：
 
 ```bash
-npm install --omit=dev
+node --version
+npm --version
+pm2 --version
+psql --version
+redis-cli ping
+redis-cli CONFIG GET maxmemory-policy
+```
+
+如果 Redis 策略不是 `noeviction`：
+
+```bash
+redis-cli CONFIG SET maxmemory-policy noeviction
+redis-cli CONFIG REWRITE
+```
+
+## 2. 下载项目
+
+推荐目录为 `/www/wwwroot/capi-saas`：
+
+```bash
+cd /www/wwwroot
+git clone https://github.com/GUSHU101/Facebook-api.git capi-saas
+cd /www/wwwroot/capi-saas
+git branch --show-current
+```
+
+只提交编译后的后台 CSS/Vue 资源，不需要在生产服务器安装开发依赖：
+
+```bash
+npm ci --omit=dev
 npm run check
 ```
 
-## 3. 配置环境变量
+## 3. 创建 PostgreSQL 数据库
 
-复制示例：
+新安装可进入 PostgreSQL：
 
 ```bash
+sudo -u postgres psql
+```
+
+执行以下 SQL，并替换强密码：
+
+```sql
+CREATE USER capi_user WITH PASSWORD 'replace_with_a_strong_database_password';
+CREATE DATABASE capi_saas OWNER capi_user;
+GRANT ALL PRIVILEGES ON DATABASE capi_saas TO capi_user;
+\q
+```
+
+如果数据库或用户已经存在，不要重复创建，也不要随意更换数据库密码。旧版本升级时保留原数据库和 `.env`。
+
+## 4. 配置 `.env`
+
+```bash
+cd /www/wwwroot/capi-saas
 cp .env.example .env
+chmod 600 .env
+nano .env
 ```
 
-编辑 `.env`，至少修改：
-
-- `DATABASE_URL`
-- `REDIS_URL`
-- `AES_SECRET_KEY`
-- `ADMIN_USERNAME`
-- `ADMIN_PASSWORD`
-
-`AES_SECRET_KEY` 一旦上线后不要更换，否则已保存的 Meta access token 无法解密。
-
-## 4. 初始化 PostgreSQL
-
-在宝塔 PostgreSQL 中创建数据库和用户，然后执行：
-
-```bash
-npm run migrate
-```
-
-`npm run migrate` 会执行统一数据库文件 `init.sql`。它既能初始化新数据库，也能升级旧数据库，不会清空已有店铺、Pixel 或事件数据。
-
-如果宝塔终端不能运行 npm，也可以在 PostgreSQL 管理工具里导入 `init.sql`。
-
-启动前运行自检：
-
-```bash
-npm run doctor
-```
-
-自检会确认环境变量、PostgreSQL 表字段、Redis 连接和队列配置是否可用。
-
-## 5. 使用 PM2 启动
-
-```bash
-pm2 start ecosystem.config.js
-pm2 save
-pm2 status
-```
-
-项目会启动两个进程：
-
-- `capi-api`：Express API、后台面板、定时出箱任务
-- `capi-worker`：BullMQ Worker，负责发送 Meta CAPI
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:3000/healthz
-curl http://127.0.0.1:3000/readyz
-```
-
-`/healthz` 只确认进程存活，`/readyz` 会检查 PostgreSQL 和 Redis。
-
-## 6. 宝塔 Nginx 非 443 HTTPS 反向代理
-
-创建站点，例如：
-
-```text
-capi.example.com
-```
-
-不要让站点占用公网 `443`。建议在宝塔站点配置里删除或停用默认 `listen 443 ssl`，改用 `8443 ssl`。反向代理转发到：
-
-```text
-http://127.0.0.1:3000
-```
-
-推荐 Nginx 片段：
-
-```nginx
-listen 8443 ssl http2;
-server_name capi.example.com;
-
-ssl_certificate     /www/server/panel/vhost/cert/capi.example.com/fullchain.pem;
-ssl_certificate_key /www/server/panel/vhost/cert/capi.example.com/privkey.pem;
-
-location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
-```
-
-如果你想直接替换宝塔「网站 -> 配置文件」里的整份 Nginx 配置，可以使用下面这个完整模板。这个模板只监听 `80` 和 `8443`，不会使用 `443`：
-
-仓库里也提供了可直接复制的模板文件：`deploy/baota-nginx-non443.conf.template`。使用时把 `__DOMAIN__`、`__PROJECT_DIR__`、`__BT_SITE_NAME__`、`__PUBLIC_PORT__`、`__INTERNAL_PORT__` 替换成你自己的值。
-
-```nginx
-server
-{
-    listen 80;
-    server_name nestworks.com.au;
-
-    # 用于 HTTP-01 证书验证；如果你使用 Cloudflare / acme.sh DNS 验证，也可以保留不影响。
-    location /.well-known/acme-challenge/ {
-        root /www/wwwroot/capi-saas;
-        try_files $uri =404;
-    }
-
-    # HTTP 自动跳转到非 443 HTTPS 端口。
-    location / {
-        return 301 https://$host:8443$request_uri;
-    }
-
-    access_log  /www/wwwlogs/capi_saas_80.log;
-    error_log   /www/wwwlogs/capi_saas_80.error.log;
-}
-
-server
-{
-    listen 8443 ssl http2;
-    server_name nestworks.com.au;
-    index index.html index.htm default.htm default.html;
-
-    # 不要添加 listen 443 ssl; 也不要添加 listen 443 quic;
-    # 证书路径按宝塔实际站点证书目录调整。
-    ssl_certificate     /www/server/panel/vhost/cert/capi_saas/fullchain.pem;
-    ssl_certificate_key /www/server/panel/vhost/cert/capi_saas/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    client_max_body_size 10m;
-
-    # 禁止访问敏感文件。
-    location ~* (\.user.ini|\.htaccess|\.htpasswd|\.env.*|\.project|\.bashrc|\.bash_profile|\.bash_logout|\.DS_Store|\.gitignore|\.gitattributes|LICENSE|README\.md|CLAUDE\.md|CHANGELOG\.md|CONTRIBUTING\.md|TODO\.md|FAQ\.md|composer\.json|composer\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.swp|\.swo|\.bak|\.old|\.tmp|\.temp|\.log|\.sql(\.gz)?|docker-compose\.yml|Dockerfile)$
-    {
-        return 404;
-    }
-
-    # 禁止访问敏感目录。
-    location ~* /(\.git|\.svn|\.bzr|\.vscode|\.idea|\.ssh|\.github|\.npm|\.yarn|\.pnpm|\.cache|node_modules|runtime|backups)/ {
-        return 404;
-    }
-
-    # 证书验证目录。
-    location /.well-known/ {
-        root /www/wwwroot/capi-saas;
-    }
-
-    # API / Admin 统一反向代理到 Node.js 内部端口。
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host $http_host;
-        proxy_set_header X-Forwarded-Port 8443;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_connect_timeout 30s;
-        proxy_send_timeout 30s;
-        proxy_read_timeout 86400s;
-    }
-
-    access_log  /www/wwwlogs/capi_saas.log;
-    error_log   /www/wwwlogs/capi_saas.error.log;
-}
-```
-
-对应 `.env` 里的端口保持内部端口即可：
+必须修改：
 
 ```env
 PORT=3000
+DATABASE_URL=postgres://capi_user:replace_with_a_strong_database_password@127.0.0.1:5432/capi_saas
+REDIS_URL=redis://127.0.0.1:6379
+
+AES_SECRET_KEY=replace_with_at_least_32_random_characters
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=replace_with_a_strong_admin_password
+REQUIRE_INGEST_TOKEN=true
+
+# 只有这些 Shopify source_name 可生成网站 Purchase。
+SHOPIFY_WEB_ORDER_SOURCES=web
+
+# 建议填写实际店铺来源；多个来源用英文逗号分隔且不要带路径。
+CORS_ORIGIN=https://shop-a.example.com,https://shop-b.example.com
 TRUST_PROXY_HOPS=1
 ```
 
-外部访问、Shopify Custom Pixel API 地址、Shopify webhook 地址都使用：
+重要规则：
+
+- `AES_SECRET_KEY` 上线后必须永久保存。更换它会导致已保存的平台 Token 无法解密。
+- `SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值。只有确认某个 Headless/自定义销售渠道属于网站流量时，才加入对应 `source_name`。
+- 不建议把 `CORS_ORIGIN` 长期设为 `*`。
+- `PIXEL_RATE_LIMIT_PER_MINUTE=0` 表示不在应用层拒绝合法高峰流量；滥用防护应放在 CDN/WAF。
+- 不要把 `.env` 上传到 GitHub、网盘或工单。
+
+### 多实例容量
+
+PostgreSQL 最大连接数近似为：
 
 ```text
-https://nestworks.com.au:8443
+(API_INSTANCES + WORKER_INSTANCES) × DB_POOL_MAX
 ```
 
-生产环境必须使用 HTTPS，因为 Shopify Customer Events 的自定义像素需要安全上下文，后端也必须通过 HTTPS 接收事件。可以使用非标准 HTTPS 端口，例如：
+默认 `1 + 1` 个实例、每实例连接池 `20`，理论上最多约 40 条应用连接。扩容前必须给 PostgreSQL 管理连接、迁移和监控预留余量。
 
-```text
-https://capi.example.com:8443
+## 5. 迁移和自检
+
+```bash
+cd /www/wwwroot/capi-saas
+npm run migrate
+npm run doctor
 ```
 
-服务器安全组和防火墙需要放行 `8443`，不需要放行 `443`。
+`migrate` 可重复运行：它不会清空店铺、像素、事件或投递历史；大型索引使用在线创建方式。`doctor` 会检查数据库结构、跨店路由一致性、事件汇总一致性、Redis 策略、连接权限和超时配置。
 
-证书建议使用 DNS 验证签发，避免面板为了 HTTP/HTTPS 文件验证临时依赖 `443`。如果宝塔当前证书工具只能使用端口验证，可以先在域名服务商或 acme.sh 使用 DNS API 签发证书，再把证书路径填入 Nginx。
+任何 `FAIL` 都应在启动前处理，不要跳过。
 
-## 7. 后台配置
+## 6. 使用 PM2 启动
 
-访问：
+```bash
+cd /www/wwwroot/capi-saas
+pm2 startOrReload ecosystem.config.js --update-env
+pm2 save
+pm2 status
+pm2 startup
+```
+
+`pm2 startup` 会输出一条需要以 root 执行的命令；执行后再次运行 `pm2 save`。
+
+进程职责：
+
+- `capi-api`：接收事件、验证 Shopify webhook、管理后台、出箱救援和定时维护。
+- `capi-worker`：按店铺与凭证租约投递 Meta CAPI/TikTok Events API。
+
+本机检查：
+
+```bash
+curl -fsS http://127.0.0.1:3000/healthz
+curl -fsS http://127.0.0.1:3000/readyz
+```
+
+`/readyz` 在 PostgreSQL 可写但 Redis 暂时异常时会返回 `status=degraded`；事件仍持久化到 PostgreSQL，Redis 恢复后自动继续派发。
+
+## 7. 配置宝塔 Nginx 和非 443 HTTPS
+
+仓库提供完整模板：[deploy/baota-nginx-non443.conf.template](deploy/baota-nginx-non443.conf.template)。复制到宝塔“网站 → 配置文件”，替换：
+
+- `__DOMAIN__`：例如 `capi.example.com`
+- `__PROJECT_DIR__`：`/www/wwwroot/capi-saas`
+- `__BT_SITE_NAME__`：宝塔站点标识/证书目录名
+- `__PUBLIC_PORT__`：`8443`
+- `__INTERNAL_PORT__`：`3000`
+
+必须确认：
+
+- 配置中没有 `listen 443 ssl` 或 `listen 443 quic`。
+- SSL 证书与私钥路径真实存在，建议用 DNS-01 方式签发。
+- `proxy_pass` 指向 `127.0.0.1:3000`，不要指向公网 IP。
+- `X-Forwarded-Proto` 为 `https`，`X-Forwarded-Port` 为 `8443`。
+- Nginx 已阻止访问 `.env`、`.git`、备份、日志、SQL 和 `node_modules`。
+
+保存前检查并平滑重载：
+
+```bash
+nginx -t
+systemctl reload nginx
+curl -I https://capi.example.com:8443/admin
+```
+
+如果使用 Cloudflare，需确保所选代理模式支持自定义 HTTPS 端口；否则先使用 DNS only 验证源站。
+
+## 8. 后台配置多店铺和多像素
+
+打开：
 
 ```text
 https://capi.example.com:8443/admin
 ```
 
-操作顺序：
+推荐顺序：
 
-1. 添加 Shopify 店铺，域名格式为 `your-store.myshopify.com`。
-2. 添加平台路由：
-   - Facebook / Meta：填写 Pixel / Dataset ID 和 System User Access Token。
-   - TikTok：填写 TikTok Pixel Code 和 Events API Access Token。
-3. 测试阶段填入对应平台的 Test Event Code。
-4. 打开“追踪代码”，选择或填入店铺域名；Meta / TikTok Pixel ID 在平台路由里配置，不写入 Shopify 自定义像素代码。
-5. 确认 API 地址显示为 `https://capi.example.com:8443`。
-6. 将生成代码粘贴到 Shopify 后台：Settings -> Customer events -> Add custom pixel。
+1. 添加 Shopify 店铺，域名使用 `store.myshopify.com`，保存 webhook secret 和独立采集 Token。
+2. 添加 Meta Dataset/Pixel 或 TikTok Pixel 凭证。
+3. 在路由选择中把一个凭证关联到多个店铺，或把一个店铺关联到多个凭证。
+4. 复制该店铺生成的 Shopify Custom Pixel 代码到 `Settings → Customer events`。
+5. 测试阶段设置平台 Test Event Code，验证后再清空。
 
-## 8. Meta 验证
+本地数据库始终按认证后的 `shop_id` 隔离事件、别名、重试和投递账本。多个店铺共用同一个外部 Pixel 时，平台侧数据会按你的配置聚合，但本系统不会把店铺事件路由串到未关联的像素。
 
-在 Meta Events Manager 中确认：
+## 9. 配置 Shopify 付款 webhook
 
-- Server 事件从已配置的平台路由正常出现。
-- 同一个 checkout / webhook 合并后的 `event_id` 保持一致。
-- `Purchase` 包含 `value`、`currency`、`content_ids`、`contents`、`order_id`。
-- `_fbp`、`_fbc`、IP、User-Agent、email、phone、name、address、external_id 能尽量进入事件匹配。
-- TikTok Events API 事件使用相同 `event_id`，`Purchase` 在 TikTok 中映射为 `CompletePayment`。
-
-## 9. Shopify Purchase Webhook 兜底
-
-Shopify Web Pixel 的 `checkout_completed` 依赖页面触发。为了降低漏单风险，建议再配置订单付款 webhook：
+每个店铺都必须配置：
 
 ```text
 Topic: orders/paid
@@ -267,73 +221,67 @@ URL: https://capi.example.com:8443/api/webhook/orders/paid
 Format: JSON
 ```
 
-后台添加店铺时填写的 `Shopify Webhook Secret` 必须与 Shopify 用于签名 webhook 的 app client secret 一致。服务端会校验 `X-Shopify-Hmac-Sha256`，并使用 `X-Shopify-Webhook-Id` 防止重复投递。
+后台填写的 Shopify Webhook Secret 必须与签名 webhook 的 App Client Secret 一致。服务端验证 `X-Shopify-Hmac-Sha256`，使用 `X-Shopify-Webhook-Id` 防重复。
 
-## 10. Shopify 权限提醒
+浏览器 `checkout_completed` 只创建 `AWAITING_PAYMENT` 候选；只有 HMAC 验证成功的 `orders/paid` 才能解锁 Purchase。这样不会把未付款、延迟付款或失败付款误判为成功购买。
 
-Shopify App Web Pixel 的客户 PII 字段会受受保护客户数据权限影响。邮箱、电话、姓名、地址可能为 `null`，这属于平台限制，不是服务故障。要提高 EMQ，需要为正式 App 申请对应的受保护客户数据权限。
+## 10. 上线验收
 
-## 11. 运维命令
+按店铺逐一完成：
+
+- `PageView`、`ViewContent`、`AddToCart`、`InitiateCheckout`、`AddPaymentInfo` 可见。
+- 支付前没有 Purchase；付款后只有一个相同 `event_id` 的 Purchase。
+- Purchase 包含正确 `value`、`currency`、`content_ids`、`contents` 和 `order_id`。
+- `_fbp`/`_ttp` 只在真实 Cookie 存在时发送，`_fbc` 只来自真实 `fbclid`。
+- 一个店铺绑定多个像素时，每条路由都有独立成功/失败状态。
+- 多店铺共用像素时，管理后台的事件和投递诊断仍按店铺隔离。
+- `/readyz`、PM2 状态、Worker 日志和后台“投递完整性”均正常。
+
+## 11. 安全升级、备份和回滚
+
+升级前：
 
 ```bash
-pm2 logs capi-api
-pm2 logs capi-worker
-pm2 restart capi-api
-pm2 restart capi-worker
-pm2 monit
-```
-
-更新代码后：
-
-```bash
-npm install --omit=dev
+cd /www/wwwroot/capi-saas
+npm run backup
+git status --short
+git pull --ff-only origin main
+npm ci --omit=dev
 npm run check
+npm test
 npm run migrate
 npm run doctor
-pm2 restart ecosystem.config.js
-```
-给数据库权限
-
-```sql
-ALTER SCHEMA public OWNER TO capi_saas;
-
-ALTER TABLE shops OWNER TO capi_saas;
-ALTER TABLE pixels OWNER TO capi_saas;
-ALTER TABLE event_store OWNER TO capi_saas;
-ALTER TABLE dead_letters OWNER TO capi_saas;
-ALTER TABLE meta_quality_snapshots OWNER TO capi_saas;
-
-ALTER SEQUENCE shops_id_seq OWNER TO capi_saas;
-ALTER SEQUENCE pixels_id_seq OWNER TO capi_saas;
-ALTER SEQUENCE event_store_id_seq OWNER TO capi_saas;
-ALTER SEQUENCE dead_letters_id_seq OWNER TO capi_saas;
-ALTER SEQUENCE meta_quality_snapshots_id_seq OWNER TO capi_saas;
-
-GRANT USAGE, CREATE ON SCHEMA public TO capi_saas;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO capi_saas;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO capi_saas;
-
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO capi_saas;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO capi_saas;
+pm2 startOrReload ecosystem.config.js --update-env
+pm2 save
 ```
 
-执行位置：
+不要覆盖已有 `.env`。备份目录默认为 `/www/wwwroot/capi-saas/backups`，其中的 `.env` 副本含解密密钥，权限必须保持 `600/700`，并应复制到受保护的异机存储。
+
+数据库回滚：
 
 ```bash
-查找目录 find /www/server -type f -name psql 2>/dev/null
-
-进入目录 sudo -u postgres 实际目录地址 -d capi_saas
+cd /www/wwwroot/capi-saas
+CONFIRM=RESTORE bash scripts/restore.sh backups/capi-db-YYYYMMDDTHHMMSSZ.dump
+npm run migrate
+npm run doctor
+pm2 startOrReload ecosystem.config.js --update-env
 ```
 
-粘贴 SQL 执行，结束后输入：
+## 12. 故障排查
 
-```sql
-\q
+```bash
+pm2 status
+pm2 logs capi-api --lines 200 --nostream
+pm2 logs capi-worker --lines 200 --nostream
+npm run doctor
+redis-cli INFO memory
+redis-cli INFO clients
+sudo -u postgres psql -d capi_saas -c 'select now();'
+tail -n 200 /www/wwwlogs/你的站点.error.log
 ```
 
-执行完后重启：
-
-```text
-capi-api
-capi-worker
-```
+- 后台打不开：先检查 Nginx `nginx -t`、安全组端口、证书和 `capi-api`。
+- 事件已接收但未发送：检查 `capi-worker`、Redis、平台凭证冷却和后台最旧到期事件。
+- Purchase 不出现：检查 `orders/paid` webhook 响应、HMAC secret、订单来源白名单及付款状态。
+- 部分像素失败：只修复对应路由凭证；成功路由不会被重发。
+- 数据增长：检查保留周期、autovacuum、数据库空间和 Worker 消费速率，不要直接删除 `PENDING` 数据。

@@ -1,275 +1,234 @@
-# Pure Ubuntu One-Command Deployment
+# Ubuntu 一键生产部署指南
 
-This path does not require Baota/aaPanel. It installs and manages the stack directly on Ubuntu with apt, Nginx, PostgreSQL, Redis, Node.js and PM2.
+本方案不依赖宝塔/aaPanel。安装脚本会在 Ubuntu 上配置 Node.js、PM2、PostgreSQL、Redis、Nginx、数据库迁移、运行自检以及可选的 DNS-01 SSL。
 
-## Requirements
+默认架构使用：
 
-- Ubuntu 20.04/22.04/24.04 VPS
-- Root SSH access
-- A GitHub repository containing this project
-- A domain pointing to the VPS if you want public HTTPS access
-- A non-443 public HTTPS port, for example `8443`
+- Node 内部端口：`3000`
+- 公网 HTTPS 端口：`8443`
+- 仓库：`https://github.com/GUSHU101/Facebook-api`
+- 分支：`main`
 
-## One-Command Install
+## 1. 前置条件
 
-After uploading this project to GitHub, run:
+- Ubuntu 20.04、22.04 或 24.04 VPS，拥有 root/sudo 权限。
+- 域名已经解析到服务器。
+- 云安全组允许 `8443/tcp`；启用 HTTP 跳转时还需 `80/tcp`。
+- 不要向公网开放 `3000`、`5432`、`6379`。
+- 自动签发证书需要 DNS 服务商 API 权限；脚本使用 acme.sh DNS-01，不依赖公网 `443`。
+
+## 2. 最小一键安装
+
+不自动签发证书时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/YOUR_REPO/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh \
+curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh \
   && sudo env \
-    REPO_URL=https://github.com/YOUR_GITHUB_USER/YOUR_REPO.git \
+    REPO_URL=https://github.com/GUSHU101/Facebook-api.git \
     DOMAIN=capi.example.com \
     PUBLIC_PORT=8443 \
-    AUTO_SSL=1 \
-    ACME_DNS_PROVIDER=dns_cf \
-    CF_Token=your_cloudflare_api_token \
-    CF_Zone_ID=your_cloudflare_zone_id \
+    AUTO_SSL=0 \
     bash /tmp/capi-install.sh
 ```
 
-Optional variables:
+脚本会生成数据库、后台和 AES 强随机密钥，并在最后显示首次登录信息。立即将这些信息存入密码管理器；尤其不能丢失 `.env` 中的 `AES_SECRET_KEY`。
 
-```bash
-APP_DIR=/www/wwwroot/capi-saas
-BRANCH=main
-INTERNAL_PORT=3000
-DB_NAME=capi_saas
-DB_USER=capi_user
-DB_PASSWORD=replace_with_strong_password
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=replace_with_strong_password
-AES_SECRET_KEY=replace_with_32_plus_character_secret
-CERT_FULLCHAIN=/etc/ssl/capi/fullchain.pem
-CERT_KEY=/etc/ssl/capi/privkey.pem
-AUTO_SSL=1
-ACME_DNS_PROVIDER=dns_cf
-ACME_EMAIL=admin@example.com
-REDIRECT_HTTP=1
-ENABLE_UFW=1
-AUTO_ENABLE_NGINX=1
-SKIP_APT=1
-```
-
-Use `SKIP_APT=1` only when Node.js, PM2, PostgreSQL, Redis and Nginx are already installed.
-
-If you provide `DB_PASSWORD`, use only letters, numbers, `.`, `_`, `~`, or `-`, because it is embedded in `DATABASE_URL`.
-
-## What The Script Does
-
-1. Detects Ubuntu and requires root.
-2. Installs missing system dependencies with apt.
-3. Installs or upgrades Node.js to 20 when needed.
-4. Installs PM2 when needed.
-5. Starts PostgreSQL, Redis and Nginx.
-6. Opens `PUBLIC_PORT` in UFW when UFW is active.
-7. Clones or updates the GitHub repository.
-8. Creates PostgreSQL database and user.
-9. Generates `.env` with strong secrets when not provided.
-10. Runs `npm install --omit=dev`.
-11. Runs `npm run check`, unified schema migration through `npm run migrate`, and `npm run doctor`.
-12. Starts API and worker with PM2.
-13. Optionally issues SSL certificates with acme.sh DNS-01.
-14. Writes a non-443 Nginx HTTPS config example, or enables it automatically when certificate paths are available.
-15. Optionally adds an HTTP port 80 redirect to `https://domain:PUBLIC_PORT`.
-
-The installer is designed to be re-runnable. If the repository already exists, it pulls the selected branch. PM2 uses `startOrReload`, so repeated deploys update existing `capi-api` and `capi-worker` processes instead of creating duplicate processes.
-
-## HTTPS Without 443
-
-The script intentionally does not bind public `443`.
-
-If `AUTO_SSL=1`, the script uses acme.sh DNS-01 validation to issue a certificate. DNS-01 is required for fully automatic SSL when avoiding public `443`.
-
-Cloudflare example:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/YOUR_REPO/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh \
-  && sudo env \
-    REPO_URL=https://github.com/YOUR_GITHUB_USER/YOUR_REPO.git \
-    DOMAIN=capi.example.com \
-    PUBLIC_PORT=8443 \
-    AUTO_SSL=1 \
-    ACME_DNS_PROVIDER=dns_cf \
-    CF_Token=your_cloudflare_api_token \
-    CF_Zone_ID=your_cloudflare_zone_id \
-    bash /tmp/capi-install.sh
-```
-
-Aliyun DNS example:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/YOUR_REPO/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh \
-  && sudo env \
-    REPO_URL=https://github.com/YOUR_GITHUB_USER/YOUR_REPO.git \
-    DOMAIN=capi.example.com \
-    PUBLIC_PORT=8443 \
-    AUTO_SSL=1 \
-    ACME_DNS_PROVIDER=dns_ali \
-    Ali_Key=your_aliyun_access_key \
-    Ali_Secret=your_aliyun_access_secret \
-    bash /tmp/capi-install.sh
-```
-
-If `CERT_FULLCHAIN` and `CERT_KEY` are provided and `AUTO_ENABLE_NGINX=1`, the script writes and reloads an active Nginx config automatically.
-
-Without certificate paths, it writes an example file:
+没有有效证书时，脚本只生成：
 
 ```text
 /etc/nginx/conf.d/capi-saas-8443.conf.example
 ```
 
-Copy it to an active Nginx config after adding real certificate paths:
+补齐证书路径并复制为活动配置后执行：
 
 ```bash
 cp /etc/nginx/conf.d/capi-saas-8443.conf.example /etc/nginx/conf.d/capi-saas.conf
-nano /etc/nginx/conf.d/capi-saas.conf
 nginx -t
 systemctl reload nginx
 ```
 
-Manual Nginx config template, using `8443` for public HTTPS and never binding `443`:
+## 3. Cloudflare DNS 自动 SSL
 
-```nginx
-# /etc/nginx/conf.d/capi-saas.conf
-# Replace nestworks.com.au and certificate paths if your domain/project name differs.
-
-server {
-    listen 80;
-    server_name nestworks.com.au;
-
-    # Optional: keep HTTP available only for redirects or certificate checks.
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-        try_files $uri =404;
-    }
-
-    location / {
-        return 301 https://$host:8443$request_uri;
-    }
-}
-
-server {
-    listen 8443 ssl http2;
-    server_name nestworks.com.au;
-
-    ssl_certificate     /etc/ssl/capi/fullchain.pem;
-    ssl_certificate_key /etc/ssl/capi/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    client_max_body_size 10m;
-
-    location ~* /(\.git|\.svn|\.hg|node_modules|runtime|backups|\.env|\.npm|\.cache)/ {
-        return 404;
-    }
-
-    location ~* (\.env.*|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|docker-compose\.yml|Dockerfile|README\.md|LICENSE|\.sql(\.gz)?|\.log|\.bak|\.old|\.tmp)$ {
-        return 404;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host $http_host;
-        proxy_set_header X-Forwarded-Port 8443;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_connect_timeout 30s;
-        proxy_send_timeout 30s;
-        proxy_read_timeout 86400s;
-    }
-
-    access_log /var/log/nginx/capi-saas.access.log;
-    error_log  /var/log/nginx/capi-saas.error.log;
-}
+```bash
+curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh \
+  && sudo env \
+    REPO_URL=https://github.com/GUSHU101/Facebook-api.git \
+    DOMAIN=capi.example.com \
+    PUBLIC_PORT=8443 \
+    AUTO_SSL=1 \
+    AUTO_ENABLE_NGINX=1 \
+    ACME_DNS_PROVIDER=dns_cf \
+    CF_Token=replace_with_scoped_cloudflare_token \
+    CF_Zone_ID=replace_with_cloudflare_zone_id \
+    ACME_EMAIL=admin@example.com \
+    bash /tmp/capi-install.sh
 ```
 
-Matching `.env` port values:
+Cloudflare Token 应只拥有目标 Zone 所需的 DNS 编辑权限。不要把 Token 写入 shell 历史、截图或仓库；更安全的做法是先在 root shell 临时导出变量，执行后立即清除。
 
-```env
-PORT=3000
-TRUST_PROXY_HOPS=1
+阿里云 DNS 使用 `ACME_DNS_PROVIDER=dns_ali`，并提供 acme.sh 所需的 `Ali_Key` 和 `Ali_Secret`。
+
+## 4. 常用安装参数
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `APP_DIR` | `/www/wwwroot/capi-saas` | 必须是安全的绝对目录 |
+| `REPO_URL` | 无 | 必填 Git 仓库地址 |
+| `BRANCH` | `main` | 部署分支 |
+| `INTERNAL_PORT` | `3000` | Node 内部端口 |
+| `PUBLIC_PORT` | `8443` | Nginx 公网 HTTPS 端口 |
+| `DOMAIN` | 无 | HTTPS 域名 |
+| `DB_NAME` / `DB_USER` | `capi_saas` / `capi_user` | PostgreSQL 标识符 |
+| `DB_PASSWORD` | 自动生成 | 只允许字母、数字、`.`、`_`、`~`、`-` |
+| `ADMIN_USERNAME` | `admin` | 后台账号 |
+| `ADMIN_PASSWORD` | 自动生成 | 后台强密码；自定义值不能含空白、`#` 或引号 |
+| `AES_SECRET_KEY` | 自动生成 | 至少 32 字符且不能含空白、`#` 或引号，永久保留 |
+| `CORS_ORIGIN` | `*` | 建议改成逗号分隔的店铺 HTTPS Origin |
+| `SHOPIFY_WEB_ORDER_SOURCES` | `web` | 可生成网站 Purchase 的 Shopify 来源白名单 |
+| `DB_POOL_MAX` | `20` | 每个 API/Worker 进程的连接池上限 |
+| `API_INSTANCES` | `1` | API 进程数 |
+| `WORKER_INSTANCES` | `1` | Worker 进程数 |
+| `AUTO_SSL` | `0` | 是否用 DNS-01 自动签发证书 |
+| `AUTO_ENABLE_NGINX` | `1` | 证书存在时自动启用 Nginx 配置 |
+| `REDIRECT_HTTP` | `1` | 80 跳转到自定义 HTTPS 端口 |
+| `ENABLE_UFW` | `1` | UFW 已启用时自动放行端口 |
+| `SKIP_APT` | `0` | 已预装全部依赖时才可设为 `1` |
+| `FORCE_ENV_REWRITE` | `0` | 危险选项，默认保护现有 `.env` |
+
+生产示例：
+
+```bash
+sudo env \
+  REPO_URL=https://github.com/GUSHU101/Facebook-api.git \
+  DOMAIN=capi.example.com \
+  PUBLIC_PORT=8443 \
+  CORS_ORIGIN=https://shop-a.example.com,https://shop-b.example.com \
+  SHOPIFY_WEB_ORDER_SOURCES=web \
+  DB_POOL_MAX=20 \
+  API_INSTANCES=2 \
+  WORKER_INSTANCES=2 \
+  AUTO_SSL=1 \
+  ACME_DNS_PROVIDER=dns_cf \
+  CF_Token=replace_me \
+  CF_Zone_ID=replace_me \
+  bash /tmp/capi-install.sh
 ```
 
-`PORT=3000` is only the internal Node.js port. Shopify, Meta, TikTok and the admin panel should use:
+连接预算近似为 `(API_INSTANCES + WORKER_INSTANCES) × DB_POOL_MAX`。扩容前给 PostgreSQL 管理、迁移和监控连接预留空间。
 
-```text
-https://nestworks.com.au:8443
+## 5. 脚本执行内容
+
+安装器会按顺序：
+
+1. 验证 root、Ubuntu、端口、目录、域名和容量参数。
+2. 安装缺失的 Node.js 20+、PM2、PostgreSQL、Redis、Nginx 等组件。
+3. 启动系统服务并把 Redis 设置为 `maxmemory-policy=noeviction`。
+4. 克隆仓库；升级现有安装时先备份数据库和 `.env`，再执行 `git pull --ff-only`。
+5. 首次安装时创建数据库用户和数据库，并生成权限为 `600` 的 `.env`。
+6. 运行 `npm ci --omit=dev`、语法检查、数据库迁移和 `npm run doctor`。
+7. 使用 PM2 `startOrReload` 启动 API/Worker。
+8. 轮询 `/healthz` 和 `/readyz`，未就绪时输出日志并中止。
+9. 可选签发 DNS-01 SSL、生成安全的非 443 Nginx 配置并重载。
+
+## 6. 重复执行和升级安全
+
+安装器可以重复运行。只要 `${APP_DIR}/.env` 已存在且 `FORCE_ENV_REWRITE` 不是 `1`，脚本会：
+
+- 保留数据库密码、管理员密码和 AES 密钥。
+- 升级前自动执行数据库与 `.env` 备份。
+- 只更新代码、依赖、数据库结构和 PM2 进程。
+
+推荐升级方式是重新下载最新脚本并使用与首次部署相同的参数：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh
+sudo env \
+  REPO_URL=https://github.com/GUSHU101/Facebook-api.git \
+  DOMAIN=capi.example.com \
+  PUBLIC_PORT=8443 \
+  AUTO_SSL=1 \
+  ACME_DNS_PROVIDER=dns_cf \
+  CF_Token=replace_me \
+  CF_Zone_ID=replace_me \
+  bash /tmp/capi-install.sh
 ```
 
-Use DNS validation for SSL certificates so certificate issuance does not require port `443`.
+不要在普通升级中使用 `FORCE_ENV_REWRITE=1`。如果确实要重建 `.env`，必须同时显式提供原有或计划使用的 `DB_PASSWORD`、`ADMIN_PASSWORD`、`AES_SECRET_KEY`；错误的 AES 密钥会让历史平台 Token 永久无法解密。
 
-When `REDIRECT_HTTP=1`, Nginx also redirects:
+## 7. 安装后配置
 
-```text
-http://capi.example.com/* -> https://capi.example.com:8443/*
-```
-
-## After Install
-
-Open:
+打开：
 
 ```text
 https://capi.example.com:8443/admin
 ```
 
-Then:
+然后：
 
-1. Add Shopify shop.
-2. Add Facebook / Meta route.
-3. Add TikTok route if needed.
-4. Copy generated Shopify Custom Pixel code. Pixel IDs and access tokens are configured in Pixel routes; the Shopify code only sends Customer Events to the hub.
-5. Configure Shopify `orders/paid` webhook:
+1. 添加 Shopify 店铺及其 webhook secret。
+2. 为店铺添加一个或多个 Meta/TikTok 像素路由。
+3. 同一个平台凭证可关联多个店铺；一个店铺也可关联多个凭证。
+4. 复制生成的 Shopify Custom Pixel 代码。
+5. 为每个店铺配置必需的付款 webhook：
 
 ```text
-https://capi.example.com:8443/api/webhook/orders/paid
+Topic: orders/paid
+URL: https://capi.example.com:8443/api/webhook/orders/paid
+Format: JSON
 ```
 
-For `Purchase`, Shopify Customer Events and webhook events should use the same checkout/order event ID. The server merges duplicate Purchase payloads while the event is still pending, so Shopify order webhook data can enrich checkout events without causing already successful events to be sent again.
+浏览器 Purchase 在付款 webhook 验证前只处于 `AWAITING_PAYMENT`，不会提前发送。重复 webhook 使用稳定身份合并，不会重复创建 Purchase。
 
-## Upgrade
+## 8. 上线验收
+
+```bash
+pm2 status
+curl -fsS http://127.0.0.1:3000/healthz
+curl -fsS http://127.0.0.1:3000/readyz
+curl -I https://capi.example.com:8443/admin
+cd /www/wwwroot/capi-saas && npm run doctor
+```
+
+平台侧逐店验证 PageView、ViewContent、AddToCart、InitiateCheckout、AddPaymentInfo 和付款后的唯一 Purchase。一个像素故障时，其他已成功路由不应重发。
+
+## 9. 手动备份、恢复和回滚
+
+备份：
 
 ```bash
 cd /www/wwwroot/capi-saas
 npm run backup
-git pull --ff-only
-npm install --omit=dev
-npm run check
-npm run migrate
-npm run doctor
-pm2 restart ecosystem.config.js
 ```
 
-## Backup And Restore
+默认保存到 `/www/wwwroot/capi-saas/backups`。数据库 dump 与 `.env` 副本权限应保持严格，并复制到加密异机存储。
 
-Create a backup before upgrades or server maintenance:
-
-```bash
-cd /www/wwwroot/capi-saas
-npm run backup
-```
-
-Backups are written to:
-
-```text
-/www/wwwroot/capi-saas/backups
-```
-
-The backup includes a PostgreSQL custom-format dump and, by default, a copy of `.env`. Keep `.env` backups private because `AES_SECRET_KEY` is required to decrypt saved platform tokens.
-
-Restore a database backup:
+恢复：
 
 ```bash
 cd /www/wwwroot/capi-saas
 CONFIRM=RESTORE bash scripts/restore.sh backups/capi-db-YYYYMMDDTHHMMSSZ.dump
 npm run migrate
 npm run doctor
-pm2 restart ecosystem.config.js
+pm2 startOrReload ecosystem.config.js --update-env
 ```
+
+代码回滚时先切换到已验证提交，再执行 `npm ci --omit=dev`、`migrate`、`doctor` 和 PM2 reload。不要在没有数据库备份时回退跨版本数据库结构。
+
+## 10. 故障排查
+
+```bash
+pm2 logs capi-api --lines 200 --nostream
+pm2 logs capi-worker --lines 200 --nostream
+nginx -t
+journalctl -u nginx -n 100 --no-pager
+journalctl -u postgresql -n 100 --no-pager
+journalctl -u redis-server -n 100 --no-pager
+redis-cli INFO memory
+cd /www/wwwroot/capi-saas && npm run doctor
+```
+
+- 后台无法访问：检查域名、证书、安全组、自定义 HTTPS 端口和 Nginx 错误日志。
+- `/readyz` 失败：优先检查 PostgreSQL；Redis 异常通常显示 `degraded`，不会阻止持久写入。
+- 事件积压：检查 Worker、Redis noeviction、平台限流冷却、数据库连接和最旧到期事件。
+- Purchase 缺失：检查 `orders/paid` webhook、HMAC secret、付款状态和 `SHOPIFY_WEB_ORDER_SOURCES`。
+- 重复或串店疑虑：运行 `npm run doctor` 并查看后台投递完整性；数据库触发器会拒绝跨店事件/路由组合。

@@ -15,7 +15,7 @@ REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 AES_SECRET_KEY="${AES_SECRET_KEY:-}"
-FB_API_VERSION="${FB_API_VERSION:-v24.0}"
+FB_API_VERSION="${FB_API_VERSION:-v25.0}"
 SKIP_APT="${SKIP_APT:-0}"
 CERT_FULLCHAIN="${CERT_FULLCHAIN:-}"
 CERT_KEY="${CERT_KEY:-}"
@@ -25,6 +25,12 @@ AUTO_SSL="${AUTO_SSL:-0}"
 ACME_DNS_PROVIDER="${ACME_DNS_PROVIDER:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 REDIRECT_HTTP="${REDIRECT_HTTP:-1}"
+FORCE_ENV_REWRITE="${FORCE_ENV_REWRITE:-0}"
+SHOPIFY_WEB_ORDER_SOURCES="${SHOPIFY_WEB_ORDER_SOURCES:-web}"
+CORS_ORIGIN="${CORS_ORIGIN:-*}"
+DB_POOL_MAX="${DB_POOL_MAX:-20}"
+API_INSTANCES="${API_INSTANCES:-1}"
+WORKER_INSTANCES="${WORKER_INSTANCES:-1}"
 
 log() {
   printf '\033[1;36m[deploy]\033[0m %s\n' "$*"
@@ -61,12 +67,66 @@ validate_port() {
   fi
 }
 
+validate_positive_integer() {
+  local name="$1"
+  local value="$2"
+  if ! printf '%s' "$value" | grep -Eq '^[0-9]+$' || [ "$value" -lt 1 ]; then
+    fail "${name} must be a positive integer"
+  fi
+}
+
+validate_bool() {
+  local name="$1"
+  local value="$2"
+  if [ "$value" != "0" ] && [ "$value" != "1" ]; then
+    fail "${name} must be 0 or 1"
+  fi
+}
+
+validate_dotenv_value() {
+  local name="$1"
+  local value="$2"
+  if printf '%s' "$value" | grep -Eq "[[:space:]#'\"]"; then
+    fail "${name} must not contain whitespace, #, or quote characters"
+  fi
+}
+
+validate_slug() {
+  local name="$1"
+  local value="$2"
+  if ! printf '%s' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+    fail "${name} contains unsafe characters: ${value}"
+  fi
+}
+
+validate_branch() {
+  if ! printf '%s' "$BRANCH" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
+    || printf '%s' "$BRANCH" | grep -Eq '(\.\.|//|(^|/)\.|/$)'; then
+    fail "BRANCH contains unsafe Git ref characters: ${BRANCH}"
+  fi
+}
+
 validate_domain() {
   if [ -z "$DOMAIN" ]; then
     return
   fi
   if ! printf '%s' "$DOMAIN" | grep -Eq '^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$'; then
     fail "DOMAIN must be a valid hostname, got: ${DOMAIN}"
+  fi
+}
+
+validate_app_dir() {
+  case "$APP_DIR" in
+    /*) ;;
+    *) fail "APP_DIR must be an absolute path" ;;
+  esac
+  case "$APP_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/www|/www/wwwroot)
+      fail "Refusing unsafe APP_DIR target: ${APP_DIR}"
+      ;;
+  esac
+  if printf '%s' "$APP_DIR" | grep -Eq '(^|/)\.\.(/|$)'; then
+    fail "APP_DIR must not contain parent-directory traversal"
   fi
 }
 
@@ -139,6 +199,13 @@ install_apt_deps() {
   ensure_service_started redis-server
   ensure_service_started redis
   ensure_service_started nginx
+
+  # BullMQ metadata must never be evicted under memory pressure. PostgreSQL is
+  # still the durable event source, but noeviction avoids avoidable queue churn.
+  if command_exists redis-cli && redis-cli ping >/dev/null 2>&1; then
+    redis-cli CONFIG SET maxmemory-policy noeviction >/dev/null
+    redis-cli CONFIG REWRITE >/dev/null || true
+  fi
 }
 
 open_firewall_port() {
@@ -201,13 +268,19 @@ clone_or_update_repo() {
 
   if [ -d "$APP_DIR/.git" ]; then
     log "Updating existing repository in $APP_DIR"
+    if [ -f "$APP_DIR/.env" ] && [ -f "$APP_DIR/scripts/backup.sh" ]; then
+      log "Creating a pre-upgrade database and environment backup"
+      (cd "$APP_DIR" && bash scripts/backup.sh)
+    fi
     git -C "$APP_DIR" fetch origin "$BRANCH"
     git -C "$APP_DIR" checkout "$BRANCH"
     git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
   else
     log "Cloning repository to $APP_DIR"
     mkdir -p "$(dirname "$APP_DIR")"
-    rm -rf "$APP_DIR"
+    if [ -e "$APP_DIR" ] && [ -n "$(find "$APP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+      fail "APP_DIR exists and is not an empty Git repository: ${APP_DIR}"
+    fi
     git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
   fi
 }
@@ -244,7 +317,7 @@ write_env() {
   ADMIN_PASSWORD="${ADMIN_PASSWORD:-$(random_secret)}"
   AES_SECRET_KEY="${AES_SECRET_KEY:-$(random_secret)}"
 
-  log "Writing .env"
+  log "Writing new .env"
   cat > "$APP_DIR/.env" <<ENV
 PORT=${INTERNAL_PORT}
 DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:5432/${DB_NAME}
@@ -255,30 +328,93 @@ AES_SECRET_KEY=${AES_SECRET_KEY}
 
 ADMIN_USERNAME=${ADMIN_USERNAME}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
+REQUIRE_INGEST_TOKEN=true
+SHOPIFY_WEB_ORDER_SOURCES=${SHOPIFY_WEB_ORDER_SOURCES}
 
-CORS_ORIGIN=*
+CORS_ORIGIN=${CORS_ORIGIN}
 TRUST_PROXY_HOPS=1
 JSON_LIMIT=1mb
+HTTP_REQUEST_TIMEOUT_MS=30000
+HTTP_HEADERS_TIMEOUT_MS=15000
+HTTP_KEEP_ALIVE_TIMEOUT_MS=5000
+SHUTDOWN_TIMEOUT_MS=120000
+DB_POOL_MAX=${DB_POOL_MAX}
+DB_IDLE_TIMEOUT_MS=30000
+DB_CONNECTION_TIMEOUT_MS=10000
+DB_STATEMENT_TIMEOUT_MS=30000
+DB_POOL_MAX_USES=7500
 BATCH_SIZE=1000
+LEGACY_REDIS_DRAIN_ENABLED=false
+WORKER_EVENT_BATCH_SIZE=100
 QUEUE_ATTEMPTS=5
 QUEUE_BACKOFF_MS=5000
-PIXEL_RATE_LIMIT_PER_MINUTE=200
+# 0 keeps authenticated tracking lossless during legitimate traffic spikes.
+# Use an upstream WAF for abuse protection; set a positive value only if you
+# intentionally accept HTTP 429 responses from the ingestion endpoint.
+PIXEL_RATE_LIMIT_PER_MINUTE=0
 ADMIN_RATE_LIMIT_PER_WINDOW=100
 FB_REQUEST_TIMEOUT_MS=15000
 FACEBOOK_BATCH_SIZE=100
+FACEBOOK_ISOLATION_MAX_REQUESTS=16
 WORKER_CONCURRENCY=20
 WORKER_RATE_LIMIT_MAX=100
 WORKER_RATE_LIMIT_DURATION_MS=1000
+DELIVERY_RETRY_BASE_SECONDS=5
+DELIVERY_RETRY_MAX_SECONDS=900
+DELIVERY_RETRY_AFTER_MAX_SECONDS=86400
+# Retry transient failures until event-age validation expires them.
+DELIVERY_MAX_ATTEMPTS=0
+CREDENTIAL_LEASE_MS=60000
+CREDENTIAL_BUSY_DELAY_SECONDS=2
+DELIVERY_RESCUE_MINUTES=1
+DELIVERY_RESCUE_SHOP_LIMIT=500
+AGGREGATE_RECONCILE_BATCH_SIZE=5000
 PURCHASE_SETTLE_MS=8000
+CLEANUP_CRON=17 * * * *
+CLEANUP_BATCH_SIZE=10000
+CLEANUP_MAX_BATCHES=2
+EVENT_RETENTION_DAYS=90
+DEAD_LETTER_RETENTION_DAYS=90
+ALIAS_RETENTION_DAYS=120
+QUALITY_RETENTION_DAYS=30
+API_INSTANCES=${API_INSTANCES}
+WORKER_INSTANCES=${WORKER_INSTANCES}
 ENV
 
   chmod 600 "$APP_DIR/.env"
 }
 
+configure_database_and_env() {
+  if [ -f "$APP_DIR/.env" ] && [ "$FORCE_ENV_REWRITE" != "1" ]; then
+    log "Preserving existing .env and database credentials"
+    return
+  fi
+
+  if [ -f "$APP_DIR/.env" ] && [ "$FORCE_ENV_REWRITE" = "1" ]; then
+    [ -n "$DB_PASSWORD" ] || fail "DB_PASSWORD is required when FORCE_ENV_REWRITE=1"
+    [ -n "$ADMIN_PASSWORD" ] || fail "ADMIN_PASSWORD is required when FORCE_ENV_REWRITE=1"
+    [ -n "$AES_SECRET_KEY" ] || fail "AES_SECRET_KEY is required when FORCE_ENV_REWRITE=1"
+  fi
+
+  [ -z "$AES_SECRET_KEY" ] || [ "${#AES_SECRET_KEY}" -ge 32 ] || fail "AES_SECRET_KEY must contain at least 32 characters"
+  validate_dotenv_value ADMIN_USERNAME "$ADMIN_USERNAME"
+  validate_dotenv_value ADMIN_PASSWORD "$ADMIN_PASSWORD"
+  validate_dotenv_value AES_SECRET_KEY "$AES_SECRET_KEY"
+  validate_dotenv_value REDIS_URL "$REDIS_URL"
+  validate_dotenv_value CORS_ORIGIN "$CORS_ORIGIN"
+  validate_dotenv_value SHOPIFY_WEB_ORDER_SOURCES "$SHOPIFY_WEB_ORDER_SOURCES"
+  if ! printf '%s' "$SHOPIFY_WEB_ORDER_SOURCES" | grep -Eq '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$'; then
+    fail "SHOPIFY_WEB_ORDER_SOURCES must be a comma-separated source_name allowlist"
+  fi
+
+  setup_database
+  write_env
+}
+
 install_app() {
   log "Installing Node dependencies"
   cd "$APP_DIR"
-  npm install --omit=dev
+  npm ci --omit=dev
   npm run check
 
   log "Initializing/migrating database"
@@ -292,6 +428,22 @@ setup_pm2() {
   pm2 startOrReload ecosystem.config.js --update-env
   pm2 save
   pm2 startup systemd -u root --hp /root >/tmp/${APP_NAME}-pm2-startup.log 2>&1 || true
+}
+
+verify_runtime() {
+  log "Waiting for API health checks"
+  local attempt
+  for attempt in $(seq 1 30); do
+    if curl -fsS --max-time 5 "http://127.0.0.1:${INTERNAL_PORT}/healthz" >/dev/null \
+      && curl -fsS --max-time 5 "http://127.0.0.1:${INTERNAL_PORT}/readyz" >/dev/null; then
+      log "API health and readiness checks passed"
+      return
+    fi
+    sleep 2
+  done
+  pm2 status || true
+  pm2 logs capi-api --lines 50 --nostream || true
+  fail "API did not become ready on 127.0.0.1:${INTERNAL_PORT}"
 }
 
 write_nginx_hint() {
@@ -329,17 +481,37 @@ write_nginx_hint() {
 server {
     listen ${PUBLIC_PORT} ssl http2;
     server_name ${server_name};
+    server_tokens off;
 
     ssl_certificate     ${cert_fullchain};
     ssl_certificate_key ${cert_key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size 2m;
+
+    location ~* /(\.git|\.svn|\.hg|\.github|node_modules|backups|\.npm|\.cache)/ {
+        return 404;
+    }
+
+    location ~* (\.env.*|package(-lock)?\.json|.*\.sql(\.gz)?|.*\.log|.*\.bak|.*\.old|.*\.tmp)$ {
+        return 404;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:${INTERNAL_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Host \$host;
+        proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Port ${PUBLIC_PORT};
+        proxy_set_header Connection "";
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 35s;
+        proxy_read_timeout 35s;
     }
 }
 NGINX
@@ -384,6 +556,7 @@ Next steps:
 3. Copy /etc/nginx/conf.d/${APP_NAME}-${PUBLIC_PORT}.conf.example to an active Nginx conf and set certificate paths.
 4. Paste the generated Shopify custom pixel code from the admin panel.
 5. Configure Shopify orders/paid webhook to https://YOUR_DOMAIN:${PUBLIC_PORT}/api/webhook/orders/paid.
+   This is required: browser Purchase candidates remain AWAITING_PAYMENT until the verified webhook confirms payment.
 
 Useful commands:
 pm2 status
@@ -397,19 +570,35 @@ SUMMARY
 main() {
   need_root
   detect_ubuntu
+  validate_slug APP_NAME "$APP_NAME"
+  validate_branch
+  validate_app_dir
   validate_port INTERNAL_PORT "$INTERNAL_PORT"
   validate_port PUBLIC_PORT "$PUBLIC_PORT"
+  [ "$INTERNAL_PORT" != "$PUBLIC_PORT" ] || fail "INTERNAL_PORT and PUBLIC_PORT must be different"
+  validate_positive_integer DB_POOL_MAX "$DB_POOL_MAX"
+  validate_positive_integer API_INSTANCES "$API_INSTANCES"
+  validate_positive_integer WORKER_INSTANCES "$WORKER_INSTANCES"
+  [ "$DB_POOL_MAX" -le 200 ] || fail "DB_POOL_MAX must not exceed the application limit of 200"
+  validate_bool SKIP_APT "$SKIP_APT"
+  validate_bool ENABLE_UFW "$ENABLE_UFW"
+  validate_bool AUTO_ENABLE_NGINX "$AUTO_ENABLE_NGINX"
+  validate_bool AUTO_SSL "$AUTO_SSL"
+  validate_bool REDIRECT_HTTP "$REDIRECT_HTTP"
+  validate_bool FORCE_ENV_REWRITE "$FORCE_ENV_REWRITE"
   validate_domain
   install_apt_deps
   open_firewall_port
   clone_or_update_repo
-  setup_database
-  write_env
+  configure_database_and_env
   install_app
   setup_pm2
+  verify_runtime
   issue_ssl_certificate
   write_nginx_hint
   print_summary
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

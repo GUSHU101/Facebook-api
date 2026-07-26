@@ -1,155 +1,330 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CAPI SaaS Data Hub</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <meta name="theme-color" content="#081428">
+    <title>CAPI 数据中枢 · 管理控制台</title>
+    <link rel="stylesheet" href="/admin/assets/admin.css">
+    <script src="/admin/assets/vue.global.prod.js"></script>
 </head>
-<body class="bg-slate-100 text-slate-900 font-sans">
-    <div id="app" class="min-h-screen">
-        <header class="bg-slate-950 text-white">
-            <div class="max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-4">
-                <h1 class="text-lg font-semibold tracking-wide">CAPI SaaS Data Hub</h1>
-                <nav class="flex flex-wrap gap-2 text-sm">
-                    <button v-for="item in tabs" :key="item.key" @click="tab = item.key" class="px-3 py-2 rounded-md hover:bg-white/10" :class="tab === item.key ? 'bg-white text-slate-950' : ''">{{ item.label }}</button>
+<body>
+    <div id="app" class="app-shell">
+        <header class="app-header">
+            <div class="header-inner">
+                <div class="brand">
+                    <div class="brand-mark" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                            <path d="M4 17.5V9.8M10 17.5V5.5M16 17.5v-4.8M3 19.5h18" stroke-linecap="round"/>
+                            <path d="m4 8 6-4 6 6 4-3" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1 class="brand-title">CAPI 数据中枢</h1>
+                        <div class="brand-subtitle">Commerce Event Operations</div>
+                    </div>
+                </div>
+                <nav class="app-nav" aria-label="主导航">
+                    <button v-for="item in tabs" :key="item.key" @click="tab = item.key" class="nav-tab" :class="tab === item.key ? 'is-active' : ''">
+                        <span class="nav-index">{{ item.index }}</span>
+                        <span>{{ item.label }}</span>
+                    </button>
                 </nav>
-                <a href="/admin/queue" target="_blank" class="px-3 py-2 rounded-md bg-cyan-500 text-slate-950 text-sm font-semibold">Queue</a>
+                <a href="/admin/queue" target="_blank" rel="noopener" class="queue-link" title="打开 BullMQ 队列面板">
+                    <span class="live-dot"></span><span>队列控制台</span>
+                </a>
             </div>
         </header>
 
-        <main class="max-w-7xl mx-auto px-6 py-6 space-y-5">
-            <div v-if="notice" class="border rounded-md px-4 py-3 text-sm" :class="notice.type === 'error' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-emerald-50 border-emerald-200 text-emerald-800'">
+        <main class="app-main space-y-5">
+            <div v-if="notice" class="notice-card border px-4 py-3 text-sm" :class="notice.type === 'error' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-emerald-50 border-emerald-200 text-emerald-800'" role="status">
                 <div class="flex items-start justify-between gap-4">
                     <pre class="whitespace-pre-wrap font-sans">{{ notice.message }}</pre>
-                    <button class="font-semibold" @click="notice = null">Close</button>
+                    <button class="font-semibold" @click="notice = null" aria-label="关闭通知">关闭</button>
                 </div>
             </div>
 
-            <section v-if="tab === 'deploy'" class="space-y-5">
-                <div class="grid md:grid-cols-3 gap-4 bg-white border rounded-lg p-4">
+            <section v-if="tab === 'deploy'" class="app-section space-y-5">
+                <div class="page-intro">
+                    <div>
+                        <div class="eyebrow">Installation · Web Pixel</div>
+                        <h2 class="page-title">像素接入与部署</h2>
+                        <p class="page-description">为指定 Shopify 店铺生成可靠的客户事件代码。路由由服务端配置决定，前端提示只用于诊断，不会改变租户归属。</p>
+                    </div>
+                    <div class="status-chip"><span class="live-dot"></span>稳定事件 ID · 持久队列</div>
+                </div>
+                <div class="surface grid md:grid-cols-3 gap-4 p-5">
+                    <div class="md:col-span-3 surface-header">
+                        <div>
+                            <div class="surface-title">生成配置</div>
+                            <div class="surface-copy">选择已配置店铺可以自动带入域名、接入令牌和像素路由。</div>
+                        </div>
+                    </div>
                     <label class="block">
-                        <span class="text-sm font-medium">Configured shop</span>
+                        <span class="text-sm font-medium">已配置店铺</span>
                         <select v-model="deployShopId" @change="applyDeployShop" class="mt-1 w-full border rounded-md p-2">
-                            <option value="">Manual</option>
+                            <option value="">手动填写</option>
                             <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
                         </select>
                     </label>
                     <label class="block">
-                        <span class="text-sm font-medium">Shopify domain</span>
+                        <span class="text-sm font-medium">Shopify 店铺域名</span>
                         <input v-model="currentShop" class="mt-1 w-full border rounded-md p-2 font-mono" placeholder="your-store.myshopify.com">
                     </label>
                     <label class="block">
-                        <span class="text-sm font-medium">API origin</span>
+                        <span class="text-sm font-medium">API 服务地址</span>
                         <input v-model="apiDomain" class="mt-1 w-full border rounded-md p-2 font-mono">
                     </label>
                     <div class="md:col-span-3 grid md:grid-cols-2 gap-3 text-sm text-slate-600">
-                        <div class="bg-slate-50 border rounded-md p-3">
-                            <div class="font-semibold text-slate-800">Meta server route hints</div>
-                            <div class="font-mono break-all">{{ currentMetaPixelIds.length ? currentMetaPixelIds.join(', ') : 'none' }}</div>
+                        <div class="hint-card bg-slate-50 border rounded-md p-3">
+                            <div class="font-semibold text-slate-800">Meta 服务端路由提示</div>
+                            <div class="mt-1 font-mono break-all">{{ currentMetaPixelIds.length ? currentMetaPixelIds.join(', ') : '暂未配置' }}</div>
                         </div>
-                        <div class="bg-slate-50 border rounded-md p-3">
-                            <div class="font-semibold text-slate-800">TikTok server route hints</div>
-                            <div class="font-mono break-all">{{ currentTikTokPixelIds.length ? currentTikTokPixelIds.join(', ') : 'none' }}</div>
+                        <div class="hint-card bg-slate-50 border rounded-md p-3">
+                            <div class="font-semibold text-slate-800">TikTok 服务端路由提示</div>
+                            <div class="mt-1 font-mono break-all">{{ currentTikTokPixelIds.length ? currentTikTokPixelIds.join(', ') : '暂未配置' }}</div>
                         </div>
                     </div>
                 </div>
-                <div class="flex flex-wrap items-center gap-3">
-                    <button @click="copyCode" class="bg-slate-950 text-white rounded-md px-4 py-2">Copy tracking code</button>
-                    <code class="bg-white border rounded-md px-3 py-2 text-sm">Webhook: {{ apiDomain }}/api/webhook/orders/paid</code>
+                <div class="toolbar flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                        <div class="surface-title">Shopify Customer Events 代码</div>
+                        <div class="surface-copy">复制到 Shopify 自定义像素；付款成功由已验证的 orders/paid Webhook 确认。</div>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-3">
+                        <button @click="copyCode" class="primary-btn px-4 py-2">复制跟踪代码</button>
+                        <code class="bg-white border rounded-md px-3 py-2 text-xs break-all">Webhook · {{ apiDomain }}/api/webhook/orders/paid</code>
+                    </div>
                 </div>
-                <textarea readonly :value="generatedCode" class="w-full h-[620px] p-4 rounded-md bg-slate-950 text-emerald-300 font-mono text-xs leading-5 border border-slate-800"></textarea>
+                <textarea readonly :value="generatedCode" aria-label="Shopify 跟踪代码" class="code-editor w-full h-[620px] p-5 font-mono text-xs leading-5"></textarea>
             </section>
 
-            <section v-if="tab === 'shops'" class="space-y-5">
-                <div class="grid md:grid-cols-[1fr_1fr_auto] gap-3 bg-white border rounded-lg p-4">
-                    <input v-model.trim="newShop.shop_domain" placeholder="your-store.myshopify.com" class="border rounded-md p-2 font-mono">
-                    <input v-model.trim="newShop.app_secret" placeholder="Shopify Webhook Secret" class="border rounded-md p-2 font-mono">
-                    <button @click="addShop" :disabled="busy.addShop" class="bg-slate-950 text-white rounded-md px-5 py-2 font-medium disabled:opacity-50">{{ busy.addShop ? 'Saving...' : 'Save shop' }}</button>
+            <section v-if="tab === 'shops'" class="app-section space-y-5">
+                <div class="page-intro">
+                    <div>
+                        <div class="eyebrow">Tenants · Shopify</div>
+                        <h2 class="page-title">店铺与租户</h2>
+                        <p class="page-description">每个店铺拥有独立的事件、去重、归因与投递边界；同一个店铺可连接多个 Pixel。</p>
+                    </div>
+                    <div class="status-chip"><span class="live-dot"></span>{{ shops.length }} 个已配置店铺</div>
                 </div>
-                <table class="w-full bg-white border rounded-lg overflow-hidden text-sm">
-                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">Shop</th><th class="p-3">Status</th><th class="p-3">Created</th><th class="p-3">Action</th></tr></thead>
-                    <tbody>
-                        <tr v-for="s in shops" :key="s.id" class="border-t">
-                            <td class="p-3 font-mono font-semibold">{{ s.shop_domain }}</td>
-                            <td class="p-3">{{ s.status }}</td>
-                            <td class="p-3">{{ formatTime(s.created_at) }}</td>
-                            <td class="p-3"><button @click="deleteShop(s)" class="text-red-600 font-medium">Delete</button></td>
+                <div class="surface p-5">
+                    <div class="surface-header">
+                        <div>
+                            <div class="surface-title">添加或更新店铺</div>
+                            <div class="surface-copy">重复提交同一域名会安全更新 Webhook 密钥并恢复店铺状态。</div>
+                        </div>
+                    </div>
+                    <div class="grid md:grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                        <label class="block">
+                            <span class="text-sm font-medium">Shopify 域名</span>
+                            <input v-model.trim="newShop.shop_domain" placeholder="your-store.myshopify.com" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">Webhook Secret</span>
+                            <input v-model.trim="newShop.app_secret" type="password" autocomplete="new-password" placeholder="粘贴 Shopify Webhook 密钥" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
+                        <button @click="addShop" :disabled="busy.addShop" class="primary-btn px-5 py-2">{{ busy.addShop ? '保存中…' : '保存店铺' }}</button>
+                    </div>
+                </div>
+                <div class="table-shell"><div class="table-scroll">
+                    <table class="data-table text-sm">
+                        <thead class="text-left"><tr><th>店铺域名</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+                        <tbody>
+                            <tr v-for="s in shops" :key="s.id">
+                                <td class="font-mono font-semibold">{{ s.shop_domain }}</td>
+                                <td><span class="status-pill ready"><span class="live-dot"></span>{{ s.status }}</span></td>
+                                <td>{{ formatTime(s.created_at) }}</td>
+                                <td><button @click="deleteShop(s)" class="text-action text-red-600 font-medium">删除</button></td>
+                            </tr>
+                            <tr v-if="!shops.length"><td colspan="4" class="table-empty">尚未添加店铺。请先配置 Shopify 域名和 Webhook 密钥。</td></tr>
+                        </tbody>
+                    </table>
+                </div></div>
+            </section>
+
+            <section v-if="tab === 'pixels'" class="app-section space-y-5">
+                <div class="page-intro">
+                    <div>
+                        <div class="eyebrow">Routing · Many to Many</div>
+                        <h2 class="page-title">Pixel 路由</h2>
+                        <p class="page-description">一个凭据可安全服务多个店铺，一个店铺也可同时投递到多个 Meta Dataset 或 TikTok Pixel。</p>
+                    </div>
+                    <div class="status-chip"><span class="live-dot"></span>{{ pixels.length }} 个共享凭据</div>
+                </div>
+                <div class="surface p-5">
+                    <div class="surface-header">
+                        <div>
+                            <div class="surface-title">新建或复用 Pixel 凭据</div>
+                            <div class="surface-copy">相同平台与 Pixel ID 只保存一份凭据，所有已选店铺获得各自独立的投递路由。</div>
+                        </div>
+                    </div>
+                    <div class="grid md:grid-cols-2 gap-4">
+                        <label class="block md:col-span-2">
+                            <span class="text-sm font-medium">绑定店铺（可多选）</span>
+                            <select v-model="newPixel.shop_ids" multiple class="mt-1 w-full border rounded-md p-2 min-h-28">
+                                <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
+                            </select>
+                            <span class="mt-2 block text-xs text-slate-500">Windows 使用 Ctrl、macOS 使用 Command 可选择多个店铺。</span>
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">投递平台</span>
+                            <select v-model="newPixel.platform" class="mt-1 w-full border rounded-md p-2">
+                                <option value="facebook">Facebook / Meta</option>
+                                <option value="tiktok">TikTok</option>
+                            </select>
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">路由名称</span>
+                            <input v-model.trim="newPixel.name" placeholder="例如：主站 Meta Dataset" class="mt-1 w-full border rounded-md p-2">
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">Pixel / Dataset ID</span>
+                            <input v-model.trim="newPixel.pixel_id" placeholder="Meta Dataset ID 或 TikTok Pixel Code" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">平台 Access Token</span>
+                            <input v-model.trim="newPixel.access_token" type="password" autocomplete="new-password" placeholder="Meta System Token / TikTok Access Token" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">Meta Dataset Quality Token（可选）</span>
+                            <input v-model.trim="newPixel.quality_access_token" type="password" autocomplete="new-password" placeholder="仅用于读取官方数据质量" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">测试事件代码（可选）</span>
+                            <input v-model.trim="newPixel.test_event_code" placeholder="Meta Test Event Code" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
+                        <button @click="addPixel" :disabled="busy.addPixel" class="primary-btn px-5 py-2 md:col-span-2">{{ busy.addPixel ? '保存中…' : '保存 Pixel 路由' }}</button>
+                    </div>
+                </div>
+                <div class="table-shell"><div class="table-scroll">
+                    <table class="data-table text-sm">
+                        <thead class="text-left"><tr><th>绑定店铺</th><th>平台</th><th>名称</th><th>Pixel / Dataset</th><th>限流状态</th><th>质量令牌</th><th>测试代码</th><th>操作</th></tr></thead>
+                        <tbody>
+                        <tr v-for="p in pixels" :key="p.id">
+                            <td class="font-mono">{{ (p.routes || []).map(route => route.shop_domain).join(', ') || p.shop_domain }}</td>
+                            <td><span class="platform-pill" :class="p.platform">{{ p.platform }}</span></td>
+                            <td>{{ p.name }}</td>
+                            <td class="font-mono">{{ p.pixel_id }}</td>
+                            <td class="text-xs">
+                                <div>{{ p.last_usage_pct == null ? 'Usage -' : 'Usage ' + p.last_usage_pct + '%' }}</div>
+                                <div :class="new Date(p.rate_limit_until).getTime() > Date.now() ? 'text-amber-700 font-semibold' : 'text-emerald-700'">
+                                    {{ new Date(p.rate_limit_until).getTime() > Date.now() ? '冷却至 ' + formatTime(p.rate_limit_until) : '可用' }}
+                                </div>
+                                <div v-if="Number(p.consecutive_failures || 0) > 0" class="text-red-600">连续失败 {{ p.consecutive_failures }} 次</div>
+                            </td>
+                            <td>{{ p.has_quality_token ? '已配置' : '—' }}</td>
+                            <td class="font-mono">{{ p.test_event_code || '—' }}</td>
+                            <td class="space-x-3 whitespace-nowrap">
+                                <button @click="editPixelRoutes(p)" class="text-action text-blue-600 font-medium">编辑店铺</button>
+                                <button @click="deletePixel(p.id)" class="text-action text-red-600 font-medium">删除</button>
+                            </td>
                         </tr>
+                        <tr v-if="!pixels.length"><td colspan="8" class="table-empty">尚未配置 Pixel 路由。请先添加店铺，再绑定 Meta 或 TikTok 凭据。</td></tr>
                     </tbody>
-                </table>
+                    </table>
+                </div></div>
             </section>
 
-            <section v-if="tab === 'pixels'" class="space-y-5">
-                <div class="grid md:grid-cols-2 gap-3 bg-white border rounded-lg p-4">
-                    <select v-model="newPixel.shop_id" class="border rounded-md p-2 md:col-span-2">
-                        <option value="">Select shop</option>
-                        <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
-                    </select>
-                    <select v-model="newPixel.platform" class="border rounded-md p-2">
-                        <option value="facebook">Facebook / Meta</option>
-                        <option value="tiktok">TikTok</option>
-                    </select>
-                    <input v-model.trim="newPixel.name" placeholder="Route name, optional" class="border rounded-md p-2">
-                    <input v-model.trim="newPixel.pixel_id" placeholder="Pixel / Dataset ID / TikTok Pixel Code" class="border rounded-md p-2 font-mono">
-                    <input v-model.trim="newPixel.access_token" type="password" placeholder="Meta System Token / TikTok Access Token" class="border rounded-md p-2 font-mono">
-                    <input v-model.trim="newPixel.quality_access_token" type="password" placeholder="Meta Dataset Quality API Token, optional" class="border rounded-md p-2 font-mono">
-                    <input v-model.trim="newPixel.test_event_code" placeholder="Test Event Code, optional" class="border rounded-md p-2 font-mono">
-                    <button @click="addPixel" :disabled="busy.addPixel" class="bg-slate-950 text-white rounded-md px-5 py-2 font-medium md:col-span-2 disabled:opacity-50">{{ busy.addPixel ? 'Saving...' : 'Save Pixel route' }}</button>
+            <section v-if="tab === 'logs'" class="app-section space-y-5">
+                <div class="page-intro">
+                    <div>
+                        <div class="eyebrow">Observability · Delivery</div>
+                        <h2 class="page-title">事件监控</h2>
+                        <p class="page-description">集中查看接入量、EMQ、投递完整性、平台质量、待重试事件与死信恢复状态。</p>
+                    </div>
+                    <div class="status-chip"><span class="live-dot"></span>PostgreSQL 为持久化真源</div>
                 </div>
-                <table class="w-full bg-white border rounded-lg overflow-hidden text-sm">
-                    <thead class="bg-slate-200 text-left"><tr><th class="p-3">Shop</th><th class="p-3">Platform</th><th class="p-3">Name</th><th class="p-3">Pixel / Dataset</th><th class="p-3">Quality token</th><th class="p-3">Test code</th><th class="p-3">Action</th></tr></thead>
-                    <tbody>
-                        <tr v-for="p in pixels" :key="p.id" class="border-t">
-                            <td class="p-3 font-mono">{{ p.shop_domain }}</td>
-                            <td class="p-3 uppercase font-semibold">{{ p.platform }}</td>
-                            <td class="p-3">{{ p.name }}</td>
-                            <td class="p-3 font-mono">{{ p.pixel_id }}</td>
-                            <td class="p-3">{{ p.has_quality_token ? 'Configured' : '-' }}</td>
-                            <td class="p-3 font-mono">{{ p.test_event_code || '-' }}</td>
-                            <td class="p-3"><button @click="deletePixel(p.id)" class="text-red-600 font-medium">Delete</button></td>
-                        </tr>
-                    </tbody>
-                </table>
-            </section>
-
-            <section v-if="tab === 'logs'" class="space-y-5">
                 <div class="grid md:grid-cols-4 gap-3">
-                    <div class="bg-white border rounded-lg p-4">
-                        <div class="text-xs text-slate-500">24h events</div>
-                        <div class="text-2xl font-semibold">{{ summary.last24h?.total_events || 0 }}</div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">24 小时事件</div>
+                        <div class="metric-value">{{ summary.last24h?.total_events || 0 }}</div>
                     </div>
-                    <div class="bg-white border rounded-lg p-4">
-                        <div class="text-xs text-slate-500">Average EMQ</div>
-                        <div class="text-2xl font-semibold">{{ summary.last24h?.avg_emq || '-' }}</div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">平均 EMQ</div>
+                        <div class="metric-value">{{ summary.last24h?.avg_emq || '—' }}</div>
                     </div>
-                    <div class="bg-white border rounded-lg p-4">
-                        <div class="text-xs text-slate-500">Dead letters</div>
-                        <div class="text-2xl font-semibold text-red-600">{{ summary.dead_letters || 0 }}</div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">死信事件</div>
+                        <div class="metric-value text-red-600">{{ summary.dead_letters || 0 }}</div>
                     </div>
-                    <div class="bg-white border rounded-lg p-4">
-                        <div class="text-xs text-slate-500">Queue waiting</div>
-                        <div class="text-2xl font-semibold">{{ summary.queue?.waiting || 0 }}</div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">队列等待</div>
+                        <div class="metric-value">{{ summary.queue?.waiting || 0 }}</div>
                     </div>
                 </div>
-                <div class="bg-white border rounded-lg p-4 text-sm">
-                    <div class="font-semibold mb-2">Platform routes</div>
+                <div class="surface p-4 text-sm">
+                    <div class="surface-title mb-2">平台路由分布</div>
                     <div class="flex flex-wrap gap-2">
-                        <span v-for="item in summary.pixels_by_platform || []" :key="item.platform" class="px-3 py-1 rounded-md bg-slate-100 font-mono">{{ item.platform }}: {{ item.count }}</span>
-                        <span v-if="!summary.pixels_by_platform?.length" class="text-slate-500">No routes</span>
+                        <span v-for="item in summary.pixels_by_platform || []" :key="item.platform" class="platform-pill" :class="item.platform">{{ item.platform }} · {{ item.count }}</span>
+                        <span v-if="!summary.pixels_by_platform?.length" class="text-slate-500">尚无路由</span>
                     </div>
                 </div>
-                <div class="bg-white border rounded-lg p-4 text-sm">
+                <div class="surface p-5 text-sm">
+                    <div class="surface-header">
+                        <div><div class="surface-title">投递完整性</div><div class="surface-copy">隔离违规必须保持为 0；积压与到期重试需结合最老等待时间判断。</div></div>
+                    </div>
+                    <div class="integrity-grid grid md:grid-cols-5 xl:grid-cols-12 gap-3">
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">跨店铺违规</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.isolation_violations || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.delivery_health?.isolation_violations || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">汇总状态待修复</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.aggregate_mismatches || 0) ? 'text-amber-700' : 'text-emerald-700'">{{ summary.delivery_health?.aggregate_mismatches || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">缺失投递账本 &gt;5m</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.events_without_ledger || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.delivery_health?.events_without_ledger || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">无路由待处理</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.unrouted_pending || 0) ? 'text-amber-700' : 'text-emerald-700'">{{ summary.delivery_health?.unrouted_pending || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">数据库积压</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.pending_backlog || 0) ? 'text-amber-700' : 'text-emerald-700'">{{ summary.delivery_health?.pending_backlog || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">最老待处理</div>
+                            <div class="text-xl font-semibold">{{ formatDuration(summary.delivery_health?.oldest_pending_seconds) }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">过期租约</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.stale_leases || 0) ? 'text-amber-700' : 'text-emerald-700'">{{ summary.delivery_health?.stale_leases || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">到期重试</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.due_retries || 0) ? 'text-amber-700' : 'text-emerald-700'">{{ summary.delivery_health?.due_retries || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">最老到期</div>
+                            <div class="text-xl font-semibold">{{ formatDuration(summary.delivery_health?.oldest_due_seconds) }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">凭据冷却中</div>
+                            <div class="text-xl font-semibold">{{ summary.delivery_health?.active_cooldowns || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">等待付款确认</div>
+                            <div class="text-xl font-semibold text-sky-700">{{ summary.delivery_health?.awaiting_payment || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">最老付款等待</div>
+                            <div class="text-xl font-semibold">{{ formatDuration(summary.delivery_health?.oldest_awaiting_payment_seconds) }}</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="surface p-5 text-sm">
                     <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
                         <div>
-                            <div class="font-semibold">EMQ signal coverage</div>
-                            <div class="text-xs text-slate-500">Last 24h match signals present in queued Meta payloads</div>
+                            <div class="surface-title">EMQ 信号覆盖率</div>
+                            <div class="surface-copy">最近 24 小时 Meta 事件中实际存在的匹配信号</div>
                         </div>
-                        <div class="text-xs text-slate-500">{{ summary.last24h?.total_events || 0 }} events</div>
+                        <div class="text-xs text-slate-500">{{ summary.last24h?.total_events || 0 }} 个事件</div>
                     </div>
                     <div class="grid md:grid-cols-7 gap-3">
-                        <div v-for="signal in emqSignals" :key="signal.key" class="border rounded-md p-3 bg-slate-50">
+                        <div v-for="signal in emqSignals" :key="signal.key" class="signal-card border rounded-md p-3 bg-slate-50">
                             <div class="flex items-center justify-between gap-2">
                                 <span class="font-semibold">{{ signal.label }}</span>
                                 <span class="font-mono text-xs" :class="signalCoverageClass(signal.coverage)">{{ formatPercent(signal.coverage) }}</span>
@@ -161,13 +336,13 @@
                         </div>
                     </div>
                 </div>
-                <div class="bg-white border rounded-lg p-4 text-sm">
+                <div class="surface p-5 text-sm">
                     <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
                         <div>
-                            <div class="font-semibold">Meta official dataset quality</div>
-                            <div class="text-xs text-slate-500">Latest cached Dataset Quality API snapshot</div>
+                            <div class="surface-title">Meta 官方数据集质量</div>
+                            <div class="surface-copy">最近一次缓存的 Dataset Quality API 快照</div>
                         </div>
-                        <button @click="refreshMetaQuality" :disabled="busy.metaQuality" class="bg-white border rounded-md px-3 py-2 text-sm disabled:opacity-50">{{ busy.metaQuality ? 'Refreshing...' : 'Refresh Meta quality' }}</button>
+                        <button @click="refreshMetaQuality" :disabled="busy.metaQuality" class="secondary-btn px-3 py-2">{{ busy.metaQuality ? '刷新中…' : '刷新 Meta 质量' }}</button>
                     </div>
                     <div v-if="officialMetaQuality.length" class="grid md:grid-cols-2 gap-3">
                         <div v-for="item in officialMetaQuality" :key="item.pixel_route_id" class="border rounded-md p-3 bg-slate-50">
@@ -180,11 +355,11 @@
                             </div>
                             <div class="mt-3 grid grid-cols-2 gap-3">
                                 <div class="border rounded-md bg-white p-3">
-                                    <div class="text-xs text-slate-500">Official EMQ avg</div>
+                                    <div class="text-xs text-slate-500">官方 EMQ 均值</div>
                                     <div class="text-2xl font-semibold">{{ officialAverageScore(item) }}</div>
                                 </div>
                                 <div class="border rounded-md bg-white p-3">
-                                    <div class="text-xs text-slate-500">Fetched</div>
+                                    <div class="text-xs text-slate-500">抓取时间</div>
                                     <div class="font-mono text-xs">{{ formatTime(item.fetched_at) }}</div>
                                 </div>
                             </div>
@@ -194,44 +369,49 @@
                             <div v-if="item.error_message" class="mt-3 text-xs text-red-700 font-mono">{{ item.error_message }}</div>
                         </div>
                     </div>
-                    <div v-else class="text-slate-500">No Meta official quality snapshot yet. Add a Meta quality-capable token and refresh.</div>
+                    <div v-else class="text-slate-500">暂无 Meta 官方质量快照。请配置具有数据集质量权限的 Token 后刷新。</div>
                 </div>
-                <div class="flex flex-wrap gap-3">
+                <div class="toolbar flex flex-wrap gap-3">
                     <select v-model="selectedShopId" @change="fetchOperationalData" class="border rounded-md px-3 py-2 bg-white">
-                        <option value="">All shops</option>
+                        <option value="">全部店铺</option>
                         <option v-for="s in shops" :key="s.id" :value="s.id">{{ s.shop_domain }}</option>
                     </select>
-                    <button @click="fetchAll" class="bg-slate-950 text-white rounded-md px-4 py-2">Refresh all</button>
-                    <button @click="fetchDlq" class="bg-red-600 text-white rounded-md px-4 py-2">Refresh DLQ</button>
-                    <button v-if="dlq.length" @click="replayDlq" class="bg-emerald-600 text-white rounded-md px-4 py-2">Replay DLQ {{ dlq.length }}</button>
-                    <button v-if="logs.length" @click="clearLogs" class="bg-white border border-red-300 text-red-700 rounded-md px-4 py-2">Clear event logs</button>
+                    <button @click="fetchAll" class="primary-btn px-4 py-2">刷新全部</button>
+                    <button @click="fetchDlq" class="danger-btn px-4 py-2">刷新死信</button>
+                    <button v-if="dlq.length" @click="replayDlq" class="success-btn px-4 py-2">重放死信 {{ dlq.length }}</button>
+                    <button v-if="logs.length" @click="clearLogs" class="secondary-btn px-4 py-2 text-red-700">清除事件日志</button>
                 </div>
 
-                <table v-if="dlq.length" class="w-full bg-red-50 border border-red-200 rounded-lg overflow-hidden text-xs">
-                    <thead class="bg-red-200 text-left"><tr><th class="p-2">Shop</th><th class="p-2">Failed at</th><th class="p-2">Reason</th></tr></thead>
-                    <tbody>
-                        <tr v-for="d in dlq" :key="d.id" class="border-t border-red-200">
-                            <td class="p-2 font-mono">{{ d.shop_domain }}</td>
-                            <td class="p-2">{{ formatTime(d.failed_at) }}</td>
-                            <td class="p-2 font-mono text-red-700">{{ d.error_reason }}</td>
-                        </tr>
-                    </tbody>
-                </table>
+                <div v-if="dlq.length" class="table-shell border-red-200 bg-red-50"><div class="table-scroll">
+                    <table class="data-table text-xs">
+                        <thead class="bg-red-100 text-left"><tr><th>店铺</th><th>失败时间</th><th>失败原因</th></tr></thead>
+                        <tbody>
+                            <tr v-for="d in dlq" :key="d.id">
+                                <td class="font-mono">{{ d.shop_domain }}</td>
+                                <td>{{ formatTime(d.failed_at) }}</td>
+                                <td class="font-mono text-red-700">{{ d.error_reason }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div></div>
 
-                <table class="w-full bg-white border rounded-lg overflow-hidden text-xs">
-                    <thead class="bg-slate-200 text-left"><tr><th class="p-2">Time</th><th class="p-2">Shop</th><th class="p-2">Event</th><th class="p-2">EMQ</th><th class="p-2">Missing signals</th><th class="p-2">Status</th><th class="p-2">Response</th></tr></thead>
-                    <tbody>
-                        <tr v-for="log in logs" :key="log.id" class="border-t">
-                            <td class="p-2">{{ formatTime(log.timestamp) }}</td>
-                            <td class="p-2 font-mono">{{ log.shop_domain }}</td>
-                            <td class="p-2"><b>{{ log.event_name }}</b><br><span class="font-mono text-slate-500">{{ log.event_id }}</span></td>
-                            <td class="p-2 font-semibold">{{ log.emq_estimate || '-' }}/10</td>
-                            <td class="p-2 font-mono text-slate-500">{{ summarizeQuality(log.quality) }}</td>
-                            <td class="p-2 font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
-                            <td class="p-2 font-mono text-slate-500">{{ summarizeResponse(log.fb_response) }}</td>
-                        </tr>
-                    </tbody>
-                </table>
+                <div class="table-shell"><div class="table-scroll">
+                    <table class="data-table text-xs">
+                        <thead class="text-left"><tr><th>时间</th><th>店铺</th><th>事件</th><th>EMQ</th><th>缺失信号</th><th>状态</th><th>平台响应</th></tr></thead>
+                        <tbody>
+                            <tr v-for="log in logs" :key="log.id">
+                                <td>{{ formatTime(log.timestamp) }}</td>
+                                <td class="font-mono">{{ log.shop_domain }}</td>
+                                <td><b>{{ log.event_name }}</b><br><span class="font-mono text-slate-500">{{ log.event_id }}</span></td>
+                                <td class="font-semibold">{{ log.emq_estimate || '—' }}/10</td>
+                                <td class="font-mono text-slate-500">{{ summarizeQuality(log.quality) }}</td>
+                                <td class="font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
+                                <td class="font-mono text-slate-500">{{ summarizeResponse(log.fb_response) }}</td>
+                            </tr>
+                            <tr v-if="!logs.length"><td colspan="7" class="table-empty">当前筛选范围内暂无事件记录。</td></tr>
+                        </tbody>
+                    </table>
+                </div></div>
             </section>
         </main>
     </div>
@@ -243,10 +423,10 @@
                 return {
                     tab: 'deploy',
                     tabs: [
-                        { key: 'deploy', label: 'Tracking Code' },
-                        { key: 'shops', label: 'Shops' },
-                        { key: 'pixels', label: 'Pixel Routes' },
-                        { key: 'logs', label: 'Logs & DLQ' },
+                        { key: 'deploy', index: '01', label: '像素接入' },
+                        { key: 'shops', index: '02', label: '店铺租户' },
+                        { key: 'pixels', index: '03', label: 'Pixel 路由' },
+                        { key: 'logs', index: '04', label: '事件监控' },
                     ],
                     shops: [],
                     pixels: [],
@@ -260,33 +440,37 @@
                     selectedShopId: '',
                     currentShop: 'your-store.myshopify.com',
                     newShop: { shop_domain: '', app_secret: '' },
-                    newPixel: { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' },
+                    newPixel: { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' },
                 };
             },
             computed: {
                 currentMetaPixelIds() {
                     const shop = String(this.currentShop || '').trim().toLowerCase();
                     return this.pixels
-                        .filter(item => item.platform === 'facebook' && String(item.shop_domain || '').toLowerCase() === shop)
+                        .filter(item => item.platform === 'facebook' && (item.routes || []).some(route => String(route.shop_domain || '').toLowerCase() === shop))
                         .map(item => String(item.pixel_id))
                         .filter(Boolean);
                 },
                 currentTikTokPixelIds() {
                     const shop = String(this.currentShop || '').trim().toLowerCase();
                     return this.pixels
-                        .filter(item => item.platform === 'tiktok' && String(item.shop_domain || '').toLowerCase() === shop)
+                        .filter(item => item.platform === 'tiktok' && (item.routes || []).some(route => String(route.shop_domain || '').toLowerCase() === shop))
                         .map(item => String(item.pixel_id))
                         .filter(Boolean);
+                },
+                currentShopIngestToken() {
+                    const shop = String(this.currentShop || '').trim().toLowerCase();
+                    return this.shops.find(item => String(item.shop_domain || '').toLowerCase() === shop)?.ingest_token || '';
                 },
                 emqSignals() {
                     return this.summary.last24h?.emq_signals || [
                         { key: 'email', label: 'Email', matched: 0, total: 0, coverage: null },
-                        { key: 'phone', label: 'Phone', matched: 0, total: 0, coverage: null },
-                        { key: 'external_id', label: 'External ID', matched: 0, total: 0, coverage: null },
+                        { key: 'phone', label: '手机号', matched: 0, total: 0, coverage: null },
+                        { key: 'external_id', label: '外部 ID', matched: 0, total: 0, coverage: null },
                         { key: 'fbp', label: 'FBP', matched: 0, total: 0, coverage: null },
                         { key: 'fbc', label: 'FBC', matched: 0, total: 0, coverage: null },
                         { key: 'client_ip_address', label: 'IP', matched: 0, total: 0, coverage: null },
-                        { key: 'client_user_agent', label: 'User Agent', matched: 0, total: 0, coverage: null },
+                        { key: 'client_user_agent', label: '浏览器 UA', matched: 0, total: 0, coverage: null },
                     ];
                 },
                 officialMetaQuality() {
@@ -296,24 +480,29 @@
                     return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
 const SHOP_DOMAIN = "${this.currentShop}";
+const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v3";
+const SOURCE_VERSION = "shopify-pixel-v8";
 const RECENT_EVENT_TTL_MS = 5000;
 const MAX_RECENT_EVENTS = 5000;
 const EVENT_QUEUE_FLUSH_MS = 1000;
-const FETCH_TIMEOUT_MS = 3000;
+const FETCH_TIMEOUT_MS = 8000;
 const KEEPALIVE_LIMIT_BYTES = 60000;
 const MAX_BATCH_EVENTS = 20;
-const MAX_CLIENT_RETRIES = 3;
-const RETRY_BACKOFF_MS = [1000, 5000, 15000];
+const MAX_CLIENT_RETRIES = 32;
+const CLIENT_RETRY_MAX_AGE_MS = 6 * 24 * 60 * 60 * 1000;
+const RETRY_BACKOFF_MS = [1000, 3000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000, 7200000, 14400000, 21600000];
 const STORAGE_QUEUE_KEY = 'capi_gateway_event_queue_v3:' + SHOP_DOMAIN;
-const MAX_STORED_EVENTS = 100;
+const MAX_STORED_EVENTS = 1000;
 const recentEvents = new Map();
 const eventQueue = [];
+var inFlightEvents = [];
 var eventQueueTimer = null;
 var persistedQueueLoaded = false;
+var storageWriteChain = Promise.resolve();
+var flushPromise = null;
 
 async function getCookieValue(name) {
     try {
@@ -361,12 +550,15 @@ async function removeStorageValue(key) {
 }
 
 function moneyAmount(value) {
-    var amount = Number((value && (value.amount || value.value)) || value);
+    var raw = value && typeof value === 'object'
+        ? firstNonEmpty(value.amount, value.value)
+        : value;
+    var amount = Number(raw);
     return Number.isFinite(amount) ? amount : undefined;
 }
 
 function moneyCurrency(value, fallback) {
-    return (value && (value.currencyCode || value.currency)) || fallback || 'USD';
+    return (value && (value.currencyCode || value.currency)) || fallback;
 }
 
 function firstNonEmpty() {
@@ -389,7 +581,9 @@ function lineItemToContent(item) {
     var product = item.product || variant.product || {};
     var quantity = Number(item.quantity || 1);
     var totalPrice = moneyAmount(item.cost && item.cost.totalAmount || item.finalLinePrice);
-    var price = moneyAmount(variant.price || item.cost && item.cost.amountPerQuantity || (totalPrice !== undefined && quantity ? totalPrice / quantity : undefined));
+    var price = totalPrice !== undefined && quantity > 0
+        ? totalPrice / quantity
+        : moneyAmount(item.cost && item.cost.amountPerQuantity || variant.price);
     return {
         id: normalizeShopifyId(variant.id || product.id || item.id),
         quantity: Number.isFinite(quantity) ? quantity : 1,
@@ -513,8 +707,8 @@ function stableHash(value) {
     return (hash >>> 0).toString(16);
 }
 
-function fallbackEventId(eventName, event, currentUrl) {
-    var stablePart = stableHash([
+async function fallbackEventId(eventName, event, currentUrl) {
+    var stableInput = [
         SHOP_DOMAIN,
         event && event.clientId,
         event && event.timestamp,
@@ -522,8 +716,14 @@ function fallbackEventId(eventName, event, currentUrl) {
         event && event.name,
         currentUrl,
         eventName,
-    ].join('|'));
-    return randomId(eventName + '_' + stablePart);
+    ].join('|');
+    var digest = await sha256Hex(stableInput, 'default');
+    if (digest) return eventName + '_' + digest.slice(0, 32);
+    // Two independent deterministic hashes keep fallback IDs stable across
+    // client retries in environments without Web Crypto.
+    var stablePart = stableHash(stableInput);
+    var stablePartReversed = stableHash(stableInput.split('').reverse().join(''));
+    return eventName + '_' + stablePart + stablePartReversed;
 }
 
 function purchaseEventId(checkout, event) {
@@ -541,12 +741,21 @@ function checkoutLineItems(checkout) {
     return Array.isArray(checkout && checkout.lineItems) ? checkout.lineItems : [];
 }
 
-async function getOrCreateFbp() {
-    var existing = await getCookieValue('_fbp');
-    if (existing) return existing;
-    var generated = 'fb.1.' + Date.now() + '.' + Math.floor(Math.random() * 10000000000);
-    await setCookieValue('_fbp', generated);
-    return generated;
+function checkoutValue(checkout) {
+    checkout = checkout || {};
+    return moneyAmount(firstNonEmpty(checkout.totalPrice, checkout.subtotalPrice));
+}
+
+function checkoutCurrency(checkout) {
+    checkout = checkout || {};
+    return moneyCurrency(firstNonEmpty(checkout.totalPrice, checkout.subtotalPrice), checkout.currencyCode);
+}
+
+async function getFbp() {
+    // _fbp identifies a browser that the Meta Pixel has actually observed.
+    // Forward the real first-party cookie when present; inventing one would
+    // create a synthetic match signal and can reduce attribution accuracy.
+    return getCookieValue('_fbp');
 }
 
 async function getOrCreateFbc(href) {
@@ -560,12 +769,10 @@ async function getOrCreateFbc(href) {
     return existing;
 }
 
-async function getOrCreateTtp() {
-    var existing = await getCookieValue('_ttp');
-    if (existing) return existing;
-    var generated = Date.now().toString(36) + Math.random().toString(36).slice(2);
-    await setCookieValue('_ttp', generated);
-    return generated;
+async function getTtp() {
+    // TikTok documents ttp as the first-party cookie used with its Pixel.
+    // Forward a real existing value, but never fabricate a match identifier.
+    return getCookieValue('_ttp');
 }
 
 async function rememberTtclid(href) {
@@ -603,14 +810,17 @@ function getInitData() {
 
 function scheduleEventQueueFlush(delayMs) {
     if (eventQueueTimer) clearTimeout(eventQueueTimer);
-    eventQueueTimer = setTimeout(flushEventQueue, Math.max(0, delayMs || EVENT_QUEUE_FLUSH_MS));
+    eventQueueTimer = setTimeout(function () {
+        eventQueueTimer = null;
+        flushEventQueue();
+    }, Math.max(0, delayMs || EVENT_QUEUE_FLUSH_MS));
 }
 
 function mergeQueuedEvents(events) {
     var merged = [];
     var seen = new Set();
     events.forEach(function (event) {
-        var key = [event.event_name, event.event_id, event.trace_id].join(':');
+        var key = [event.event_name, event.event_id].join(':');
         if (seen.has(key)) return;
         seen.add(key);
         merged.push(event);
@@ -618,18 +828,22 @@ function mergeQueuedEvents(events) {
     return merged;
 }
 
-async function persistEventQueue() {
-    var storable = eventQueue.slice(-MAX_STORED_EVENTS);
-    if (!storable.length) {
-        await removeStorageValue(STORAGE_QUEUE_KEY);
-        return;
-    }
-    await setStorageValue(STORAGE_QUEUE_KEY, JSON.stringify(storable));
+function persistEventQueue() {
+    // Keep unconfirmed in-flight requests in durable browser storage. If the
+    // page closes after the server accepted them, stable event IDs make the
+    // replay harmless; dropping them before acceptance would be irreversible.
+    var storable = mergeQueuedEvents(inFlightEvents.concat(eventQueue)).slice(0, MAX_STORED_EVENTS);
+    storageWriteChain = storageWriteChain.then(function () {
+        if (!storable.length) return removeStorageValue(STORAGE_QUEUE_KEY);
+        return setStorageValue(STORAGE_QUEUE_KEY, JSON.stringify(storable));
+    });
+    return storageWriteChain;
 }
 
 async function loadPersistedEventQueue() {
     if (persistedQueueLoaded) return;
     persistedQueueLoaded = true;
+    await storageWriteChain;
     var stored = await getStorageValue(STORAGE_QUEUE_KEY);
     if (!stored) return;
     try {
@@ -643,7 +857,9 @@ async function loadPersistedEventQueue() {
 }
 
 function enqueueEventPayload(payload) {
-    eventQueue.push(payload);
+    eventQueue.push(Object.assign({
+        _client_first_queued_at: Date.now(),
+    }, payload));
     persistEventQueue();
     if (!eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
 }
@@ -678,16 +894,40 @@ function buildEventBatches(events) {
     return batches;
 }
 
-function requeueFailedEvents(events) {
+function retryAfterMsFromResponse(response) {
+    try {
+        if (!response || !response.headers || !response.headers.get) return 0;
+        var raw = response.headers.get('retry-after');
+        if (!raw) return 0;
+        var numeric = Number(raw);
+        if (Number.isFinite(numeric) && numeric >= 0) return Math.ceil(numeric * 1000);
+        var timestamp = Date.parse(String(raw));
+        return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 0;
+    } catch (error) {
+        return 0;
+    }
+}
+
+function isRetryableResponse(response) {
+    var status = Number(response && response.status);
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function requeueFailedEvents(events, retryAfterMs) {
     var now = Date.now();
     var retryable = events.filter(function (event) {
-        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES;
+        var firstQueuedAt = Number(event._client_first_queued_at || now);
+        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES
+            && now - firstQueuedAt < CLIENT_RETRY_MAX_AGE_MS;
     }).map(function (event) {
         var nextRetryCount = Number(event._client_retry_count || 0) + 1;
-        var delay = RETRY_BACKOFF_MS[Math.min(nextRetryCount - 1, RETRY_BACKOFF_MS.length - 1)] || EVENT_QUEUE_FLUSH_MS;
+        var baseDelay = RETRY_BACKOFF_MS[Math.min(nextRetryCount - 1, RETRY_BACKOFF_MS.length - 1)] || EVENT_QUEUE_FLUSH_MS;
+        var jitter = 0.8 + (Math.random() * 0.4);
+        var delay = Math.max(Number(retryAfterMs || 0), Math.ceil(baseDelay * jitter));
         return Object.assign({}, event, {
             _client_retry_count: nextRetryCount,
             _client_next_attempt_at: now + delay,
+            _client_first_queued_at: Number(event._client_first_queued_at || now),
         });
     });
 
@@ -695,6 +935,15 @@ function requeueFailedEvents(events) {
     Array.prototype.push.apply(eventQueue, retryable);
     persistEventQueue();
     if (!eventQueueTimer) scheduleEventQueueFlush(RETRY_BACKOFF_MS[0]);
+}
+
+function removeInFlightEvents(events) {
+    var keys = new Set(events.map(function (event) {
+        return [event.event_name, event.event_id].join(':');
+    }));
+    inFlightEvents = inFlightEvents.filter(function (event) {
+        return !keys.has([event.event_name, event.event_id].join(':'));
+    });
 }
 
 function requestOptionsForBody(body) {
@@ -717,7 +966,7 @@ function requestOptionsForBody(body) {
     return options;
 }
 
-async function flushEventQueue() {
+async function flushEventQueueOnce() {
     if (eventQueueTimer) {
         clearTimeout(eventQueueTimer);
         eventQueueTimer = null;
@@ -745,6 +994,8 @@ async function flushEventQueue() {
         return;
     }
 
+    inFlightEvents = dueEvents.slice();
+    await persistEventQueue();
     var batches = buildEventBatches(dueEvents);
     for (var index = 0; index < batches.length; index += 1) {
         var batch = batches[index];
@@ -753,8 +1004,19 @@ async function flushEventQueue() {
 
         try {
             var response = await fetch(CAPI_HUB_URL, options);
-            if (response && response.ok === false) requeueFailedEvents(batch);
+            if (response && response.ok === false) {
+                if (isRetryableResponse(response)) {
+                    removeInFlightEvents(batch);
+                    requeueFailedEvents(batch, retryAfterMsFromResponse(response));
+                } else {
+                    removeInFlightEvents(batch);
+                    console.warn('CAPI gateway rejected a non-retryable event batch', response.status);
+                }
+            } else {
+                removeInFlightEvents(batch);
+            }
         } catch (error) {
+            removeInFlightEvents(batch);
             requeueFailedEvents(batch);
         } finally {
             if (options._timeoutId) clearTimeout(options._timeoutId);
@@ -764,6 +1026,15 @@ async function flushEventQueue() {
 
     await persistEventQueue();
     if (eventQueue.length && !eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
+}
+
+function flushEventQueue() {
+    if (flushPromise) return flushPromise;
+    flushPromise = flushEventQueueOnce().finally(function () {
+        flushPromise = null;
+        if (eventQueue.length && !eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
+    });
+    return flushPromise;
 }
 
 async function sendGatewayEvent(metaEventName, event, customData, forcedEventId) {
@@ -783,12 +1054,12 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
     var shippingAddress = checkout.shippingAddress || {};
     var address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
     var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer || fallbackDocumentInfo.URL || fallbackDocumentInfo.referrer;
-    var eventId = String(eventIdFrom(forcedEventId) || event.id || fallbackEventId(metaEventName, event, currentUrl));
+    var eventId = String(eventIdFrom(forcedEventId) || event.id || await fallbackEventId(metaEventName, event, currentUrl));
     if (!shouldSendRecentEvent(metaEventName, eventId)) return;
 
-    var fbp = await getOrCreateFbp();
+    var fbp = await getFbp();
     var fbc = await getOrCreateFbc(currentUrl);
-    var ttp = await getOrCreateTtp();
+    var ttp = await getTtp();
     var ttclid = await rememberTtclid(currentUrl);
     var shopifyY = await getCookieValue('_shopify_y');
     var shopifyS = await getCookieValue('_shopify_s');
@@ -818,7 +1089,8 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
     var traceId = randomId('trace');
 
     enqueueEventPayload(compact({
-            shop_domain: SHOP_DOMAIN,
+        shop_domain: SHOP_DOMAIN,
+        ingest_token: SHOP_INGEST_TOKEN,
             tenant_id: SHOP_DOMAIN,
             schema_version: SCHEMA_VERSION,
             source_version: SOURCE_VERSION,
@@ -869,14 +1141,14 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
 }
 
 analytics.subscribe('page_viewed', function (event) {
-    sendGatewayEvent('PageView', event);
+    return sendGatewayEvent('PageView', event);
 });
 
 analytics.subscribe('cart_viewed', function (event) {
     var cart = event.data && event.data.cart || {};
     var lines = cart.lines || cart.cartLines || [];
     var contents = lines.map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('CartView', event, {
+    return sendGatewayEvent('CartView', event, {
         value: moneyAmount(cart.cost && cart.cost.totalAmount),
         currency: moneyCurrency(cart.cost && cart.cost.totalAmount),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -888,7 +1160,7 @@ analytics.subscribe('cart_viewed', function (event) {
 
 analytics.subscribe('collection_viewed', function (event) {
     var collection = event.data && event.data.collection || {};
-    sendGatewayEvent('CollectionView', event, {
+    return sendGatewayEvent('CollectionView', event, {
         content_category: collection.title,
         content_name: collection.title,
     });
@@ -898,7 +1170,7 @@ analytics.subscribe('product_viewed', function (event) {
     var variant = event.data && event.data.productVariant || {};
     var product = event.data && event.data.product || variant.product || {};
     var contentId = normalizeShopifyId(variant.id || product.id);
-    sendGatewayEvent('ViewContent', event, {
+    return sendGatewayEvent('ViewContent', event, {
         value: moneyAmount(variant.price),
         currency: moneyCurrency(variant.price),
         content_ids: contentId ? [contentId] : undefined,
@@ -911,12 +1183,16 @@ analytics.subscribe('product_viewed', function (event) {
 analytics.subscribe('product_added_to_cart', function (event) {
     var line = event.data && event.data.cartLine || {};
     var content = lineItemToContent(line);
-    sendGatewayEvent('AddToCart', event, {
+    var variant = line.merchandise || line.variant || {};
+    var product = variant.product || line.product || {};
+    return sendGatewayEvent('AddToCart', event, {
         value: moneyAmount(line.cost && line.cost.totalAmount),
         currency: moneyCurrency(line.cost && line.cost.totalAmount),
         content_ids: content.id ? [content.id] : undefined,
         contents: content.id ? [content] : undefined,
         content_type: 'product',
+        content_name: product.title || variant.title,
+        content_category: product.type,
         num_items: content.quantity,
     });
 });
@@ -924,7 +1200,7 @@ analytics.subscribe('product_added_to_cart', function (event) {
 analytics.subscribe('product_removed_from_cart', function (event) {
     var line = event.data && event.data.cartLine || {};
     var content = lineItemToContent(line);
-    sendGatewayEvent('RemoveFromCart', event, {
+    return sendGatewayEvent('RemoveFromCart', event, {
         value: moneyAmount(line.cost && line.cost.totalAmount),
         currency: moneyCurrency(line.cost && line.cost.totalAmount),
         content_ids: content.id ? [content.id] : undefined,
@@ -937,9 +1213,9 @@ analytics.subscribe('product_removed_from_cart', function (event) {
 analytics.subscribe('checkout_started', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('InitiateCheckout', event, {
-        value: moneyAmount(checkout.totalPrice),
-        currency: moneyCurrency(checkout.totalPrice),
+    return sendGatewayEvent('InitiateCheckout', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
@@ -950,9 +1226,9 @@ analytics.subscribe('checkout_started', function (event) {
 analytics.subscribe('checkout_contact_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('CheckoutContactInfoSubmitted', event, {
-        value: moneyAmount(checkout.totalPrice),
-        currency: moneyCurrency(checkout.totalPrice),
+    return sendGatewayEvent('CheckoutContactInfoSubmitted', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
@@ -963,9 +1239,9 @@ analytics.subscribe('checkout_contact_info_submitted', function (event) {
 analytics.subscribe('checkout_address_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('CheckoutAddressInfoSubmitted', event, {
-        value: moneyAmount(checkout.totalPrice),
-        currency: moneyCurrency(checkout.totalPrice),
+    return sendGatewayEvent('CheckoutAddressInfoSubmitted', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
@@ -976,9 +1252,9 @@ analytics.subscribe('checkout_address_info_submitted', function (event) {
 analytics.subscribe('checkout_shipping_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('CheckoutShippingInfoSubmitted', event, {
-        value: moneyAmount(checkout.totalPrice),
-        currency: moneyCurrency(checkout.totalPrice),
+    return sendGatewayEvent('CheckoutShippingInfoSubmitted', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
@@ -989,9 +1265,9 @@ analytics.subscribe('checkout_shipping_info_submitted', function (event) {
 analytics.subscribe('payment_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('AddPaymentInfo', event, {
-        value: moneyAmount(checkout.totalPrice),
-        currency: moneyCurrency(checkout.totalPrice),
+    return sendGatewayEvent('AddPaymentInfo', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
@@ -1002,9 +1278,9 @@ analytics.subscribe('payment_info_submitted', function (event) {
 analytics.subscribe('checkout_completed', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    sendGatewayEvent('Purchase', event, {
-        value: moneyAmount(checkout.totalPrice),
-        currency: moneyCurrency(checkout.totalPrice),
+    return sendGatewayEvent('Purchase', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
@@ -1015,12 +1291,12 @@ analytics.subscribe('checkout_completed', function (event) {
 
 analytics.subscribe('search_submitted', function (event) {
     var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
-    sendGatewayEvent('Search', event, { search_string: query });
+    return sendGatewayEvent('Search', event, { search_string: query });
 });
 
 analytics.subscribe('alert_displayed', function (event) {
     var alert = event.data && event.data.alert || {};
-    sendGatewayEvent('ShopifyAlertDisplayed', event, {
+    return sendGatewayEvent('ShopifyAlertDisplayed', event, {
         content_name: alert.message || alert.type,
         content_category: 'shopify_alert',
     });
@@ -1028,7 +1304,7 @@ analytics.subscribe('alert_displayed', function (event) {
 
 analytics.subscribe('ui_extension_errored', function (event) {
     var error = event.data && event.data.error || {};
-    sendGatewayEvent('ShopifyUiExtensionErrored', event, {
+    return sendGatewayEvent('ShopifyUiExtensionErrored', event, {
         content_name: error.message || error.name,
         content_category: 'shopify_ui_extension',
     });
@@ -1065,10 +1341,17 @@ analytics.subscribe('ui_extension_errored', function (event) {
                         }
                     }
                     if (!response.ok) {
-                        const message = payload.error || payload.message || response.statusText || 'Request failed';
+                        const message = payload.error || payload.message || response.statusText || '请求失败';
                         throw new Error(`${response.status} ${message}`);
                     }
                     return payload;
+                },
+                formatDuration(seconds) {
+                    const total = Math.max(0, Number(seconds || 0));
+                    if (total < 60) return `${Math.round(total)}s`;
+                    if (total < 3600) return `${Math.round(total / 60)}m`;
+                    if (total < 86400) return `${(total / 3600).toFixed(1)}h`;
+                    return `${(total / 86400).toFixed(1)}d`;
                 },
                 async fetchAll() {
                     await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchDlq(), this.fetchSummary()]);
@@ -1085,7 +1368,7 @@ analytics.subscribe('ui_extension_errored', function (event) {
                 async fetchDlq() { this.dlq = await this.api(this.shopScopedPath('/api/admin/dlq')); },
                 async fetchSummary() { this.summary = await this.api(this.shopScopedPath('/api/admin/summary')); },
                 async replayDlq() {
-                    if (!confirm('Replay all visible failed events?')) return;
+                    if (!confirm('确认重放当前列表中的全部失败事件？成功路由不会重复发送。')) return;
                     await this.runAction('replayDlq', async () => {
                         const result = await this.api('/api/admin/dlq/replay', {
                             method: 'POST',
@@ -1094,23 +1377,23 @@ analytics.subscribe('ui_extension_errored', function (event) {
                         });
                         await this.fetchAll();
                         return result;
-                    }, 'DLQ replay submitted.');
+                    }, '死信重放任务已提交。');
                 },
                 async refreshMetaQuality() {
                     await this.runAction('metaQuality', async () => {
                         const result = await this.api(this.shopScopedPath('/api/admin/meta-quality/refresh'), { method: 'POST' });
                         await this.fetchSummary();
                         return result;
-                    }, 'Meta official quality refresh requested.');
+                    }, '已请求刷新 Meta 官方质量数据。');
                 },
                 async clearLogs() {
-                    const scope = this.selectedShopId ? 'selected shop' : 'all shops';
-                    if (!confirm(`Clear event logs, queued jobs, and dedupe cache for ${scope}? Dead letters will not be deleted.`)) return;
+                    const scope = this.selectedShopId ? '所选店铺' : '全部店铺';
+                    if (!confirm(`确认清除${scope}的事件日志和队列任务？死信记录不会被删除。`)) return;
                     await this.runAction('clearLogs', async () => {
                         const result = await this.api(this.shopScopedPath('/api/admin/logs'), { method: 'DELETE' });
                         await this.fetchOperationalData();
                         return result;
-                    }, 'Event logs cleared.');
+                    }, '事件日志已清除。');
                 },
                 async addShop() {
                     await this.runAction('addShop', async () => {
@@ -1121,18 +1404,20 @@ analytics.subscribe('ui_extension_errored', function (event) {
                         });
                         this.newShop = { shop_domain: '', app_secret: '' };
                         await this.fetchShops();
-                    }, 'Shop saved.');
+                    }, '店铺已保存。');
                 },
                 async addPixel() {
                     await this.runAction('addPixel', async () => {
+                        const shopIds = this.newPixel.shop_ids.map(Number).filter(Number.isInteger);
+                        if (!shopIds.length) throw new Error('请至少选择一个店铺');
                         await this.api('/api/admin/pixels', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(this.newPixel),
+                            body: JSON.stringify({ ...this.newPixel, shop_id: shopIds[0], shop_ids: shopIds }),
                         });
-                        this.newPixel = { shop_id: '', platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' };
+                        this.newPixel = { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' };
                         await Promise.all([this.fetchPixels(), this.fetchSummary()]);
-                    }, 'Pixel route saved.');
+                    }, 'Pixel 路由已保存。');
                 },
                 applyDeployShop() {
                     const shopId = Number(this.deployShopId);
@@ -1143,23 +1428,44 @@ analytics.subscribe('ui_extension_errored', function (event) {
                 },
                 async copyCode() {
                     await navigator.clipboard.writeText(this.generatedCode);
-                    this.setNotice('success', 'Tracking code copied.');
+                    this.setNotice('success', '跟踪代码已复制到剪贴板。');
                 },
                 async deletePixel(id) {
-                    if (!confirm('Delete this Pixel route?')) return;
+                    if (!confirm('确认删除这个 Pixel 凭据及其全部店铺路由？')) return;
                     await this.runAction('deletePixel', async () => {
                         await this.api('/api/admin/pixels/' + id, { method: 'DELETE' });
                         await Promise.all([this.fetchPixels(), this.fetchSummary()]);
-                    }, 'Pixel route deleted.');
+                    }, 'Pixel 路由已删除。');
+                },
+                async editPixelRoutes(pixel) {
+                    const current = (pixel.routes || []).map(route => route.shop_domain).join(', ');
+                    const value = prompt('请输入此 Pixel 绑定的店铺域名，多个域名使用英文逗号分隔：', current);
+                    if (value === null) return;
+                    const domains = value.split(',').map(item => item.trim().toLowerCase()).filter(Boolean);
+                    const shopIds = this.shops
+                        .filter(shop => domains.includes(String(shop.shop_domain).toLowerCase()))
+                        .map(shop => Number(shop.id));
+                    if (shopIds.length !== new Set(domains).size) {
+                        this.setNotice('error', '一个或多个店铺域名不存在。');
+                        return;
+                    }
+                    await this.runAction('editPixelRoutes', async () => {
+                        await this.api('/api/admin/pixels/' + pixel.id + '/routes', {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ shop_ids: shopIds }),
+                        });
+                        await Promise.all([this.fetchPixels(), this.fetchSummary()]);
+                    }, 'Pixel 店铺绑定已更新。');
                 },
                 async deleteShop(shop) {
-                    if (!confirm(`Delete shop ${shop.shop_domain}? Pixel routes and event logs for this shop will also be deleted.`)) return;
+                    if (!confirm(`确认删除店铺 ${shop.shop_domain}？该店铺的 Pixel 路由和事件日志也会被删除。`)) return;
                     await this.runAction('deleteShop', async () => {
                         await this.api('/api/admin/shops/' + shop.id, { method: 'DELETE' });
                         if (String(this.selectedShopId) === String(shop.id)) this.selectedShopId = '';
                         if (String(this.deployShopId) === String(shop.id)) this.deployShopId = '';
                         await this.fetchAll();
-                    }, 'Shop deleted.');
+                    }, '店铺已删除。');
                 },
                 formatTime(value) {
                     return value ? new Date(value).toLocaleString() : '-';
@@ -1167,13 +1473,14 @@ analytics.subscribe('ui_extension_errored', function (event) {
                 statusClass(status) {
                     return {
                         SUCCESS: 'text-emerald-600',
+                        AWAITING_PAYMENT: 'text-sky-600',
                         PENDING: 'text-amber-600',
                         FAILED: 'text-red-600',
                         PARTIAL_FAILED: 'text-orange-600',
                     }[status] || 'text-slate-700';
                 },
                 summarizeResponse(value) {
-                    if (!value) return 'Waiting';
+                    if (!value) return '等待处理';
                     const deliveries = value.deliveries || [];
                     if (deliveries.length) return deliveries.map(item => `${item.pixel_id}:${item.status}`).join(', ');
                     return value.fbtrace_id || JSON.stringify(value).slice(0, 120);

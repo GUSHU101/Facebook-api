@@ -2,9 +2,9 @@
 # Purpose: use HTTPS on a non-443 public port, for example 8443.
 #
 # Replace these placeholders before using:
-#   __DOMAIN__        -> nestworks.com.au
-#   __PROJECT_DIR__   -> /www/wwwroot/Facebook-api-main
-#   __BT_SITE_NAME__  -> Facebook_api_main
+#   __DOMAIN__        -> capi.example.com
+#   __PROJECT_DIR__   -> /www/wwwroot/capi-saas
+#   __BT_SITE_NAME__  -> capi_example_com
 #   __PUBLIC_PORT__   -> 8443
 #   __INTERNAL_PORT__ -> 3000
 #
@@ -39,6 +39,7 @@ server
 {
     listen __PUBLIC_PORT__ ssl http2;
     server_name __DOMAIN__;
+    server_tokens off;
     index index.html index.htm default.htm default.html;
 
     include /www/server/panel/vhost/nginx/extension/__BT_SITE_NAME__/*.conf;
@@ -51,7 +52,7 @@ server
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    client_max_body_size 10m;
+    client_max_body_size 2m;
 
     location ~* (\.user.ini|\.htaccess|\.htpasswd|\.env.*|\.project|\.bashrc|\.bash_profile|\.bash_logout|\.DS_Store|\.gitignore|\.gitattributes|LICENSE|README\.md|CLAUDE\.md|CHANGELOG\.md|CHANGELOG|CONTRIBUTING\.md|TODO\.md|FAQ\.md|composer\.json|composer\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.\w+~|\.swp|\.swo|\.bak(up)?|\.old|\.tmp|\.temp|\.log|\.sql(\.gz)?|docker-compose\.yml|docker\.env|Dockerfile)$
     {
@@ -77,12 +78,11 @@ server
         proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header X-Forwarded-Port __PUBLIC_PORT__;
 
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection "";
 
-        proxy_connect_timeout 30s;
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 30s;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 35s;
+        proxy_send_timeout 35s;
     }
 
     access_log  /www/wwwlogs/__BT_SITE_NAME__.log;

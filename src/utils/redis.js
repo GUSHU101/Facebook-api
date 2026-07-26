@@ -1,9 +1,33 @@
 const Redis = require('ioredis');
 const config = require('../config');
 
-const redis = new Redis(config.redisUrl, {
+function createConnection(overrides = {}) {
+    const connection = new Redis(config.redisUrl, {
+        enableReadyCheck: true,
+        connectTimeout: 10000,
+        keepAlive: 10000,
+        retryStrategy: times => Math.min(50 * times, 2000),
+        ...overrides,
+    });
+    connection.on('error', error => {
+        console.error('Redis error:', error);
+    });
+    return connection;
+}
+
+// HTTP ingestion and distributed-lock commands must fail promptly during a
+// partition. PostgreSQL is the durable outbox, so waiting indefinitely here
+// only accumulates requests and memory without improving durability.
+const redis = createConnection({
+    maxRetriesPerRequest: 1,
+    enableOfflineQueue: false,
+    commandTimeout: 5000,
+});
+
+redis.createBullMqWorkerConnection = () => createConnection({
+    // BullMQ workers use blocking commands and are expected to keep reconnecting.
     maxRetriesPerRequest: null,
-    enableReadyCheck: false,
+    enableOfflineQueue: true,
 });
 
 redis.defineCommand('safePopAndTransfer', {
@@ -50,10 +74,6 @@ redis.defineCommand('completeProcessing', {
         redis.call('DEL', processingKey)
         return #ARGV
     `,
-});
-
-redis.on('error', error => {
-    console.error('Redis error:', error);
 });
 
 module.exports = redis;
