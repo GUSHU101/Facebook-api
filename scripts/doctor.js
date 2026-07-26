@@ -6,16 +6,18 @@ const config = require('../src/config');
 const { credentialFingerprint, decryptTokenIfPossible } = require('../src/utils/crypto');
 
 const checks = [];
-const runtimeTables = ['shops', 'pixels', 'shop_pixel_routes', 'event_store', 'shopify_webhook_inbox', 'shopify_reconcile_state', 'event_id_aliases', 'event_deliveries', 'dead_letters'];
+const runtimeTables = ['shops', 'pixels', 'shop_pixel_routes', 'event_store', 'shopify_webhook_inbox', 'shopify_privacy_inbox', 'shopify_reconcile_state', 'event_id_aliases', 'event_deliveries', 'dead_letters', 'meta_quality_snapshots'];
 const runtimeSequences = [
     'shops_id_seq',
     'pixels_id_seq',
     'shop_pixel_routes_id_seq',
     'event_store_id_seq',
     'shopify_webhook_inbox_id_seq',
+    'shopify_privacy_inbox_id_seq',
     'event_id_aliases_id_seq',
     'event_deliveries_id_seq',
     'dead_letters_id_seq',
+    'meta_quality_snapshots_id_seq',
 ];
 
 async function check(name, fn) {
@@ -85,6 +87,9 @@ async function main() {
             ['event_store', 'fb_response'],
             ['shopify_webhook_inbox', 'webhook_id'],
             ['shopify_webhook_inbox', 'status'],
+            ['shopify_privacy_inbox', 'shop_domain_hash'],
+            ['shopify_privacy_inbox', 'payload_digest'],
+            ['shopify_privacy_inbox', 'status'],
             ['shopify_reconcile_state', 'last_successful_at'],
             ['shopify_reconcile_state', 'after_cursor'],
             ['event_id_aliases', 'canonical_event_id'],
@@ -231,6 +236,25 @@ async function main() {
         return 'configured reconciliation jobs have no recorded GraphQL errors';
     });
 
+    await check('Shopify privacy inbox', async () => {
+        const { rows: [result] } = await pool.query(
+            `SELECT
+                 COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT')::int AS permanent_failed,
+                 COUNT(*) FILTER (WHERE status = 'ACTION_REQUIRED')::int AS action_required,
+                 COUNT(*) FILTER (
+                     WHERE status = 'PROCESSING' AND lease_expires_at < NOW()
+                 )::int AS expired_leases,
+                 COUNT(*) FILTER (
+                     WHERE status IN ('PENDING', 'RETRYABLE_FAILED') AND next_attempt_at <= NOW()
+                 )::int AS due
+             FROM shopify_privacy_inbox`,
+        );
+        if (Number(result.permanent_failed) > 0) {
+            throw new Error(`${result.permanent_failed} privacy webhooks failed permanently and require immediate investigation`);
+        }
+        return `${result.action_required} data requests require action; ${result.due} jobs due; ${result.expired_leases} expired leases reclaimable`;
+    });
+
     await check('event aggregate consistency', async () => {
         const { rows: [result] } = await pool.query(
             `WITH delivery_summary AS (
@@ -297,12 +321,16 @@ async function main() {
     await check('postgres scale indexes', async () => {
         const required = [
             'idx_event_store_pending_shop_time',
-            'idx_event_store_terminal_retention',
+            'idx_event_store_retention_all_terminal',
             'idx_event_store_timestamp_brin',
             'idx_event_id_aliases_updated',
             'idx_dead_letters_failed_at',
             'idx_meta_quality_snapshots_retention',
             'idx_shopify_webhook_inbox_due',
+            'idx_shopify_webhook_inbox_retention',
+            'idx_shopify_privacy_inbox_due',
+            'idx_shopify_privacy_inbox_action',
+            'idx_shopify_privacy_inbox_retention',
             'idx_pixels_platform_external_id',
             'idx_pixels_credential_scope',
         ];
@@ -371,6 +399,22 @@ async function main() {
             throw new Error('autovacuum must be enabled for bounded-retention tables');
         }
         return 'enabled';
+    });
+
+    await check('storage footprint', async () => {
+        const { rows: [result] } = await pool.query(
+            `SELECT pg_size_pretty(pg_database_size(current_database())) AS database_size,
+                    pg_size_pretty(
+                        pg_total_relation_size('event_store'::regclass)
+                        + pg_total_relation_size('event_deliveries'::regclass)
+                        + pg_total_relation_size('event_id_aliases'::regclass)
+                    ) AS event_ledger_size,
+                    pg_size_pretty(
+                        pg_total_relation_size('shopify_webhook_inbox'::regclass)
+                        + pg_total_relation_size('shopify_privacy_inbox'::regclass)
+                    ) AS webhook_inbox_size`,
+        );
+        return `database ${result.database_size}; event ledger ${result.event_ledger_size}; webhook inbox ${result.webhook_inbox_size}`;
     });
 
     await check('postgres privileges', async () => {

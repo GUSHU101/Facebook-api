@@ -2,6 +2,8 @@
 
 这是一个部署在私有 VPS 上的 Shopify Customer Events 数据中枢，用于将店铺事件可靠地发送到 Meta Conversions API 和 TikTok Events API。
 
+本项目按“独立服务端 + Shopify 自建未上架应用 + Shopify 客户事件自定义像素”设计，不包含 App Store 上架、OAuth 安装页或主题脚本注入：自建应用只提供订单 Webhook、Admin API Token 和 Client Secret；浏览器事件来自店铺后台 `Settings → Customer events` 中粘贴的生成代码。
+
 管理后台使用仓库内固定版本的 Tailwind CSS 和 Vue 浏览器资源，不依赖运行时 CDN。修改后台 HTML/CSS 或升级 Vue 后，请运行：
 
 ```bash
@@ -91,10 +93,11 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - 手动重放死信先使用同一套事务合并规则吸收载荷，只重置当前启用且永久失败的路由；成功路由保持不可变，停用路由保持停用，未确认付款的 Purchase 也不能通过重放绕过付款门禁。
 - 共享凭证使用可续期的分布式投递租约和逐次尝试隔离。过期 Worker 不能覆盖较新的尝试，共用凭证的多个店铺也不会并发冲击同一个平台凭证。
 - Meta 响应头 `Retry-After`、`X-Business-Use-Case-Usage`、`X-App-Usage`、`X-Ad-Account-Usage` 会形成持久化的凭证冷却。使用率过高时会提前减缓后续发送，收到 429 后会暂停所有共用该凭证的店铺。
-- 店铺采集 Token 是嵌入 Shopify 自定义像素的公开路由凭据，不等同于用户身份认证。默认启用较宽松的店铺/IP 限流（`PIXEL_RATE_LIMIT_PER_MINUTE=600`），浏览器会对 `429` 使用稳定事件 ID 重试；如果前置 CDN/WAF 已提供可靠的分布式限流，可显式设为 `0`。
+- 店铺采集 Token 是嵌入 Shopify 自定义像素的公开路由凭据，不等同于用户身份认证。默认启用较宽松的店铺/IP 限流（`PIXEL_RATE_LIMIT_PER_MINUTE=600`，按实际批次事件数计费）：多 API 实例通过 Redis 共用计数，Redis 故障时自动降级为进程内限流；浏览器会对 `429` 使用稳定事件 ID 重试。只有前置 CDN/WAF 已提供可靠限流时才应显式设为 `0`。
+- Shopify 客户事件代码运行在沙箱中，网络请求的浏览器 Origin 不应被假定为店铺自定义域名。采集接口本身不使用 Cookie 凭据，建议保持 `CORS_ORIGIN=*`；安全边界由店铺采集 Token、服务端店铺查找、批次同租户验证、限流和数据库路由共同提供。管理接口没有启用 CORS。
 - Shopify `orders/paid` 在 HMAC 验证后先持久化到 PostgreSQL 收件箱并立即确认，随后通过租约、指数退避和定时扫描生成 Purchase；外部平台或 Redis 短暂故障不会阻塞 Shopify 的确认窗口。
 - webhook 原始 JSON 会以大整数安全模式重新解析，Shopify 64 位订单、商品和变体 ID 不会先被 JavaScript 浮点数改写末位数字。
-- 店铺可选保存具备 `read_orders` 的 Admin API Token。系统按 Shopify 官方 `orders` 查询的 `updated_at`、`financial_status:paid` 过滤器分页对账，并通过持久游标处理超大店铺；对账订单仍进入同一收件箱和 Purchase 去重事务。
+- 店铺可选保存具备 `read_orders` 的 Admin API Token。系统按 Shopify 官方 `orders` 查询的 `updated_at`、`financial_status:paid` 过滤器分页对账，并通过持久游标处理超大店铺；失效游标会在同一冻结时间窗口内安全重扫一次，对账订单仍进入同一收件箱和 Purchase 去重事务。
 - 平台回写以内部 `event_store.id` 为准，公开 `event_id` 只承担平台去重；即使不同事件名称偶然复用同一个公开 ID，也不会互相覆盖投递状态。
 - 相同平台访问令牌会映射到同一分布式凭据作用域，共享租约、请求节奏和冷却状态；作用域与冷却同时保存在 PostgreSQL，Redis 或进程重启后也不会让多个店铺/像素立即同时冲击同一平台额度。
 - 如果不同 Token 仍属于同一 Meta App、Business Use Case 或其他共享平台额度，可在后台填写相同“平台限流组”；系统会让这些 Token 共用租约、节奏和冷却。不同业务额度必须使用不同组名，避免无关像素互相限速。
@@ -107,6 +110,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - `WORKER_EVENT_BATCH_SIZE` 限制繁忙店铺或共享凭证单次占用 Worker 的时间。成功批次会持续创建后续任务直至数据库积压清空，救援游标会轮换店铺，避免大店铺饿死小店铺。
 - 只有 Purchase 使用咨询锁别名注册表；其他事件直接使用 `(shop_id, event_name, event_id)` 唯一索引，避免不必要的锁和别名表增长。
 - 每小时的有界清理只删除旧终态事件、超过 `EVENT_RETENTION_DAYS` 仍未付款的候选以及过期诊断数据，永远不会删除等待投递的 `PENDING`。这样既保留付款确认窗口，也不会让永久未付款候选无限占用数据库。规模化索引通过 `CREATE INDEX CONCURRENTLY` 在线创建。
+- 后台同时显示数据库总量、事件账本和 Webhook 收件箱占用。`PENDING` 不会为节省空间而被静默删除，因此必须结合“数据库积压、最老待处理、无路由待处理”和磁盘监控提前扩容或修复路由；这是保证流量高峰不丢事件的必要运维边界。
 - PostgreSQL 健康但 Redis 暂时不可用时，`/readyz` 返回 HTTP 200 和 `status=degraded`。持久采集继续工作，Redis 恢复后恢复投递。
 - PostgreSQL 账本协调任务会修复“所有逐路由投递已终结、但父事件汇总尚未更新”这一狭窄崩溃窗口。它使用事务咨询锁和有界 `SKIP LOCKED` 批次，多 API 实例不会竞争或无限扫描积压。
 - 重复付款 webhook 只能解锁 `AWAITING_PAYMENT` Purchase，不能复活 `SUCCESS`、`FAILED` 或 `PARTIAL_FAILED`，也不能重发已成功路由。
@@ -273,6 +277,10 @@ npm run doctor
    ```
 
    在该 webhook 到达前，Purchase 会保持 `AWAITING_PAYMENT`。Shopify 会重试失败的 webhook 投递，浏览器候选会保存归因和 checkout 标识，供后续合并。
+
+   后台店铺表单中的 `Webhook Secret` 填该店铺自建应用的 Client Secret；`Admin API Token` 填同一应用安装后生成、具备 `read_orders` 的访问令牌。若多个店铺实际使用同一个自建应用，可选在服务端 `.env` 填一次 `SHOPIFY_APP_SECRET` 作为共享验签密钥；每店分别创建应用时保持为空，并在每个店铺记录中保存各自 Secret。
+
+   如果你还为自建应用注册了 Shopify 隐私主题，可分别指向 `/api/webhook/customers/data_request`、`/api/webhook/customers/redact`、`/api/webhook/shop/redact`。删除请求自动清理匹配数据；数据访问请求会在后台“Shopify 隐私请求”中生成最小化 JSON 报告，安全交付后必须点击“确认已交付”以清除暂存内容。
 
 10. 在 Meta Events Manager 中验证：
     - 服务端事件来自正确的平台路由。

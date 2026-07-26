@@ -299,6 +299,7 @@ test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product
     assert.equal(payload.ttclid, 'tt-click-1');
     assert.equal(payload.client_id, 'shopify-y-cookie');
     assert.equal(payload.checkout_token, 'checkout-token-1');
+    assert.equal(payload._shopify_order_id, '987');
     assert.equal(payload.shopify_y, 'shopify-y-cookie');
     assert.equal(payload.external_id, '12345');
     assert.deepEqual(payload.content_ids, ['111', '222']);
@@ -488,6 +489,7 @@ test('private event fields are removed before Meta CAPI send', () => {
         _duplicate_candidate: true,
         _quality: { missing_match_signals: ['fbc'] },
         _received_at: 123,
+        _shopify_order_id: '987',
     }), {
         event_name: 'Purchase',
         event_id: 'evt-1',
@@ -826,7 +828,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(schema, /ALTER TABLE event_store SET \([\s\S]*?autovacuum_vacuum_scale_factor = 0\.02/);
     assert.match(scaleIndexes, /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_store_pending_shop_time/);
     assert.match(scaleIndexes, /WHERE status = 'PENDING'/);
-    assert.match(scaleIndexes, /idx_event_store_terminal_retention/);
+    assert.match(scaleIndexes, /idx_event_store_retention_all_terminal/);
     assert.match(scaleIndexes, /CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_pixels_platform_external_id[\s\S]*?ON pixels\(platform, pixel_id\)/);
     assert.match(scaleIndexes, /idx_pixels_credential_scope/);
     assert.match(workerSource, /ed\.attempt_count = c\.attempt_count/);
@@ -899,12 +901,28 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(migrateSource, /DROP INDEX CONCURRENTLY IF EXISTS/);
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_webhook_inbox/);
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_reconcile_state/);
+    assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_privacy_inbox/);
+    assert.match(schema, /UNIQUE \(shop_domain_hash, webhook_id\)/);
+    assert.match(scaleIndexes, /idx_shopify_privacy_inbox_due/);
+    assert.match(scaleIndexes, /idx_shopify_privacy_inbox_action/);
+    assert.match(scaleIndexes, /idx_shopify_webhook_inbox_retention/);
+    assert.match(scaleIndexes, /idx_shopify_privacy_inbox_retention/);
     assert.match(serverSource, /INSERT INTO shopify_webhook_inbox/);
     assert.match(serverSource, /financial_status:paid/);
     assert.match(serverSource, /shopify_reconcile_state/);
     assert.match(serverSource, /FOR UPDATE SKIP LOCKED/);
     assert.match(serverSource, /res\.status\(200\)\.json\(\{ success: true, accepted: true, durable: true/);
     assert.match(serverSource, /setImmediate\(\(\) => void drainShopifyWebhookInbox/);
+    assert.match(serverSource, /app\.post\('\/api\/webhook\/customers\/data_request'/);
+    assert.match(serverSource, /app\.post\('\/api\/webhook\/customers\/redact'/);
+    assert.match(serverSource, /app\.post\('\/api\/webhook\/shop\/redact'/);
+    assert.match(serverSource, /return res\.status\(401\)\.send\('HMAC Failed'\)/);
+    assert.match(serverSource, /\$2 <> '' AND/);
+    assert.match(serverSource, /payload = NULL,[\s\S]*?result = NULL,[\s\S]*?shop_domain = NULL/);
+    assert.match(serverSource, /DISTRIBUTED_RATE_LIMIT_SCRIPT/);
+    assert.match(serverSource, /rate:pixel:\$\{digest\}/);
+    assert.match(serverSource, /Recovered invalid cursor/);
+    assert.match(serverSource, /for \(const task of scheduledTasks\) task\.stop\(\)/);
 });
 
 test('runtime config rejects weak encryption keys and malformed CORS origins', () => {
@@ -1478,6 +1496,8 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(installer, /Creating a pre-upgrade database and environment backup/);
     assert.match(installer, /DB_PASSWORD is required when FORCE_ENV_REWRITE=1/);
     assert.match(installer, /AES_SECRET_KEY is required when FORCE_ENV_REWRITE=1/);
+    assert.match(installer, /SHOPIFY_APP_SECRET="\$\{SHOPIFY_APP_SECRET:-\}"/);
+    assert.match(installer, /SHOPIFY_PRIVACY_RETENTION_DAYS=30/);
     assert.match(installer, /verify_runtime\(\)/);
     assert.match(installer, /\/healthz/);
     assert.match(installer, /\/readyz/);
