@@ -75,6 +75,8 @@ jobs:
 
       - name: Unit tests
         run: npm test
+        env:
+          RUN_INTEGRATION_TESTS: "1"
 
       - name: Audit dependencies
         run: npm audit --omit=dev --audit-level=moderate

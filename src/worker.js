@@ -11,12 +11,13 @@ const redis = require('./utils/redis');
 const workerRedis = redis.createBullMqWorkerConnection();
 const { credentialFingerprint, decryptTokenIfPossible } = require('./utils/crypto');
 const { stripPrivateFields } = require('./events/common');
-const { prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
+const { isolateMetaBatch, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const {
     classifyFacebookError,
     classifyTikTokError,
     metaRateControlFromHeaders,
     retryDelayWithJitterSeconds,
+    shouldIsolateFacebookError,
 } = require('./platforms/rate-control');
 const { buildTikTokPayload } = require('./platforms/tiktok');
 
@@ -57,18 +58,51 @@ const DELIVERY_LEASE_SECONDS = Math.max(
 );
 
 async function ensureDeliveryLedger(shopId, eventIds) {
-    await pool.query(
-        `INSERT INTO event_deliveries (event_store_id, route_id)
-         SELECT e.id, r.id
-         FROM event_store e
-         JOIN shop_pixel_routes r
-           ON r.shop_id = e.shop_id
-          AND r.status = 'active'
-         WHERE e.shop_id = $1
-           AND e.id = ANY($2::bigint[])
-         ON CONFLICT (event_store_id, route_id) DO NOTHING`,
-        [shopId, eventIds],
-    );
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query(
+            'SELECT pg_advisory_xact_lock(hashtext($1))',
+            [`delivery-routes:${shopId}`],
+        );
+        await client.query(
+            `WITH active_routes AS (
+                 SELECT ARRAY_AGG(route.id ORDER BY route.id)::bigint[] AS route_ids
+                 FROM shop_pixel_routes route
+                 JOIN pixels pixel ON pixel.id = route.pixel_id
+                 WHERE route.shop_id = $1
+                   AND route.status = 'active'
+                   AND pixel.status = 'active'
+             )
+             UPDATE event_store event
+             SET delivery_route_snapshot = active_routes.route_ids
+             FROM active_routes
+             WHERE event.shop_id = $1
+               AND event.id = ANY($2::bigint[])
+               AND event.delivery_route_snapshot IS NULL
+               AND CARDINALITY(active_routes.route_ids) > 0`,
+            [shopId, eventIds],
+        );
+        await client.query(
+            `INSERT INTO event_deliveries (event_store_id, route_id)
+             SELECT event.id, snapshot.route_id
+             FROM event_store event
+             JOIN LATERAL UNNEST(event.delivery_route_snapshot) AS snapshot(route_id) ON TRUE
+             JOIN shop_pixel_routes route
+               ON route.id = snapshot.route_id
+              AND route.shop_id = event.shop_id
+             WHERE event.shop_id = $1
+               AND event.id = ANY($2::bigint[])
+             ON CONFLICT (event_store_id, route_id) DO NOTHING`,
+            [shopId, eventIds],
+        );
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 async function claimRouteEvents(routeId, eventIds) {
@@ -238,24 +272,37 @@ async function deferRouteEvents(routeId, eventIds, delaySeconds, code, message) 
 async function syncEventStatuses(shopId, eventIds) {
     if (eventIds.length === 0) return;
     await pool.query(
-        `WITH delivery_summary AS (
-             SELECT event_store_id,
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE status = 'SUCCESS') AS succeeded,
-                    COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT') AS permanent_failed,
+        `WITH snapshot_events AS (
+             SELECT id, delivery_route_snapshot,
+                    CARDINALITY(delivery_route_snapshot) AS expected
+             FROM event_store
+             WHERE shop_id = $2
+               AND id = ANY($1::bigint[])
+         ),
+         delivery_summary AS (
+             SELECT snapshot_event.id AS event_store_id,
+                    snapshot_event.expected,
+                    COUNT(delivery.id) AS total,
+                    COUNT(delivery.id) FILTER (WHERE delivery.status = 'SUCCESS') AS succeeded,
+                    COUNT(delivery.id) FILTER (WHERE delivery.status = 'FAILED_PERMANENT') AS permanent_failed,
                     COUNT(*) FILTER (
-                        WHERE status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                        WHERE delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
                     ) AS outstanding
-             FROM event_deliveries
-             WHERE event_store_id = ANY($1::bigint[])
-             GROUP BY event_store_id
+             FROM snapshot_events snapshot_event
+             LEFT JOIN LATERAL UNNEST(snapshot_event.delivery_route_snapshot)
+                 AS snapshot(route_id) ON TRUE
+             LEFT JOIN event_deliveries delivery
+               ON delivery.event_store_id = snapshot_event.id
+              AND delivery.route_id = snapshot.route_id
+             GROUP BY snapshot_event.id, snapshot_event.expected
          )
          UPDATE event_store e
          SET status = CASE
-             WHEN d.total > 0 AND d.succeeded = d.total THEN 'SUCCESS'
+             WHEN d.expected IS NULL OR d.expected = 0 OR d.total < d.expected THEN 'PENDING'
+             WHEN d.succeeded = d.expected THEN 'SUCCESS'
              WHEN d.outstanding > 0 THEN 'PENDING'
              WHEN d.succeeded > 0 AND d.permanent_failed > 0 THEN 'PARTIAL_FAILED'
-             WHEN d.permanent_failed = d.total THEN 'FAILED'
+             WHEN d.permanent_failed = d.expected THEN 'FAILED'
              ELSE e.status
          END
          FROM delivery_summary d
@@ -513,11 +560,6 @@ function buildFacebookResult(pixel, successes, failures) {
     };
 }
 
-function shouldIsolateFacebookError(classification) {
-    const pixelLevelCodes = new Set([102, 190, 463, 467]);
-    return !pixelLevelCodes.has(classification.code);
-}
-
 async function postFacebookBatch(pixel, token, dbEvents) {
     const finalEvents = dbEvents.map(event => (
         prepareMetaEvent(stripPrivateFields({ ...event.request_payload }))
@@ -553,39 +595,12 @@ async function postFacebookBatch(pixel, token, dbEvents) {
 }
 
 async function sendFacebookBatchWithIsolation(pixel, token, dbEvents, budget) {
-    if (budget.remaining <= 0) {
-        throw new RetryableError(
-            'Meta error-isolation request budget reached; remaining events were deferred',
-            { code: 'LOCAL_ISOLATION_BUDGET', retryAfterSeconds: config.deliveryRetryBaseSeconds },
-        );
-    }
-    budget.remaining -= 1;
-
-    try {
-        const result = await postFacebookBatch(pixel, token, dbEvents);
-        return {
-            successes: [result],
-            failures: [],
-        };
-    } catch (error) {
-        const classification = classifyFacebookError(error);
-        if (classification.retryable) throw error;
-
-        if (dbEvents.length === 1 || !shouldIsolateFacebookError(classification)) {
-            return {
-                successes: [],
-                failures: [platformFailureResult(pixel, dbEvents, classification)],
-            };
-        }
-
-        const midpoint = Math.ceil(dbEvents.length / 2);
-        const left = await sendFacebookBatchWithIsolation(pixel, token, dbEvents.slice(0, midpoint), budget);
-        const right = await sendFacebookBatchWithIsolation(pixel, token, dbEvents.slice(midpoint), budget);
-        return {
-            successes: [...left.successes, ...right.successes],
-            failures: [...left.failures, ...right.failures],
-        };
-    }
+    return isolateMetaBatch(dbEvents, budget, {
+        send: items => postFacebookBatch(pixel, token, items),
+        classify: classifyFacebookError,
+        shouldIsolate: shouldIsolateFacebookError,
+        failure: (items, classification) => platformFailureResult(pixel, items, classification),
+    });
 }
 
 async function sendToFacebookPixel(pixel, dbEvents) {
@@ -614,7 +629,26 @@ async function sendToFacebookPixel(pixel, dbEvents) {
             const result = await sendFacebookBatchWithIsolation(pixel, token, batches[index], budget);
             successes.push(...result.successes);
             failures.push(...result.failures);
+            if (result.deferredItems.length > 0) {
+                const retryError = result.retryError || new RetryableError(
+                    'Meta error-isolation request budget reached; unresolved events were deferred',
+                    { code: 'LOCAL_ISOLATION_BUDGET', retryAfterSeconds: config.deliveryRetryBaseSeconds },
+                );
+                retryError.partialDelivery = {
+                    result: buildFacebookResult(pixel, successes, failures),
+                    retryable_event_ids: eventIds([
+                        ...result.deferredItems,
+                        ...batches.slice(index + 1).flat(),
+                    ]),
+                    retryable_event_store_ids: eventStoreIds([
+                        ...result.deferredItems,
+                        ...batches.slice(index + 1).flat(),
+                    ]),
+                };
+                throw retryError;
+            }
         } catch (error) {
+            if (error.partialDelivery) throw error;
             // Preserve completed chunks. Without this, a transient error in a
             // later chunk causes already accepted events to be retried as if
             // the whole route request had failed.
@@ -1001,6 +1035,7 @@ const worker = new Worker('capi-events', async job => {
           AND snapshot_delivery.event_store_id = ANY($2::bigint[])
          WHERE r.shop_id = $1
            AND r.status = 'active'
+           AND p.status = 'active'
          GROUP BY r.id, p.id
          ORDER BY r.id ASC`,
         [normalizedShopId, idsToUpdate],

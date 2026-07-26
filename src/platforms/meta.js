@@ -191,7 +191,71 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
     return errors;
 }
 
+async function isolateMetaBatch(items, budget, handlers) {
+    if (!Array.isArray(items) || items.length === 0) {
+        return { successes: [], failures: [], deferredItems: [] };
+    }
+    if (!budget || !Number.isInteger(budget.remaining) || budget.remaining <= 0) {
+        return {
+            successes: [],
+            failures: [],
+            deferredItems: [...items],
+            budgetExhausted: true,
+        };
+    }
+
+    budget.remaining -= 1;
+    try {
+        return {
+            successes: [await handlers.send(items)],
+            failures: [],
+            deferredItems: [],
+        };
+    } catch (error) {
+        const classification = handlers.classify(error);
+        if (classification.retryable) {
+            return {
+                successes: [],
+                failures: [],
+                deferredItems: [...items],
+                retryError: error,
+            };
+        }
+        if (items.length === 1 || !handlers.shouldIsolate(classification)) {
+            return {
+                successes: [],
+                failures: [handlers.failure(items, classification)],
+                deferredItems: [],
+            };
+        }
+
+        const midpoint = Math.ceil(items.length / 2);
+        const left = await isolateMetaBatch(items.slice(0, midpoint), budget, handlers);
+        // A transient/rate-limit failure applies to the shared request scope.
+        // Do not probe the sibling branch after it; defer that untouched branch
+        // with the failed one and let the credential cooldown take effect.
+        if (left.retryError) {
+            return {
+                successes: [...left.successes],
+                failures: [...left.failures],
+                deferredItems: [...left.deferredItems, ...items.slice(midpoint)],
+                retryError: left.retryError,
+                budgetExhausted: left.budgetExhausted === true,
+            };
+        }
+        const right = await isolateMetaBatch(items.slice(midpoint), budget, handlers);
+        return {
+            successes: [...left.successes, ...right.successes],
+            failures: [...left.failures, ...right.failures],
+            deferredItems: [...left.deferredItems, ...right.deferredItems],
+            retryError: left.retryError || right.retryError,
+            budgetExhausted: left.budgetExhausted === true || right.budgetExhausted === true,
+        };
+    }
+}
+
 module.exports = {
+    isolateMetaBatch,
     normalizeMetaCookie,
     prepareMetaEvent,
     sanitizeMetaCustomData,

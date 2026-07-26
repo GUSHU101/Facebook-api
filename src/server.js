@@ -53,6 +53,7 @@ const {
 const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
 const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const { parseJsonPreservingLargeIntegers } = require('./utils/json');
+const { consumeWeightedWindow } = require('./utils/weighted-rate-limit');
 
 const app = express();
 let shuttingDown = false;
@@ -135,13 +136,7 @@ function pixelRateLimitIdentity(req) {
     return `${tenantKey}:${firstForwardedIp(req)}`;
 }
 
-const localPixelLimiter = rateLimit({
-    windowMs: 60_000,
-    max: Math.max(1, config.pixelRateLimitPerMinute),
-    keyGenerator: req => crypto.createHash('sha256').update(pixelRateLimitIdentity(req)).digest('hex'),
-    standardHeaders: true,
-    legacyHeaders: false,
-});
+const localPixelRateWindows = new Map();
 const DISTRIBUTED_RATE_LIMIT_SCRIPT = `
     local count = redis.call('INCRBY', KEYS[1], ARGV[2])
     if count == tonumber(ARGV[2]) then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
@@ -173,9 +168,24 @@ async function pixelLimiter(req, res, next) {
         }
         return next();
     } catch (error) {
-        // PostgreSQL ingestion remains available during a Redis incident, while
-        // the process-local limiter still caps abusive clients on this instance.
-        return localPixelLimiter(req, res, next);
+        // PostgreSQL ingestion remains available during a Redis incident. The
+        // emergency process-local limiter uses the same event weight as Redis,
+        // so a 50-event request consumes 50 units rather than one request.
+        const local = consumeWeightedWindow(
+            localPixelRateWindows,
+            digest,
+            eventWeight,
+            config.pixelRateLimitPerMinute,
+        );
+        res.set('RateLimit-Limit', String(config.pixelRateLimitPerMinute));
+        res.set('RateLimit-Remaining', String(local.remaining));
+        res.set('RateLimit-Reset', String(local.retryAfterSeconds));
+        res.set('X-RateLimit-Mode', 'local-weighted-degraded');
+        if (!local.allowed) {
+            res.set('Retry-After', String(local.retryAfterSeconds));
+            return res.status(429).json({ error: 'Too many pixel events', retryable: true });
+        }
+        return next();
     }
 }
 
@@ -629,13 +639,25 @@ async function deleteShopDataById(shopId) {
         shopDomain = shopResult.rows[0]?.shop_domain;
         if (shopDomain) {
             await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shopId]);
+            // Remove tenant events first so their delivery rows are gone before
+            // the shop cascade removes routes protected by ON DELETE RESTRICT.
+            await client.query('DELETE FROM event_store WHERE shop_id = $1', [shopId]);
             const result = await client.query('DELETE FROM shops WHERE id = $1', [shopId]);
             deleted = result.rowCount > 0;
             await client.query(
-                `DELETE FROM pixels pixel
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM shop_pixel_routes route WHERE route.pixel_id = pixel.id
-                 )`,
+                `UPDATE pixels pixel
+                 SET status = 'archived',
+                     archived_at = COALESCE(archived_at, NOW()),
+                     access_token = '',
+                     quality_access_token = NULL,
+                     test_event_code = NULL,
+                     credential_scope = NULL,
+                     rate_limit_group = NULL,
+                     rate_limit_until = NULL
+                 WHERE status = 'active'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM shop_pixel_routes route WHERE route.pixel_id = pixel.id
+                   )`,
             );
         }
         await client.query('COMMIT');
@@ -857,6 +879,7 @@ async function refreshMetaQualitySnapshots(shopId = null) {
          JOIN pixels p ON p.id = r.pixel_id
          JOIN shops s ON s.id = r.shop_id
          WHERE p.platform = 'facebook'
+           AND p.status = 'active'
            AND r.status = 'active'
            AND s.status = 'active'
            ${shopFilter}
@@ -1162,27 +1185,19 @@ async function reconcileEventAggregateStatuses() {
                  SELECT event.id
                  FROM event_store event
                  WHERE event.status = 'PENDING'
-                   AND EXISTS (
-                       SELECT 1 FROM event_deliveries delivery
+                   AND CARDINALITY(event.delivery_route_snapshot) > 0
+                   AND CARDINALITY(event.delivery_route_snapshot) = (
+                       SELECT COUNT(*)
+                       FROM event_deliveries delivery
                        WHERE delivery.event_store_id = event.id
+                         AND delivery.route_id = ANY(event.delivery_route_snapshot)
                    )
                    AND NOT EXISTS (
                        SELECT 1
                        FROM event_deliveries outstanding
                        WHERE outstanding.event_store_id = event.id
+                         AND outstanding.route_id = ANY(event.delivery_route_snapshot)
                          AND outstanding.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM shop_pixel_routes route
-                       WHERE route.shop_id = event.shop_id
-                         AND route.status = 'active'
-                         AND NOT EXISTS (
-                             SELECT 1
-                             FROM event_deliveries missing
-                             WHERE missing.event_store_id = event.id
-                               AND missing.route_id = route.id
-                         )
                    )
                  ORDER BY event.id ASC
                  FOR UPDATE OF event SKIP LOCKED
@@ -1198,6 +1213,8 @@ async function reconcileEventAggregateStatuses() {
                         ) AS outstanding
                  FROM event_deliveries delivery
                  JOIN candidates candidate ON candidate.id = delivery.event_store_id
+                 JOIN event_store event ON event.id = candidate.id
+                 WHERE delivery.route_id = ANY(event.delivery_route_snapshot)
                  GROUP BY delivery.event_store_id
              ),
              expected AS (
@@ -1921,22 +1938,37 @@ async function drainShopifyWebhookInbox(limit = config.shopifyWebhookInboxBatchS
 }
 
 const SHOPIFY_RECONCILE_QUERY = `
-    query ReconcilePaidOrders($first: Int!, $after: String, $query: String!) {
+    query ReconcilePaidOrders($first: Int!, $after: String, $query: String!, $includeCustomer: Boolean!) {
         orders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
             edges {
                 cursor
                 node {
-                    id name createdAt processedAt updatedAt sourceName test
+                    id legacyResourceId name createdAt processedAt updatedAt sourceName test
+                    email phone cartToken checkoutToken clientIp
                     currentSubtotalLineItemsQuantity
                     displayFinancialStatus
                     currentTotalPriceSet { shopMoney { amount currencyCode } }
-                    lineItems(first: 200) {
+                    billingAddress {
+                        firstName lastName phone city province provinceCode zip country countryCodeV2
+                    }
+                    shippingAddress {
+                        firstName lastName phone city province provinceCode zip country countryCodeV2
+                    }
+                    customer @include(if: $includeCustomer) {
+                        id firstName lastName numberOfOrders
+                    }
+                    customerJourneySummary {
+                        customerOrderIndex
+                        lastVisit { landingPage referrerUrl }
+                    }
+                    lineItems(first: 250) {
                         nodes {
                             id quantity sku
                             product { id }
                             variant { id }
                             discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } }
                         }
+                        pageInfo { hasNextPage endCursor }
                     }
                 }
             }
@@ -1945,10 +1977,116 @@ const SHOPIFY_RECONCILE_QUERY = `
     }
 `;
 
+const SHOPIFY_ORDER_LINE_ITEMS_QUERY = `
+    query ReconcileOrderLineItems($id: ID!, $after: String) {
+        order(id: $id) {
+            lineItems(first: 250, after: $after) {
+                nodes {
+                    id quantity sku
+                    product { id }
+                    variant { id }
+                    discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } }
+                }
+                pageInfo { hasNextPage endCursor }
+            }
+        }
+    }
+`;
+
+const SHOPIFY_ACCESS_SCOPES_QUERY = `
+    query ReconcileAccessScopes {
+        currentAppInstallation { accessScopes { handle } }
+    }
+`;
+
+function graphqlAddress(address) {
+    if (!address) return undefined;
+    return compactObject({
+        first_name: address.firstName,
+        last_name: address.lastName,
+        phone: address.phone,
+        city: address.city,
+        province: address.province,
+        province_code: address.provinceCode,
+        zip: address.zip,
+        country: address.country,
+        country_code: address.countryCodeV2,
+    });
+}
+
+async function waitForShopifyGraphqlThrottle(responseData) {
+    const cost = responseData?.extensions?.cost;
+    const available = Number(cost?.throttleStatus?.currentlyAvailable);
+    const restoreRate = Number(cost?.throttleStatus?.restoreRate);
+    const queryCost = Number(cost?.actualQueryCost || cost?.requestedQueryCost);
+    if (Number.isFinite(available) && Number.isFinite(restoreRate) && restoreRate > 0
+        && Number.isFinite(queryCost) && available < queryCost) {
+        const delayMs = Math.min(5000, Math.ceil(((queryCost - available) / restoreRate) * 1000));
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+}
+
+async function shopifyAccessScopes(url, token) {
+    try {
+        const response = await axios.post(url, { query: SHOPIFY_ACCESS_SCOPES_QUERY }, {
+            timeout: config.fbRequestTimeoutMs,
+            headers: {
+                'X-Shopify-Access-Token': token,
+                'Content-Type': 'application/json',
+            },
+        });
+        if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) return new Set();
+        await waitForShopifyGraphqlThrottle(response.data);
+        return new Set(
+            (response.data?.data?.currentAppInstallation?.accessScopes || [])
+                .map(scope => String(scope?.handle || '').trim())
+                .filter(Boolean),
+        );
+    } catch (error) {
+        // Scope discovery enriches optional customer fields only. The required
+        // read_orders reconciliation request remains the authoritative check.
+        return new Set();
+    }
+}
+
+async function hydrateAllShopifyLineItems(node, url, token) {
+    const lineItems = [...(node.lineItems?.nodes || [])];
+    let pageInfo = node.lineItems?.pageInfo;
+    let pageCount = 1;
+    while (pageInfo?.hasNextPage) {
+        if (!pageInfo.endCursor) throw new Error(`Shopify order ${node.id} line item cursor is missing`);
+        if (pageCount >= config.shopifyReconcileMaxLineItemPages) {
+            throw new Error(`Shopify order ${node.id} exceeds the configured line item pagination safety limit`);
+        }
+        const response = await axios.post(url, {
+            query: SHOPIFY_ORDER_LINE_ITEMS_QUERY,
+            variables: { id: node.id, after: pageInfo.endCursor },
+        }, {
+            timeout: config.fbRequestTimeoutMs,
+            headers: {
+                'X-Shopify-Access-Token': token,
+                'Content-Type': 'application/json',
+            },
+        });
+        if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
+            throw new Error(`Shopify GraphQL: ${response.data.errors.map(item => item.message).join('; ')}`);
+        }
+        const connection = response.data?.data?.order?.lineItems;
+        if (!connection) throw new Error(`Shopify order ${node.id} line item response is missing`);
+        lineItems.push(...(connection.nodes || []));
+        pageInfo = connection.pageInfo;
+        pageCount += 1;
+        await waitForShopifyGraphqlThrottle(response.data);
+    }
+    node.lineItems = { nodes: lineItems, pageInfo };
+}
+
 function reconciledGraphqlOrder(node) {
+    const customerOrderIndex = Number(node.customerJourneySummary?.customerOrderIndex);
     return {
         _reconciled: true,
-        id: node.id,
+        id: node.legacyResourceId || node.id,
+        admin_graphql_api_id: node.id,
         name: node.name,
         created_at: node.createdAt,
         processed_at: node.processedAt,
@@ -1959,6 +2097,24 @@ function reconciledGraphqlOrder(node) {
         financial_status: String(node.displayFinancialStatus || '').toLowerCase(),
         current_total_price: node.currentTotalPriceSet?.shopMoney?.amount,
         currency: node.currentTotalPriceSet?.shopMoney?.currencyCode,
+        email: node.email,
+        phone: node.phone,
+        checkout_token: node.checkoutToken,
+        cart_token: node.cartToken,
+        browser_ip: node.clientIp,
+        billing_address: graphqlAddress(node.billingAddress),
+        shipping_address: graphqlAddress(node.shippingAddress),
+        landing_site: node.customerJourneySummary?.lastVisit?.landingPage,
+        referring_site: node.customerJourneySummary?.lastVisit?.referrerUrl,
+        customer: (node.customer || Number.isInteger(customerOrderIndex)) ? compactObject({
+            id: node.customer?.id,
+            first_name: node.customer?.firstName,
+            last_name: node.customer?.lastName,
+            orders_count: node.customer?.numberOfOrders,
+            is_first_order: Number.isInteger(customerOrderIndex)
+                ? customerOrderIndex === 1
+                : undefined,
+        }) : undefined,
         line_items: (node.lineItems?.nodes || []).map(item => ({
             id: item.id,
             product_id: item.product?.id,
@@ -1991,6 +2147,8 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
     const cutoff = scanCutoff.toISOString();
     const token = decryptTokenIfPossible(shop.admin_access_token);
     const url = `https://${shop.shop_domain}/admin/api/${config.shopifyApiVersion}/graphql.json`;
+    const accessScopes = await shopifyAccessScopes(url, token);
+    const includeCustomer = accessScopes.has('read_customers');
     let after = state.rows[0].after_cursor || null;
     let received = 0;
     let cursorRestarted = false;
@@ -2002,6 +2160,7 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
             variables: {
                 first,
                 after,
+                includeCustomer,
                 // Freeze both ends of the scan window. Without the upper
                 // bound, orders updated while pagination is in progress can
                 // move between pages and invalidate Shopify cursors.
@@ -2034,30 +2193,28 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
             }
             throw new Error(`Shopify GraphQL: ${errorMessage}`);
         }
-        const cost = response.data?.extensions?.cost;
-        const available = Number(cost?.throttleStatus?.currentlyAvailable);
-        const restoreRate = Number(cost?.throttleStatus?.restoreRate);
-        const queryCost = Number(cost?.actualQueryCost || cost?.requestedQueryCost);
-        if (Number.isFinite(available) && Number.isFinite(restoreRate) && restoreRate > 0
-            && Number.isFinite(queryCost) && available < queryCost) {
-            const delayMs = Math.min(5000, Math.ceil(((queryCost - available) / restoreRate) * 1000));
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-        }
+        await waitForShopifyGraphqlThrottle(response.data);
         const connection = response.data?.data?.orders;
         if (!connection) throw new Error('Shopify GraphQL response is missing orders');
         for (const edge of connection.edges || []) {
             const node = edge.node;
             if (!node?.id || String(node.displayFinancialStatus).toUpperCase() !== 'PAID') continue;
+            await hydrateAllShopifyLineItems(node, url, token);
             const payload = reconciledGraphqlOrder(node);
             const identity = crypto.createHash('sha256')
-                .update(`${node.id}\0${node.updatedAt || ''}`)
+                .update(`${node.id}\0${node.processedAt || node.createdAt || ''}`)
                 .digest('hex');
             await db.query(
                 `INSERT INTO shopify_webhook_inbox
                     (shop_id, webhook_id, topic, triggered_at, payload)
                  VALUES ($1, $2, 'orders/paid', $3, $4::jsonb)
                  ON CONFLICT (shop_id, webhook_id) DO NOTHING`,
-                [shop.id, `reconcile:${identity}`, node.updatedAt || scanCutoff, JSON.stringify(payload)],
+                [
+                    shop.id,
+                    `reconcile:${identity}`,
+                    node.processedAt || node.createdAt || scanCutoff,
+                    JSON.stringify(payload),
+                ],
             );
             received += 1;
         }
@@ -2547,11 +2704,12 @@ app.get('/readyz', asyncHandler(async (req, res) => {
             redisState = 'degraded';
         }
     }
-    res.json({
+    res.status(redisState === 'ready' ? 200 : 503).json({
         status: redisState === 'ready' ? 'ready' : 'degraded',
         postgres: 'ready',
         redis: redisState,
         durable_ingestion: true,
+        immediate_dispatch: redisState === 'ready',
     });
 }));
 
@@ -2850,6 +3008,7 @@ app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
           ON r.pixel_id = p.id
          AND r.status = 'active'
         LEFT JOIN shops s ON s.id = r.shop_id
+        WHERE p.status = 'active'
         GROUP BY p.id, owner.shop_domain
         ORDER BY p.id DESC
     `);
@@ -2889,7 +3048,7 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
             `SELECT id, rate_limit_group
              FROM pixels
              WHERE platform = $1 AND pixel_id = $2
-             ORDER BY id ASC
+             ORDER BY (status = 'active') DESC, id ASC
              LIMIT 1
              FOR UPDATE`,
             [platform, pixelId],
@@ -2908,7 +3067,9 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
                      quality_access_token = COALESCE($5, quality_access_token),
                      test_event_code = $6,
                      credential_scope = $7,
-                     rate_limit_group = $8
+                     rate_limit_group = $8,
+                     status = 'active',
+                     archived_at = NULL
                  WHERE id = $1`,
                 [
                     credentialId,
@@ -2941,6 +3102,12 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
             );
             credentialId = inserted.rows[0].id;
         }
+        for (const routedShopId of [...shopIds].sort((left, right) => left - right)) {
+            await client.query(
+                'SELECT pg_advisory_xact_lock(hashtext($1))',
+                [`delivery-routes:${routedShopId}`],
+            );
+        }
         await client.query(
             `INSERT INTO shop_pixel_routes (shop_id, pixel_id)
              SELECT shop_id, $2
@@ -2967,10 +3134,27 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const pixelResult = await client.query('SELECT id FROM pixels WHERE id = $1 FOR UPDATE', [pixelId]);
+        const pixelResult = await client.query(
+            "SELECT id FROM pixels WHERE id = $1 AND status = 'active' FOR UPDATE",
+            [pixelId],
+        );
         if (pixelResult.rowCount === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Pixel not found' });
+        }
+        const routeShopResult = await client.query(
+            'SELECT shop_id FROM shop_pixel_routes WHERE pixel_id = $1',
+            [pixelId],
+        );
+        const lockedShopIds = [...new Set([
+            ...shopIds,
+            ...routeShopResult.rows.map(row => Number(row.shop_id)),
+        ])].sort((left, right) => left - right);
+        for (const routedShopId of lockedShopIds) {
+            await client.query(
+                'SELECT pg_advisory_xact_lock(hashtext($1))',
+                [`delivery-routes:${routedShopId}`],
+            );
         }
         const shopsResult = await client.query(
             "SELECT id FROM shops WHERE id = ANY($1::int[]) AND status = 'active'",
@@ -3012,24 +3196,37 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
         )];
         if (affectedEventIds.length > 0) {
             await client.query(
-                `WITH delivery_summary AS (
-                     SELECT event_store_id,
-                            COUNT(*) AS total,
-                            COUNT(*) FILTER (WHERE status = 'SUCCESS') AS succeeded,
-                            COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT') AS permanent_failed,
+                `WITH snapshot_events AS (
+                     SELECT id, delivery_route_snapshot,
+                            CARDINALITY(delivery_route_snapshot) AS expected
+                     FROM event_store
+                     WHERE id = ANY($1::bigint[])
+                 ),
+                 delivery_summary AS (
+                     SELECT snapshot_event.id AS event_store_id,
+                            snapshot_event.expected,
+                            COUNT(delivery.id) AS total,
+                            COUNT(delivery.id) FILTER (WHERE delivery.status = 'SUCCESS') AS succeeded,
+                            COUNT(delivery.id) FILTER (WHERE delivery.status = 'FAILED_PERMANENT') AS permanent_failed,
                             COUNT(*) FILTER (
-                                WHERE status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                                WHERE delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
                             ) AS outstanding
-                     FROM event_deliveries
-                     WHERE event_store_id = ANY($1::bigint[])
-                     GROUP BY event_store_id
+                     FROM snapshot_events snapshot_event
+                     LEFT JOIN LATERAL UNNEST(snapshot_event.delivery_route_snapshot)
+                         AS snapshot(route_id) ON TRUE
+                     LEFT JOIN event_deliveries delivery
+                       ON delivery.event_store_id = snapshot_event.id
+                      AND delivery.route_id = snapshot.route_id
+                     GROUP BY snapshot_event.id, snapshot_event.expected
                  )
                  UPDATE event_store event
                  SET status = CASE
-                     WHEN summary.total > 0 AND summary.succeeded = summary.total THEN 'SUCCESS'
+                     WHEN summary.expected IS NULL OR summary.expected = 0
+                          OR summary.total < summary.expected THEN 'PENDING'
+                     WHEN summary.succeeded = summary.expected THEN 'SUCCESS'
                      WHEN summary.outstanding > 0 THEN 'PENDING'
                      WHEN summary.succeeded > 0 AND summary.permanent_failed > 0 THEN 'PARTIAL_FAILED'
-                     WHEN summary.permanent_failed = summary.total THEN 'FAILED'
+                     WHEN summary.permanent_failed = summary.expected THEN 'FAILED'
                      ELSE event.status
                  END
                  FROM delivery_summary summary
@@ -3056,9 +3253,109 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
 
 app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
     const pixelId = readPositiveId(req.params.id, 'pixel_id');
-    const { rowCount } = await pool.query('DELETE FROM pixels WHERE id = $1', [pixelId]);
-    if (rowCount === 0) return res.status(404).json({ error: 'Pixel route not found' });
-    res.json({ success: true });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const pixelResult = await client.query(
+            "SELECT id FROM pixels WHERE id = $1 AND status = 'active' FOR UPDATE",
+            [pixelId],
+        );
+        if (pixelResult.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Pixel route not found' });
+        }
+        const routeShopResult = await client.query(
+            'SELECT shop_id FROM shop_pixel_routes WHERE pixel_id = $1 ORDER BY shop_id',
+            [pixelId],
+        );
+        for (const row of routeShopResult.rows) {
+            await client.query(
+                'SELECT pg_advisory_xact_lock(hashtext($1))',
+                [`delivery-routes:${row.shop_id}`],
+            );
+        }
+        const terminated = await client.query(
+            `UPDATE event_deliveries delivery
+             SET status = 'FAILED_PERMANENT',
+                 lease_expires_at = NULL,
+                 error_code = 'ROUTE_ARCHIVED',
+                 error_message = 'Pixel credential was archived before delivery completed',
+                 updated_at = NOW()
+             FROM shop_pixel_routes route
+             WHERE delivery.route_id = route.id
+               AND route.pixel_id = $1
+               AND delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+             RETURNING delivery.event_store_id`,
+            [pixelId],
+        );
+        await client.query(
+            "UPDATE shop_pixel_routes SET status = 'inactive' WHERE pixel_id = $1 AND status <> 'inactive'",
+            [pixelId],
+        );
+        await client.query(
+            `UPDATE pixels
+             SET status = 'archived',
+                 archived_at = NOW(),
+                 access_token = '',
+                 quality_access_token = NULL,
+                 test_event_code = NULL,
+                 credential_scope = NULL,
+                 rate_limit_group = NULL,
+                 rate_limit_until = NULL
+             WHERE id = $1`,
+            [pixelId],
+        );
+        const affectedEventIds = [...new Set(
+            terminated.rows.map(row => String(row.event_store_id)),
+        )];
+        if (affectedEventIds.length > 0) {
+            await client.query(
+                `WITH snapshot_events AS (
+                     SELECT id, delivery_route_snapshot,
+                            CARDINALITY(delivery_route_snapshot) AS expected
+                     FROM event_store
+                     WHERE id = ANY($1::bigint[])
+                 ),
+                 delivery_summary AS (
+                     SELECT snapshot_event.id AS event_store_id,
+                            snapshot_event.expected,
+                            COUNT(delivery.id) AS total,
+                            COUNT(delivery.id) FILTER (WHERE delivery.status = 'SUCCESS') AS succeeded,
+                            COUNT(delivery.id) FILTER (WHERE delivery.status = 'FAILED_PERMANENT') AS permanent_failed,
+                            COUNT(*) FILTER (
+                                WHERE delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                            ) AS outstanding
+                     FROM snapshot_events snapshot_event
+                     LEFT JOIN LATERAL UNNEST(snapshot_event.delivery_route_snapshot)
+                         AS snapshot(route_id) ON TRUE
+                     LEFT JOIN event_deliveries delivery
+                       ON delivery.event_store_id = snapshot_event.id
+                      AND delivery.route_id = snapshot.route_id
+                     GROUP BY snapshot_event.id, snapshot_event.expected
+                 )
+                 UPDATE event_store event
+                 SET status = CASE
+                     WHEN summary.expected IS NULL OR summary.expected = 0
+                          OR summary.total < summary.expected THEN 'PENDING'
+                     WHEN summary.succeeded = summary.expected THEN 'SUCCESS'
+                     WHEN summary.outstanding > 0 THEN 'PENDING'
+                     WHEN summary.succeeded > 0 AND summary.permanent_failed > 0 THEN 'PARTIAL_FAILED'
+                     WHEN summary.permanent_failed = summary.expected THEN 'FAILED'
+                     ELSE event.status
+                 END
+                 FROM delivery_summary summary
+                 WHERE event.id = summary.event_store_id`,
+                [affectedEventIds],
+            );
+        }
+        await client.query('COMMIT');
+        res.json({ success: true, archived: true, affected_events: affectedEventIds.length });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
 }));
 
 app.get('/api/admin/logs', asyncHandler(async (req, res) => {
@@ -3067,6 +3364,7 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
     const shopFilter = shopId ? 'WHERE e.shop_id = $1' : '';
     const { rows } = await pool.query(`
         SELECT e.id, s.shop_domain, e.event_name, e.event_id, e.status, e.emq_estimate,
+               e.delivery_route_snapshot,
                e.request_payload->'_quality' AS quality, e.fb_response, e.timestamp,
                COALESCE(d.deliveries, '[]'::jsonb) AS route_deliveries
         FROM event_store e

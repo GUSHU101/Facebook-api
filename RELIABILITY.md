@@ -135,8 +135,10 @@ worker restarted.
     remain stable deduplication keys but cannot accidentally update a different
     event name that reused the same external identifier.
 40. Delivery routes are read through ledger rows created for that worker
-    snapshot. A concurrently activated route cannot appear without its own
-    idempotency row or cause a false terminal parent state.
+    snapshot. The exact route IDs are persisted on `event_store`; aggregate
+    success requires a ledger row for every snapshotted route. A concurrently
+    activated route belongs to a later snapshot and cannot cause a false
+    terminal parent state or silently rewrite an in-flight event contract.
 41. Delivery leases, pacing, and Redis cooldowns are keyed by a SHA-256 scope
     of platform plus decrypted access token. The scope and cooldown are also
     persisted on every matching credential row, so database rows sharing one
@@ -145,13 +147,38 @@ worker restarted.
     enters maintenance, stops/drains writers, restores in one database
     transaction, validates the migrated database and credential key, then
     reloads the runtime. A failed restore remains stopped in maintenance mode.
+43. Meta errors are explicitly scoped. HTTP 401/403 and credential,
+    permission, application, or missing-object codes such as 10, 102, 190,
+    200, 803, and 2500 never enter recursive event isolation. Unknown
+    permanent errors fail closed; only an HTTP 400/code 100 failure carrying an
+    explicit `data[index]` blame path is eligible for bounded splitting.
+44. Bounded Meta isolation returns three disjoint outcomes: accepted events,
+    confirmed permanent failures, and unresolved deferred events. Exhausting
+    the request budget never discards the first two groups, and a transient
+    child failure stops sibling probes so platform cooldown can begin.
+45. Pixel removal is archival, not physical deletion. Active routes are
+    disabled, unfinished ledgers become terminal with `ROUTE_ARCHIVED`, unused
+    credentials are erased, and restrictive foreign keys preserve historical
+    routes and deliveries.
+46. Shopify order reconciliation paginates both orders and every order's line
+    items. Recovered Purchase time uses `processedAt` (then `createdAt`), while
+    `updatedAt` is only the moving scan index. Missing fields that the current
+    Admin GraphQL Order schema cannot supply, including order-level user agent,
+    remain absent instead of being fabricated.
+47. Redis and process-local ingestion limiters charge the same event weight.
+    During a Redis partition, a 50-event HTTP batch consumes 50 local units,
+    and the bounded local key map cannot grow without limit.
+48. `/readyz` returns HTTP 503 whenever Redis cannot support immediate BullMQ
+    dispatch; `/healthz` remains the liveness endpoint. This prevents deployers
+    from treating durable-only degraded mode as fully ready.
 
 ## Storefront ingestion abuse boundary
 
 The generated shop token is a public routing capability embedded in Shopify's
 custom pixel; it must not be treated as user authentication. The default
 `PIXEL_RATE_LIMIT_PER_MINUTE=600` provides a generous per-shop/per-IP ceiling,
-and the browser retries HTTP 429 with stable event IDs. Set it to `0` only when
+and both Redis and emergency process-local enforcement count actual events,
+not HTTP envelopes. The browser retries HTTP 429 with stable event IDs. Set it to `0` only when
 a distributed CDN/WAF limiter is verified in front of every API instance.
 
 Meta can still issue a rate-limit response. The worker classifies it as
@@ -263,6 +290,24 @@ Before production rollout, verify all of the following in a staging stack:
 27. Merge an old cart containing a removed item with a confirmed paid order.
     The outbound Purchase `contents` and `content_ids` must contain only the
     confirmed order items.
+28. Return Meta HTTP 403/code 200, HTTP 400/code 10, and code 803 for a
+    100-event request. Exactly one platform call must occur and the full batch
+    must become a request-level permanent failure.
+29. Exhaust `FACEBOOK_ISOLATION_MAX_REQUESTS` after one child branch succeeds.
+    The successful branch must remain `SUCCESS`, confirmed bad events must
+    remain terminal, and only the unresolved branch may retry.
+30. Activate another route while a worker holds the route-snapshot advisory
+    lock. The event must complete exactly the persisted snapshot; later events
+    must include the newly active route.
+31. Archive a Pixel with in-progress deliveries. The token must be cleared,
+    unfinished ledger rows must become `ROUTE_ARCHIVED`, historical successful
+    rows must remain queryable, and a physical `DELETE FROM pixels` must fail.
+32. Reconcile a paid order with more than 250 line items. Every page must be
+    present in `contents`, and Purchase time must equal `processedAt`, not a
+    later order edit's `updatedAt`.
+33. Stop Redis and send repeated 50-event requests against a 600-event local
+    ceiling. The thirteenth request must receive 429, and `/readyz` must return
+    HTTP 503 while `/healthz` remains live.
 
 ## Official references used
 
@@ -292,6 +337,8 @@ Before production rollout, verify all of the following in a staging stack:
   https://shopify.dev/docs/apps/build/webhooks/verify-deliveries
 - Shopify order source attribution:
   https://shopify.dev/docs/api/admin-graphql/latest/objects/Order
+- Shopify GraphQL cursor pagination:
+  https://shopify.dev/docs/api/usage/pagination-graphql
 - BullMQ retry and backoff:
   https://docs.bullmq.io/guide/retrying-failing-jobs
 - BullMQ production Redis guidance:

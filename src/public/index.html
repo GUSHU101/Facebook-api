@@ -232,7 +232,7 @@
                             <td class="font-mono">{{ p.test_event_code || '—' }}</td>
                             <td class="space-x-3 whitespace-nowrap">
                                 <button @click="editPixelRoutes(p)" class="text-action text-blue-600 font-medium">编辑店铺</button>
-                                <button @click="deletePixel(p.id)" class="text-action text-red-600 font-medium">删除</button>
+                                <button @click="deletePixel(p.id)" class="text-action text-red-600 font-medium">归档</button>
                             </td>
                         </tr>
                         <tr v-if="!pixels.length"><td colspan="9" class="table-empty">尚未配置 Pixel 路由。请先添加店铺，再绑定 Meta 或 TikTok 凭据。</td></tr>
@@ -1628,7 +1628,7 @@ analytics.subscribe('search_submitted', function (event) {
                     this.setNotice('success', '跟踪代码已复制到剪贴板。');
                 },
                 async deletePixel(id) {
-                    if (!confirm('确认删除这个 Pixel 凭据及其全部店铺路由？')) return;
+                    if (!confirm('确认归档这个 Pixel 凭据并停用全部店铺路由？历史投递账本会保留，未完成投递会安全终结。')) return;
                     await this.runAction('deletePixel', async () => {
                         await this.api('/api/admin/pixels/' + id, { method: 'DELETE' });
                         await Promise.all([this.fetchPixels(), this.fetchSummary()]);
