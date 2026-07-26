@@ -78,11 +78,13 @@ async function main() {
             ['pixels', 'platform'],
             ['pixels', 'access_token'],
             ['pixels', 'credential_scope'],
+            ['pixels', 'credential_version'],
             ['pixels', 'rate_limit_group'],
             ['pixels', 'rate_limit_until'],
             ['pixels', 'consecutive_failures'],
             ['shop_pixel_routes', 'shop_id'],
             ['shop_pixel_routes', 'pixel_id'],
+            ['shop_pixel_routes', 'test_event_code'],
             ['event_store', 'request_payload'],
             ['event_store', 'fb_response'],
             ['shopify_webhook_inbox', 'webhook_id'],
@@ -360,7 +362,8 @@ async function main() {
         const { rows: [result] } = await pool.query(
             `SELECT COUNT(*)::int AS missing
              FROM pixels
-             WHERE credential_scope IS NULL OR credential_scope = ''`,
+             WHERE status = 'active'
+               AND (credential_scope IS NULL OR credential_scope = '')`,
         );
         if (Number(result.missing) > 0) {
             throw new Error(`${result.missing} pixel credentials have no persisted throttle scope; rerun npm run migrate`);
@@ -372,6 +375,7 @@ async function main() {
                 `SELECT id, platform, access_token, rate_limit_group, credential_scope
                  FROM pixels
                  WHERE id > $1
+                   AND status = 'active'
                  ORDER BY id
                  LIMIT 500`,
                 [afterId],

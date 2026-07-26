@@ -49,7 +49,7 @@
                     <div>
                         <div class="eyebrow">Installation · Web Pixel</div>
                         <h2 class="page-title">像素接入与部署</h2>
-                        <p class="page-description">为指定 Shopify 店铺生成可靠的客户事件代码。路由由服务端配置决定，前端提示只用于诊断，不会改变租户归属。</p>
+                        <p class="page-description">为指定 Shopify 店铺生成 Meta 浏览器 Pixel + 服务端 CAPI 双通道代码。两条链路共用事件名与 eventID，浏览器端会定期同步当前 Meta 路由，服务端路由仍是唯一可信投递边界。</p>
                     </div>
                     <div class="status-chip"><span class="live-dot"></span>稳定事件 ID · 持久队列</div>
                 </div>
@@ -77,7 +77,7 @@
                     </label>
                     <div class="md:col-span-3 grid md:grid-cols-2 gap-3 text-sm text-slate-600">
                         <div class="hint-card bg-slate-50 border rounded-md p-3">
-                            <div class="font-semibold text-slate-800">Meta 服务端路由提示</div>
+                            <div class="font-semibold text-slate-800">Meta 双通道路由</div>
                             <div class="mt-1 font-mono break-all">{{ currentMetaPixelIds.length ? currentMetaPixelIds.join(', ') : '暂未配置' }}</div>
                         </div>
                         <div class="hint-card bg-slate-50 border rounded-md p-3">
@@ -89,7 +89,7 @@
                 <div class="toolbar flex flex-wrap items-center justify-between gap-3">
                     <div>
                         <div class="surface-title">Shopify Customer Events 代码</div>
-                        <div class="surface-copy">复制到 Shopify 自定义像素；付款成功由已验证的 orders/paid Webhook 确认。</div>
+                        <div class="surface-copy">复制到 Shopify 自定义像素；浏览器 Pixel 立即发送，服务端 Purchase 仍由已验证的 orders/paid Webhook 确认。</div>
                     </div>
                     <div class="flex flex-wrap items-center gap-3">
                         <button @click="copyCode" class="primary-btn px-4 py-2">复制跟踪代码</button>
@@ -97,7 +97,7 @@
                     </div>
                 </div>
                 <div class="border border-amber-300 bg-amber-50 text-amber-900 rounded-md p-3 text-sm">
-                    同一 Meta Dataset 如果还由 Shopify Facebook &amp; Instagram、GTM、主题脚本或其他 CAPI 应用发送相同事件，只有两边的事件名称和 eventID 完全一致时 Meta 才能浏览器/服务端去重。无法统一 ID 时应停用重复事件源，否则可能重复计数。
+                    生成代码已经同时发送 Meta 浏览器 Pixel 与本项目 CAPI，并自动复用同一 eventID。不要再为相同 Dataset 启用 Shopify Facebook &amp; Instagram、GTM、主题 Meta Pixel 或另一套 CAPI；外部来源无法复用本项目 eventID 时会造成重复计数。
                 </div>
                 <textarea readonly :value="generatedCode" aria-label="Shopify 跟踪代码" class="code-editor w-full h-[620px] p-5 font-mono text-xs leading-5"></textarea>
             </section>
@@ -201,7 +201,7 @@
                         <label class="block">
                             <span class="text-sm font-medium">测试事件代码（可选）</span>
                             <input v-model.trim="newPixel.test_event_code" placeholder="Meta Test Event Code" class="mt-1 w-full border rounded-md p-2 font-mono">
-                            <span class="mt-1 block text-xs text-amber-700">仅用于短期联调；正式投放前必须清空。Meta 测试事件仍会进入测量流程。</span>
+                            <span class="mt-1 block text-xs text-amber-700">仅应用到本次选中的店铺路由；正式投放前必须清空，避免共享 Pixel 的其他店铺误入测试模式。</span>
                         </label>
                         <label class="block">
                             <span class="text-sm font-medium">平台限流组（可选）</span>
@@ -229,7 +229,12 @@
                             </td>
                             <td class="font-mono text-xs">{{ p.rate_limit_group || '按 Token' }}</td>
                             <td>{{ p.has_quality_token ? '已配置' : '—' }}</td>
-                            <td class="font-mono">{{ p.test_event_code || '—' }}</td>
+                            <td class="font-mono text-xs">
+                                <div v-for="route in (p.routes || []).filter(item => item.test_event_code)" :key="'test-' + route.route_id">
+                                    {{ route.shop_domain }}: {{ route.test_event_code }}
+                                </div>
+                                <span v-if="!(p.routes || []).some(item => item.test_event_code)">—</span>
+                            </td>
                             <td class="space-x-3 whitespace-nowrap">
                                 <button @click="editPixelRoutes(p)" class="text-action text-blue-600 font-medium">编辑店铺</button>
                                 <button @click="deletePixel(p.id)" class="text-action text-red-600 font-medium">归档</button>
@@ -556,12 +561,29 @@
                 generatedCode() {
                     return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
+const CAPI_PIXEL_CONFIG_URL = "${this.apiDomain}/api/pixel-config";
 const SHOP_DOMAIN = "${this.currentShop}";
 const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
-const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
+var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v11";
+const SOURCE_VERSION = "shopify-pixel-v14";
+const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
+const META_STANDARD_BROWSER_EVENTS = new Set([
+    'PageView', 'ViewContent', 'Search', 'AddToCart',
+    'InitiateCheckout', 'AddPaymentInfo', 'Purchase',
+]);
+const META_PIXEL_MAX_LOAD_ATTEMPTS = 3;
+const META_PIXEL_RETRY_BACKOFF_MS = [1000, 5000, 30000];
+const META_PIXEL_MAX_QUEUE_SIZE = 500;
+const META_ROUTE_CONFIG_WAIT_MS = 500;
+const META_ROUTE_CONFIG_TTL_MS = 60 * 1000;
+const META_ROUTE_CONFIG_STORAGE_KEY = 'capi_meta_route_config_v1:' + SHOP_DOMAIN;
+const META_PIXEL_LOW_PRIORITY_EVENTS = new Set([
+    'PageView', 'Search', 'CartView', 'CollectionView',
+    'RemoveFromCart', 'CheckoutContactInfoSubmitted',
+    'CheckoutAddressInfoSubmitted', 'CheckoutShippingInfoSubmitted',
+]);
 const RECENT_EVENT_TTL_MS = 5000;
 const MAX_RECENT_EVENTS = 5000;
 const EVENT_QUEUE_FLUSH_MS = 1000;
@@ -580,6 +602,160 @@ var eventQueueTimer = null;
 var persistedQueueLoaded = false;
 var storageWriteChain = Promise.resolve();
 var flushPromise = null;
+const initializedMetaBrowserPixelIds = new Set();
+var metaBrowserSdkLoading = false;
+var metaBrowserSdkLoadAttempts = 0;
+var metaBrowserSdkRetryAt = 0;
+var metaRouteConfigPromise = null;
+var metaRouteConfigPending = false;
+
+function normalizedMetaPixelIds() {
+    return Array.from(new Set(META_ROUTE_PIXEL_IDS.map(function (value) {
+        return String(value || '').trim();
+    }).filter(function (value) {
+        return /^\\d{5,32}$/.test(value);
+    })));
+}
+
+function trimMetaBrowserQueue() {
+    var fbq = typeof window !== 'undefined' && window.fbq;
+    var queue = fbq && fbq.queue;
+    if (!Array.isArray(queue) || fbq.callMethod || queue.length <= META_PIXEL_MAX_QUEUE_SIZE) return;
+
+    function removeOldest(predicate) {
+        var index = queue.findIndex(function (call) {
+            return call && call[0] !== 'init' && predicate(call);
+        });
+        if (index < 0) return false;
+        queue.splice(index, 1);
+        return true;
+    }
+
+    while (queue.length > META_PIXEL_MAX_QUEUE_SIZE) {
+        if (removeOldest(function (call) { return META_PIXEL_LOW_PRIORITY_EVENTS.has(call[2]); })) continue;
+        if (removeOldest(function (call) { return call[2] !== 'Purchase'; })) continue;
+        if (removeOldest(function () { return true; })) continue;
+        break;
+    }
+}
+
+function injectMetaBrowserPixelScript() {
+    if (metaBrowserSdkLoading || metaBrowserSdkLoadAttempts >= META_PIXEL_MAX_LOAD_ATTEMPTS) return;
+    if (Date.now() < metaBrowserSdkRetryAt) return;
+
+    metaBrowserSdkLoading = true;
+    metaBrowserSdkLoadAttempts += 1;
+    var attempt = metaBrowserSdkLoadAttempts;
+    try {
+        var script = document.createElement('script');
+        script.async = true;
+        script.src = META_PIXEL_SCRIPT_URL;
+        script.onload = function () {
+            metaBrowserSdkLoading = false;
+            metaBrowserSdkRetryAt = 0;
+            trimMetaBrowserQueue();
+        };
+        script.onerror = function () {
+            metaBrowserSdkLoading = false;
+            var delay = META_PIXEL_RETRY_BACKOFF_MS[Math.min(attempt - 1, META_PIXEL_RETRY_BACKOFF_MS.length - 1)];
+            metaBrowserSdkRetryAt = Date.now() + delay;
+            console.warn('Meta browser Pixel SDK failed to load (attempt ' + attempt + '); server CAPI remains active');
+            if (attempt < META_PIXEL_MAX_LOAD_ATTEMPTS && typeof setTimeout === 'function') {
+                setTimeout(function () {
+                    if (!metaBrowserSdkLoading && metaBrowserSdkLoadAttempts === attempt) {
+                        metaBrowserSdkRetryAt = 0;
+                        bootstrapMetaBrowserPixel();
+                    }
+                }, delay + 25);
+            }
+        };
+        var firstScript = document.getElementsByTagName && document.getElementsByTagName('script')[0];
+        if (firstScript && firstScript.parentNode) firstScript.parentNode.insertBefore(script, firstScript);
+        else {
+            var scriptParentNode = document.head || document.body || document.documentElement;
+            if (!scriptParentNode || !scriptParentNode.appendChild) throw new Error('No script parent available');
+            scriptParentNode.appendChild(script);
+        }
+    } catch (error) {
+        metaBrowserSdkLoading = false;
+        var retryDelay = META_PIXEL_RETRY_BACKOFF_MS[Math.min(attempt - 1, META_PIXEL_RETRY_BACKOFF_MS.length - 1)];
+        metaBrowserSdkRetryAt = Date.now() + retryDelay;
+        console.warn('Meta browser Pixel SDK injection failed; server CAPI remains active');
+        if (attempt < META_PIXEL_MAX_LOAD_ATTEMPTS && typeof setTimeout === 'function') {
+            setTimeout(function () {
+                if (!metaBrowserSdkLoading && metaBrowserSdkLoadAttempts === attempt) {
+                    metaBrowserSdkRetryAt = 0;
+                    bootstrapMetaBrowserPixel();
+                }
+            }, retryDelay + 25);
+        }
+    }
+}
+
+function bootstrapMetaBrowserPixel() {
+    var pixelIds = normalizedMetaPixelIds();
+    if (!pixelIds.length || typeof window === 'undefined' || typeof document === 'undefined') return false;
+
+    try {
+        if (!window.fbq) {
+            var fbq = function () {
+                if (fbq.callMethod) fbq.callMethod.apply(fbq, arguments);
+                else fbq.queue.push(arguments);
+            };
+            window.fbq = fbq;
+            window._fbq = fbq;
+            fbq.push = fbq;
+            fbq.loaded = true;
+            fbq.version = '2.0';
+            fbq.queue = [];
+        }
+
+        if (!window.fbq.callMethod) injectMetaBrowserPixelScript();
+
+        pixelIds.forEach(function (pixelId) {
+            if (initializedMetaBrowserPixelIds.has(pixelId)) return;
+            window.fbq('init', pixelId);
+            initializedMetaBrowserPixelIds.add(pixelId);
+        });
+        trimMetaBrowserQueue();
+        return true;
+    } catch (error) {
+        console.warn('Meta browser Pixel initialization failed; server CAPI remains active');
+        return false;
+    }
+}
+
+function metaBrowserCustomData(customData) {
+    customData = customData || {};
+    return compact({
+        value: customData.value,
+        currency: customData.currency,
+        content_ids: customData.content_ids,
+        contents: customData.contents,
+        content_type: customData.content_type,
+        num_items: customData.num_items,
+        search_string: customData.search_string,
+        content_name: customData.content_name,
+        content_category: customData.content_category,
+        order_id: customData.order_id,
+    });
+}
+
+function sendMetaBrowserEvent(eventName, eventId, customData) {
+    if (!eventId || !bootstrapMetaBrowserPixel()) return false;
+    var command = META_STANDARD_BROWSER_EVENTS.has(eventName) ? 'trackSingle' : 'trackSingleCustom';
+    var parameters = metaBrowserCustomData(customData);
+    var options = { eventID: String(eventId) };
+    normalizedMetaPixelIds().forEach(function (pixelId) {
+        try {
+            window.fbq(command, pixelId, eventName, parameters, options);
+        } catch (error) {
+            console.warn('Meta browser Pixel event failed for dataset ' + pixelId);
+        }
+    });
+    trimMetaBrowserQueue();
+    return true;
+}
 
 async function getCookieValue(name) {
     try {
@@ -626,6 +802,74 @@ async function removeStorageValue(key) {
     } catch (error) {}
 }
 
+function applyMetaRoutePixelIds(values) {
+    if (!Array.isArray(values)) return false;
+    META_ROUTE_PIXEL_IDS = Array.from(new Set(values.map(function (value) {
+        return String(value || '').trim();
+    }).filter(function (value) {
+        return /^\\d{5,32}$/.test(value);
+    })));
+    return true;
+}
+
+async function refreshMetaRouteConfig() {
+    try {
+        var cachedText = await getStorageValue(META_ROUTE_CONFIG_STORAGE_KEY);
+        var cached = cachedText ? JSON.parse(cachedText) : null;
+        if (cached && cached.shop_domain === SHOP_DOMAIN
+            && Number(cached.expires_at || 0) > Date.now()
+            && Array.isArray(cached.pixel_ids)) {
+            applyMetaRoutePixelIds(cached.pixel_ids);
+        }
+    } catch (error) {}
+
+    var options = requestOptionsForBody(JSON.stringify({
+        shop_domain: SHOP_DOMAIN,
+        ingest_token: SHOP_INGEST_TOKEN,
+    }));
+    options.keepalive = false;
+    try {
+        var response = await fetch(CAPI_PIXEL_CONFIG_URL, options);
+        if (!response || response.ok === false || typeof response.json !== 'function') return false;
+        var payload = await response.json();
+        if (!payload || payload.shop_domain !== SHOP_DOMAIN || !Array.isArray(payload.pixel_ids)) return false;
+        applyMetaRoutePixelIds(payload.pixel_ids);
+        await setStorageValue(META_ROUTE_CONFIG_STORAGE_KEY, JSON.stringify({
+            shop_domain: SHOP_DOMAIN,
+            pixel_ids: META_ROUTE_PIXEL_IDS,
+            expires_at: Date.now() + META_ROUTE_CONFIG_TTL_MS,
+        }));
+        return true;
+    } catch (error) {
+        return false;
+    } finally {
+        if (options._timeoutId) clearTimeout(options._timeoutId);
+    }
+}
+
+async function waitForMetaRouteConfig() {
+    if (!metaRouteConfigPromise || !metaRouteConfigPending) return;
+    await Promise.race([
+        metaRouteConfigPromise,
+        new Promise(function (resolve) { setTimeout(resolve, META_ROUTE_CONFIG_WAIT_MS); }),
+    ]);
+}
+
+function startMetaRouteConfigRefresh() {
+    metaRouteConfigPending = true;
+    metaRouteConfigPromise = refreshMetaRouteConfig().finally(function () {
+        metaRouteConfigPending = false;
+    });
+}
+
+function scheduleMetaRouteConfigRefresh() {
+    if (typeof setTimeout !== 'function') return;
+    setTimeout(function () {
+        startMetaRouteConfigRefresh();
+        scheduleMetaRouteConfigRefresh();
+    }, META_ROUTE_CONFIG_TTL_MS);
+}
+
 function moneyAmount(value) {
     var raw = value && typeof value === 'object'
         ? firstNonEmpty(value.amount, value.value)
@@ -652,12 +896,42 @@ function normalizeShopifyId(value) {
     return text.slice(marker.length).split('/').pop() || undefined;
 }
 
-function shopScopedIdentifier(value) {
+function fallbackIdentifierDigest(value) {
+    var text = String(value || '');
+    var seeds = [2166136261, 2246822507, 3266489909, 668265263];
+    return seeds.map(function (seed, seedIndex) {
+        var hash = seed >>> 0;
+        for (var index = 0; index < text.length; index += 1) {
+            hash ^= text.charCodeAt(index) + seedIndex;
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+    }).join('');
+}
+
+async function rawSha256Hex(value) {
+    try {
+        var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+        var subtle = cryptoApi && cryptoApi.subtle;
+        var encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : undefined;
+        if (subtle && encoder) {
+            return toHex(await subtle.digest('SHA-256', encoder.encode(String(value))));
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+async function shopScopedIdentifier(value, maxLength) {
     var normalized = normalizeShopifyId(value);
     if (!normalized) return undefined;
     var prefix = String(SHOP_DOMAIN || '').trim().toLowerCase() + ':';
     var text = String(normalized).trim();
-    return text.toLowerCase().indexOf(prefix) === 0 ? prefix + text.slice(prefix.length) : prefix + text;
+    var scoped = text.toLowerCase().indexOf(prefix) === 0 ? prefix + text.slice(prefix.length) : prefix + text;
+    var boundedLength = Number(maxLength || 255);
+    if (scoped.length <= boundedLength) return scoped;
+    var digest = await rawSha256Hex(scoped) || fallbackIdentifierDigest(scoped);
+    var suffix = String(digest).slice(0, 32);
+    return scoped.slice(0, Math.max(0, boundedLength - suffix.length - 1)) + '-' + suffix;
 }
 
 function lineItemToContent(item) {
@@ -874,7 +1148,8 @@ async function getFbp() {
 }
 
 async function getOrCreateFbc(href) {
-    var fbclid = getUrlParam('fbclid', href);
+    var fbclid = String(getUrlParam('fbclid', href) || '').trim();
+    if (!fbclid || fbclid.length > 1024 || /\\s/.test(fbclid)) fbclid = undefined;
     var existing = await getCookieValue('_fbc');
     if (fbclid && (!existing || !existing.endsWith('.' + fbclid))) {
         var generated = 'fb.1.' + Date.now() + '.' + fbclid;
@@ -899,12 +1174,11 @@ async function rememberTtclid(href) {
     return getCookieValue('ttclid');
 }
 
-function primaryExternalId(event, customer, checkout, shopifyY, checkoutToken) {
+function primaryExternalId(event, customer, checkout, checkoutToken) {
     return firstNonEmpty(
         normalizeShopifyId(customer && customer.id),
         normalizeShopifyId(checkout && checkout.order && checkout.order.customer && checkout.order.customer.id),
         event && event.clientId,
-        shopifyY,
         checkoutToken
     );
 }
@@ -1199,7 +1473,7 @@ function flushEventQueue() {
     return flushPromise;
 }
 
-async function sendGatewayEvent(metaEventName, event, customData, forcedEventId) {
+async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
     customData = customData || {};
     event = event || {};
     var initContext = getInitContext();
@@ -1211,27 +1485,32 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
     var fallbackNavigatorInfo = initContext.navigator || {};
     var locationInfo = documentInfo.location || fallbackDocumentInfo.location || {};
     var checkout = event.data && event.data.checkout || {};
+    var normalizedOrderId = normalizeShopifyId(checkout.order && checkout.order.id);
+    var orderId = firstNonEmpty(checkout.order && checkout.order.name, normalizedOrderId);
     var customer = event.data && event.data.customer || checkout.order && checkout.order.customer || initData.customer || {};
     var billingAddress = checkout.billingAddress || {};
     var shippingAddress = checkout.shippingAddress || {};
     var address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
     var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer || fallbackDocumentInfo.URL || fallbackDocumentInfo.referrer;
-    var eventId = String(shopScopedIdentifier(
+    var eventId = String(await shopScopedIdentifier(
         eventIdFrom(forcedEventId) || event.id || await fallbackEventId(metaEventName, event, currentUrl)
     ));
     if (!shouldSendRecentEvent(metaEventName, eventId)) return;
+    await waitForMetaRouteConfig();
+    var scopedOrderId = await shopScopedIdentifier(firstNonEmpty(customData.order_id, orderId));
+    var browserCustomData = {
+        ...customData,
+        order_id: scopedOrderId,
+    };
+    sendMetaBrowserEvent(metaEventName, eventId, browserCustomData);
 
     var fbp = await getFbp();
     var fbc = await getOrCreateFbc(currentUrl);
     var ttp = await getTtp();
     var ttclid = await rememberTtclid(currentUrl);
-    var shopifyY = await getCookieValue('_shopify_y');
-    var shopifyS = await getCookieValue('_shopify_s');
     var checkoutToken = checkout.token || checkout.checkoutToken;
     var cartToken = normalizeShopifyId(event.data && event.data.cart && event.data.cart.id || checkout.cartToken);
-    var normalizedOrderId = normalizeShopifyId(checkout.order && checkout.order.id);
-    var orderId = firstNonEmpty(checkout.order && checkout.order.name, normalizedOrderId);
-    var externalId = primaryExternalId(event, customer, checkout, shopifyY, checkoutToken);
+    var externalId = primaryExternalId(event, customer, checkout, checkoutToken);
     var rawEmail = customer.email || checkout.email;
     var rawPhone = customer.phone || checkout.phone || address.phone;
     var rawFirstName = customer.firstName || address.firstName;
@@ -1279,8 +1558,6 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
             fbc: fbc,
             ttp: ttp,
             ttclid: ttclid,
-            shopify_y: shopifyY,
-            shopify_s: shopifyS,
             email_hash: hashedFields[0],
             phone_hash: hashedFields[1],
             first_name_hash: hashedFields[2],
@@ -1289,10 +1566,10 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
             state_hash: hashedFields[5],
             zip_hash: hashedFields[6],
             country_hash: hashedFields[7],
-            client_id: event.clientId || shopifyY,
+            client_id: event.clientId,
             checkout_token: checkoutToken,
             cart_token: cartToken,
-            order_id: orderId,
+            order_id: scopedOrderId,
             route_hints: {
                 facebook_pixel_ids: META_ROUTE_PIXEL_IDS,
                 tiktok_pixel_ids: TIKTOK_ROUTE_PIXEL_IDS,
@@ -1310,15 +1587,18 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
         }));
 }
 
+startMetaRouteConfigRefresh();
+scheduleMetaRouteConfigRefresh();
+
 analytics.subscribe('page_viewed', function (event) {
-    return sendGatewayEvent('PageView', event);
+    return sendDualChannelEvent('PageView', event);
 });
 
 analytics.subscribe('cart_viewed', function (event) {
     var cart = event.data && event.data.cart || {};
     var lines = cart.lines || cart.cartLines || [];
     var contents = lines.map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('CartView', event, {
+    return sendDualChannelEvent('CartView', event, {
         value: moneyAmount(cart.cost && cart.cost.totalAmount),
         currency: moneyCurrency(cart.cost && cart.cost.totalAmount),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1330,7 +1610,7 @@ analytics.subscribe('cart_viewed', function (event) {
 
 analytics.subscribe('collection_viewed', function (event) {
     var collection = event.data && event.data.collection || {};
-    return sendGatewayEvent('CollectionView', event, {
+    return sendDualChannelEvent('CollectionView', event, {
         content_category: collection.title,
         content_name: collection.title,
     });
@@ -1340,7 +1620,7 @@ analytics.subscribe('product_viewed', function (event) {
     var variant = event.data && event.data.productVariant || {};
     var product = event.data && event.data.product || variant.product || {};
     var contentId = normalizeShopifyId(variant.id || product.id);
-    return sendGatewayEvent('ViewContent', event, {
+    return sendDualChannelEvent('ViewContent', event, {
         value: moneyAmount(variant.price),
         currency: moneyCurrency(variant.price),
         content_ids: contentId ? [contentId] : undefined,
@@ -1355,7 +1635,7 @@ analytics.subscribe('product_added_to_cart', function (event) {
     var content = lineItemToContent(line);
     var variant = line.merchandise || line.variant || {};
     var product = variant.product || line.product || {};
-    return sendGatewayEvent('AddToCart', event, {
+    return sendDualChannelEvent('AddToCart', event, {
         value: moneyAmount(line.cost && line.cost.totalAmount),
         currency: moneyCurrency(line.cost && line.cost.totalAmount),
         content_ids: content.id ? [content.id] : undefined,
@@ -1370,7 +1650,7 @@ analytics.subscribe('product_added_to_cart', function (event) {
 analytics.subscribe('product_removed_from_cart', function (event) {
     var line = event.data && event.data.cartLine || {};
     var content = lineItemToContent(line);
-    return sendGatewayEvent('RemoveFromCart', event, {
+    return sendDualChannelEvent('RemoveFromCart', event, {
         value: moneyAmount(line.cost && line.cost.totalAmount),
         currency: moneyCurrency(line.cost && line.cost.totalAmount),
         content_ids: content.id ? [content.id] : undefined,
@@ -1383,7 +1663,7 @@ analytics.subscribe('product_removed_from_cart', function (event) {
 analytics.subscribe('checkout_started', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('InitiateCheckout', event, {
+    return sendDualChannelEvent('InitiateCheckout', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1396,7 +1676,7 @@ analytics.subscribe('checkout_started', function (event) {
 analytics.subscribe('checkout_contact_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('CheckoutContactInfoSubmitted', event, {
+    return sendDualChannelEvent('CheckoutContactInfoSubmitted', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1409,7 +1689,7 @@ analytics.subscribe('checkout_contact_info_submitted', function (event) {
 analytics.subscribe('checkout_address_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('CheckoutAddressInfoSubmitted', event, {
+    return sendDualChannelEvent('CheckoutAddressInfoSubmitted', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1422,7 +1702,7 @@ analytics.subscribe('checkout_address_info_submitted', function (event) {
 analytics.subscribe('checkout_shipping_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('CheckoutShippingInfoSubmitted', event, {
+    return sendDualChannelEvent('CheckoutShippingInfoSubmitted', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1435,7 +1715,7 @@ analytics.subscribe('checkout_shipping_info_submitted', function (event) {
 analytics.subscribe('payment_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('AddPaymentInfo', event, {
+    return sendDualChannelEvent('AddPaymentInfo', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1448,7 +1728,7 @@ analytics.subscribe('payment_info_submitted', function (event) {
 analytics.subscribe('checkout_completed', function (event) {
     var checkout = event.data && event.data.checkout || {};
     var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
-    return sendGatewayEvent('Purchase', event, {
+    return sendDualChannelEvent('Purchase', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
@@ -1461,7 +1741,7 @@ analytics.subscribe('checkout_completed', function (event) {
 
 analytics.subscribe('search_submitted', function (event) {
     var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
-    return sendGatewayEvent('Search', event, { search_string: query });
+    return sendDualChannelEvent('Search', event, { search_string: query });
 });
 `;
                 },

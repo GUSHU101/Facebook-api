@@ -85,7 +85,7 @@ Cloudflare Token 应只拥有目标 Zone 所需的 DNS 编辑权限。不要把 
 | `ADMIN_PASSWORD` | 自动生成 | 后台强密码；自定义值不能含空白、`#` 或引号 |
 | `AES_SECRET_KEY` | 自动生成 | 至少 32 字符且不能含空白、`#` 或引号，永久保留 |
 | `INGEST_TOKEN_SECRET` | 自动生成 | 独立的店铺采集 Token 密钥，永久保留 |
-| `CORS_ORIGIN` | `*` | 建议保持 `*` 以兼容 Shopify 客户事件沙箱；仅采集接口启用 CORS且不使用 Cookie 凭据 |
+| `CORS_ORIGIN` | `*` | 建议保持 `*` 以兼容 Shopify 客户事件沙箱；仅采集与 Pixel 配置接口启用 CORS，且不使用 Cookie 凭据 |
 | `SHOPIFY_WEB_ORDER_SOURCES` | `web` | 可生成网站 Purchase 的 Shopify 来源白名单 |
 | `SHOPIFY_APP_SECRET` | 空 | 同一个自建应用跨多个店铺时可选的共享 Client Secret；每店独立应用时留空 |
 | `DB_POOL_MAX` | `20` | 每个 API/Worker 进程的连接池上限 |
@@ -135,7 +135,7 @@ sudo env \
 
 ## 6. 重复执行和升级安全
 
-升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v11` 代码重新复制到每个 Shopify 店铺。服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。
+升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v14` 代码重新复制到每个 Shopify 店铺。v14 会自动同时运行浏览器 Meta Pixel 与本项目 CAPI、复用相同 eventID，把浏览器/CAPI 订单 ID 都按店铺隔离，并增加 SDK 有界重试、浏览器队列上限和每 60 秒活动路由同步；服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。以后日常新增、停用或重新分配 Pixel 不需要仅为路由列表重贴代码。连接前请停用相同 Dataset 的主题 Meta 代码、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，避免重复事件源。
 
 安装器可以重复运行。只要 `${APP_DIR}/.env` 已存在且 `FORCE_ENV_REWRITE` 不是 `1`，脚本会：
 

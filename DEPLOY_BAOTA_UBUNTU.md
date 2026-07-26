@@ -111,6 +111,7 @@ SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
 SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
 SHOPIFY_RECONCILE_MAX_ORDERS=1000
 SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES=100
+COMMERCE_ITEM_LIMIT=1000
 
 # Shopify Customer Events 运行在沙箱中，建议采集接口保持 *；管理接口不启用 CORS。
 CORS_ORIGIN=*
@@ -122,8 +123,9 @@ TRUST_PROXY_HOPS=1
 - `AES_SECRET_KEY` 上线后必须永久保存。更换它会导致已保存的平台 Token 无法解密，`npm run doctor` 会直接报告失败而不是让密文被误当作令牌继续运行。
 - `INGEST_TOKEN_SECRET` 用于店铺采集 Token，应与 AES 密钥不同并永久备份；轮换时可把旧值暂存到 `INGEST_TOKEN_PREVIOUS_SECRET`，待所有 Shopify 像素更新后清空。
 - `SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值。只有确认某个 Headless/自定义销售渠道属于网站流量时，才加入对应 `source_name`。
-- Shopify 客户事件沙箱的请求 Origin 不应假定为店铺域名。`/api/pixel-event` 不使用 Cookie 身份，建议保持 `CORS_ORIGIN=*`；管理 API 没有启用 CORS，采集安全由店铺 Token、租户校验、限流和服务端路由承担。
+- Shopify 客户事件沙箱的请求 Origin 不应假定为店铺域名。`/api/pixel-event` 与 `/api/pixel-config` 不使用 Cookie 身份，建议保持 `CORS_ORIGIN=*`；管理 API 没有启用 CORS，采集安全由店铺 Token、租户校验、限流和服务端路由承担。
 - `PIXEL_RATE_LIMIT_PER_MINUTE=600` 是默认的店铺/IP 宽松保护，多 API 实例通过 Redis 共用计数；Redis 故障时自动退回单进程保护。设为 `0` 前必须确认 CDN/WAF 已提供可靠限流。
+- `COMMERCE_ITEM_LIMIT=1000` 控制单个购物事件最多保留的商品行数，可按超大订单需求提高，但不得超过 5000；系统会对超限事件记录截断诊断，避免单个异常请求无限占用内存。
 - 不要把 `.env` 上传到 GitHub、网盘或工单。
 
 ### 多实例容量
@@ -262,7 +264,7 @@ shop/redact            → https://capi.example.com:8443/api/webhook/shop/redact
 
 ## 11. 安全升级、备份和回滚
 
-每次代码升级并通过健康检查后，都要进入管理后台重新复制当前生成的 Shopify Customer Events 代码到所有店铺。`shopify-pixel-v11` 的店铺级事件 ID、离线队列和 UTF-8 字节容量修复位于店铺端，服务器更新不会自动替换 Shopify 中已粘贴的旧代码。
+每次客户事件代码版本升级并通过健康检查后，都要进入管理后台重新复制当前生成的 Shopify Customer Events 代码到所有店铺。`shopify-pixel-v14` 的店铺级事件/订单 ID、离线队列、Meta SDK 有界重试、浏览器队列上限以及 Pixel/CAPI 双通道逻辑位于店铺端，服务器更新不会自动替换 Shopify 中已粘贴的旧代码。v14 每 60 秒同步当前活动 Meta 路由，因此日常新增、停用或重新分配 Pixel 不需要仅为路由列表重贴代码。连接前请停用相同 Dataset 的主题 Meta 代码、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，避免无法去重的第三条事件源。
 
 升级前：
 

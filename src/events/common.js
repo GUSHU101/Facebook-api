@@ -52,6 +52,55 @@ function tenantScopedExternalId(tenantId, externalId) {
         .digest('hex');
 }
 
+function buildCustomData(payload = {}, commerceItemLimit = 1000) {
+    const itemLimit = Math.max(1, Number(commerceItemLimit) || 1000);
+    const contents = Array.isArray(payload.contents)
+        ? payload.contents.slice(0, itemLimit)
+            .filter(Boolean)
+            .map(item => compactObject({
+                id: firstPresent(item.id, item.content_id)
+                    ? String(firstPresent(item.id, item.content_id))
+                    : undefined,
+                quantity: Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0
+                    ? Number(item.quantity)
+                    : undefined,
+                item_price: Number.isFinite(Number(firstPresent(item.item_price, item.price)))
+                    && Number(firstPresent(item.item_price, item.price)) >= 0
+                    ? Number(firstPresent(item.item_price, item.price))
+                    : undefined,
+            }))
+            .filter(item => item.id)
+        : undefined;
+    // Item-level contents are authoritative. Deriving IDs from them prevents
+    // a stale caller-supplied content_ids list from describing other products.
+    const contentIds = contents?.length
+        ? contents.map(item => String(item.id))
+        : (Array.isArray(payload.content_ids)
+            ? payload.content_ids.slice(0, itemLimit).filter(Boolean).map(String)
+            : undefined);
+    const numItems = Number.isFinite(Number(payload.num_items))
+        ? Number(payload.num_items)
+        : contents?.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+
+    return compactObject({
+        value: payload.value !== undefined && Number.isFinite(Number(payload.value)) && Number(payload.value) >= 0
+            ? Number(payload.value)
+            : undefined,
+        currency: payload.currency ? String(payload.currency).trim().toUpperCase() : undefined,
+        content_ids: contentIds?.length ? contentIds : undefined,
+        contents: contents?.length ? contents : undefined,
+        content_type: payload.content_type,
+        content_name: payload.content_name,
+        content_category: payload.content_category,
+        num_items: numItems > 0 ? numItems : undefined,
+        order_id: tenantScopedIdentifier(
+            firstPresent(payload.tenant_id, payload.shop_domain),
+            payload.order_id,
+        ),
+        search_string: payload.search_string,
+    });
+}
+
 function stripPrivateFields(eventPayload) {
     return Object.fromEntries(Object.entries(eventPayload).filter(([key]) => !key.startsWith('_')));
 }
@@ -70,6 +119,7 @@ function missingCommerceSignals(eventName, customData = {}) {
 }
 
 module.exports = {
+    buildCustomData,
     compactObject,
     firstPresent,
     missingCommerceSignals,

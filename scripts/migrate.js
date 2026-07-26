@@ -35,6 +35,7 @@ async function main() {
         const credentials = await client.query(
             `SELECT id, platform, access_token, rate_limit_group
              FROM pixels
+             WHERE status = 'active'
              ORDER BY id`,
         );
         for (const credential of credentials.rows) {

@@ -165,12 +165,73 @@ worker restarted.
     `updatedAt` is only the moving scan index. Missing fields that the current
     Admin GraphQL Order schema cannot supply, including order-level user agent,
     remain absent instead of being fabricated.
-47. Redis and process-local ingestion limiters charge the same event weight.
-    During a Redis partition, a 50-event HTTP batch consumes 50 local units,
-    and the bounded local key map cannot grow without limit.
+47. Redis and process-local ingestion limiters charge the same weight: the
+    larger of actual event count and one unit per 16 KiB of request body.
+    During a Redis partition, a 50-event HTTP batch consumes at least 50 local
+    units, an oversized single event cannot bypass protection by counting as
+    one, and the bounded local key map cannot grow without limit.
 48. `/readyz` returns HTTP 503 whenever Redis cannot support immediate BullMQ
     dispatch; `/healthz` remains the liveness endpoint. This prevents deployers
     from treating durable-only degraded mode as fully ready.
+49. The generated Shopify custom pixel sends each Meta event through two
+    independently failing channels. Browser `trackSingle`/`trackSingleCustom`
+    and server CAPI use the same event name and store-scoped event ID; a browser
+    SDK load or call failure cannot prevent PostgreSQL ingestion.
+50. Every configured Meta Dataset is initialized once and targeted explicitly.
+    A multi-pixel shop cannot turn a generic browser `track` call into an
+    accidental broadcast, and duplicate Shopify callbacks are suppressed before
+    either browser or server delivery is attempted.
+51. Browser Pixel routing refreshes from a token-validated, server-authoritative
+    configuration endpoint every 60 seconds. The endpoint returns only active
+    Facebook routes, uses a bounded five-second process cache, and never accepts
+    client-supplied delivery targets. A 500 ms first-event wait normally closes
+    the stale embedded-route window; network failure falls back to the generated
+    route list without delaying CAPI durability indefinitely.
+52. The Meta browser SDK loader makes at most three attempts with bounded
+    backoff. While the SDK is unavailable its queue is capped at 500 calls,
+    discarding low-value page/browsing events before Purchase and preserving
+    Pixel initialization calls whenever possible. Browser memory cannot grow
+    without limit while server CAPI remains active.
+53. New Shopify customer-event code uses the documented `event.clientId` and
+    no longer reads `_shopify_y` or `_shopify_s`, which Shopify stopped setting
+    in 2026. Server parsing retains legacy compatibility for already-stored and
+    webhook-provided historical attributes. Oversized or whitespace-containing
+    `fbclid` values cannot be written into `_fbc`.
+54. Browser and server Purchase `order_id` values use the same shop namespace.
+    Two shops sharing a Dataset cannot collide merely because both Shopify
+    stores generated order `#1001`; their event IDs, order IDs, external IDs,
+    aliases, outbox rows, and route ledgers remain tenant-scoped. Identifiers
+    longer than the persistence limit are shortened with the same SHA-256
+    suffix before both browser and CAPI delivery, preserving cross-channel
+    deduplication instead of letting the server silently rewrite only one side.
+55. Shared credential configuration is version-fenced. A worker must observe
+    the same active `credential_version` before sending and before committing a
+    failure. Token rotation during an in-flight request converts an unconfirmed
+    old result into `LOCAL_CREDENTIAL_CHANGED` and reloads the current Token;
+    stale failures cannot poison the replacement credential's cooldown state.
+56. Updating a shared Pixel Token reopens only credential/permission failures
+    for that Pixel and wakes every active routed shop. Confirmed successes and
+    event-specific permanent failures remain immutable, preventing both data
+    loss after credential repair and indiscriminate replay.
+57. Meta Test Event Code belongs to `shop_pixel_routes`, not the shared
+    credential. One shop can be tested without silently placing every other
+    shop using the Dataset into test mode. Dataset Quality polling also uses
+    the exact same credential-scope lease and cooldown as production delivery,
+    so observability traffic cannot bypass shared Meta pacing.
+58. Browser Pixel execution remains subordinate to Shopify Customer Events
+    consent and sandbox controls. The integration never uses theme DOM scraping
+    or treats browser delivery as the Purchase payment authority; verified
+    `orders/paid` remains the server-side Purchase gate and fallback.
+59. Commerce payload construction no longer discards every line after a fixed
+    200-item boundary. Shopify reconciliation still paginates all line items;
+    the final event retains up to the explicit `COMMERCE_ITEM_LIMIT` (1000 by
+    default, at most 5000) and records a truncation diagnostic if an extreme
+    order exceeds that operational safety boundary.
+60. Admin authentication and brute-force limiting execute before JSON parsing,
+    and every authenticated admin page/API response defaults to `private,
+    no-store`. Unauthenticated oversized bodies cannot consume the full admin
+    parser allowance, and browsers/proxies cannot retain operational customer
+    data after logout.
 
 ## Storefront ingestion abuse boundary
 
@@ -308,6 +369,34 @@ Before production rollout, verify all of the following in a staging stack:
 33. Stop Redis and send repeated 50-event requests against a 600-event local
     ceiling. The thirteenth request must receive 429, and `/readyz` must return
     HTTP 503 while `/healthz` remains live.
+34. Generate a shop with two Meta Datasets and trigger every supported Shopify
+    event. Each Dataset must receive exactly one targeted browser call and one
+    CAPI ledger using the same `event_name`/`eventID`; custom events must use
+    `trackSingleCustom`.
+35. Block `connect.facebook.net` or force `fbq` to throw. The corresponding
+    event must still be persisted and delivered through CAPI without changing
+    its event ID.
+36. Fail the first Meta SDK download, then restore the network. A later bounded
+    retry must inject the SDK again; more than 500 queued browser calls must
+    retain Pixel initialization and Purchase while shedding old PageView calls.
+37. Change a shop from two active Meta routes to a different route without
+    replacing its Shopify custom-pixel code. After configuration refresh, only
+    the new Dataset may receive targeted browser calls; CAPI must continue to
+    derive its targets solely from PostgreSQL.
+38. Bind two shops to the same Pixel, send the same Shopify-local event and
+    order identifiers from both shops, and verify their store-scoped IDs,
+    events, aliases, attribution, and delivery ledgers remain distinct. A
+    cross-shop event/route ledger insert must fail with SQLSTATE `23514`.
+39. Give only one of two shared-Pixel routes a Meta Test Event Code. Only that
+    route's CAPI request may contain the code; the second shop and browser
+    Pixel calls must remain unaffected.
+40. Rotate a shared Pixel Token while one worker is in flight. An unconfirmed
+    old-token failure must become `LOCAL_CREDENTIAL_CHANGED`, must not consume
+    a platform attempt under the replacement version, and all active routed
+    shops with recoverable credential failures must resume.
+41. Start Dataset Quality refresh while a shared-Pixel delivery owns the
+    credential lease. The refresh must defer rather than bypassing the lease,
+    and both paths must honor the same persisted cooldown and usage state.
 
 ## Official references used
 
@@ -329,8 +418,28 @@ Before production rollout, verify all of the following in a staging stack:
   https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
 - Meta Graph API error handling:
   https://developers.facebook.com/docs/graph-api/guides/error-handling/
+- Meta guidance for using Conversions API with the Pixel:
+  https://www.facebook.com/business/help/AboutConversionsAPI
+- Meta Business Tools Terms and consent requirements:
+  https://www.facebook.com/legal/terms/businesstools/preview
 - Shopify Web Pixels API:
   https://shopify.dev/docs/api/web-pixels-api
+- Shopify Web Pixels standard API (`analytics`, `browser`, `init`, privacy):
+  https://shopify.dev/docs/api/web-pixels-api/standard-api
+- Shopify custom pixels and Lax sandbox:
+  https://help.shopify.com/en/manual/promoting-marketing/pixels/custom-pixels
+- Shopify custom Meta pixel SDK/event example:
+  https://help.shopify.com/en/manual/promoting-marketing/pixels/custom-pixels/code
+- Shopify pixel sandbox behavior and consent:
+  https://help.shopify.com/en/manual/promoting-marketing/pixels/overview
+- Shopify custom-pixel testing and consent diagnostics:
+  https://help.shopify.com/en/manual/promoting-marketing/pixels/custom-pixels/testing
+- Shopify `checkout_completed` semantics:
+  https://shopify.dev/docs/api/web-pixels-api/standard-events/checkout_completed
+- Shopify `_shopify_y`/`_shopify_s` deprecation and `event.clientId` replacement:
+  https://shopify.dev/changelog/shopifyy-and-shopifys-cookies-will-no-longer-be-set
+- Shopify theme app extension checkout restriction:
+  https://shopify.dev/docs/apps/build/online-store/theme-app-extensions/configuration
 - Shopify standard customer events:
   https://shopify.dev/docs/api/web-pixels-api/standard-events
 - Shopify webhook verification and duplicate handling:

@@ -106,9 +106,17 @@ if (aesSecretKey.length < 32) {
     throw new Error('AES_SECRET_KEY must be at least 32 characters');
 }
 
-const ingestTokenSecret = process.env.INGEST_TOKEN_SECRET || aesSecretKey;
+const production = process.env.NODE_ENV === 'production';
+const configuredIngestTokenSecret = String(process.env.INGEST_TOKEN_SECRET || '').trim();
+if (production && !configuredIngestTokenSecret) {
+    throw new Error('INGEST_TOKEN_SECRET must be set separately from AES_SECRET_KEY in production');
+}
+const ingestTokenSecret = configuredIngestTokenSecret || aesSecretKey;
 if (ingestTokenSecret.length < 32) {
     throw new Error('INGEST_TOKEN_SECRET must be at least 32 characters');
+}
+if (production && ingestTokenSecret === aesSecretKey) {
+    throw new Error('INGEST_TOKEN_SECRET must differ from AES_SECRET_KEY in production');
 }
 const ingestTokenPreviousSecret = String(process.env.INGEST_TOKEN_PREVIOUS_SECRET || '').trim();
 if (ingestTokenPreviousSecret && ingestTokenPreviousSecret.length < 32) {
@@ -129,6 +137,19 @@ if (shutdownTimeoutMs <= httpRequestTimeoutMs) {
     throw new Error('SHUTDOWN_TIMEOUT_MS must exceed HTTP_REQUEST_TIMEOUT_MS');
 }
 
+const adminUsername = readRequired('ADMIN_USERNAME');
+const adminPassword = readRequired('ADMIN_PASSWORD');
+const requireIngestToken = readBool('REQUIRE_INGEST_TOKEN', true);
+if (production && adminPassword.length < 16) {
+    throw new Error('ADMIN_PASSWORD must be at least 16 characters in production');
+}
+if (production && adminPassword === adminUsername) {
+    throw new Error('ADMIN_PASSWORD must differ from ADMIN_USERNAME in production');
+}
+if (production && !requireIngestToken) {
+    throw new Error('REQUIRE_INGEST_TOKEN must remain enabled in production');
+}
+
 module.exports = {
     port: readBoundedInt('PORT', 3000, 65535),
     databaseUrl: readRequired('DATABASE_URL'),
@@ -137,9 +158,9 @@ module.exports = {
     ingestTokenSecret,
     ingestTokenPreviousSecret,
     maintenanceFile: process.env.MAINTENANCE_FILE || path.join(process.cwd(), '.maintenance'),
-    adminUsername: readRequired('ADMIN_USERNAME'),
-    adminPassword: readRequired('ADMIN_PASSWORD'),
-    requireIngestToken: readBool('REQUIRE_INGEST_TOKEN', true),
+    adminUsername,
+    adminPassword,
+    requireIngestToken,
     shopifyWebOrderSources: readCsv('SHOPIFY_WEB_ORDER_SOURCES', 'web'),
     shopifyAppSecret: String(process.env.SHOPIFY_APP_SECRET || '').trim(),
     shopifyApiVersion: readShopifyApiVersion(),
@@ -150,6 +171,7 @@ module.exports = {
     fbApiVersion: readFacebookApiVersion(),
     corsOrigin: readCorsOrigin(),
     jsonLimit: readJsonLimit(),
+    commerceItemLimit: readBoundedInt('COMMERCE_ITEM_LIMIT', 1000, 5000),
     trustProxy: readNonNegativeInt('TRUST_PROXY_HOPS', 1),
     httpRequestTimeoutMs,
     httpHeadersTimeoutMs,

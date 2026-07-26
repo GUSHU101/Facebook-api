@@ -174,6 +174,86 @@ test('database prevents physical Pixel deletion from cascading delivery history'
     }
 });
 
+test('two shops sharing one Pixel retain isolated routes, test codes, and ledgers', { skip: !enabled }, async () => {
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const suffix = crypto.randomUUID();
+    const shopIds = [];
+    const routeIds = [];
+    const eventIds = [];
+    let pixelId;
+    try {
+        for (const label of ['a', 'b']) {
+            const { rows: [{ id }] } = await pool.query(
+                `INSERT INTO shops (shop_domain, app_secret)
+                 VALUES ($1, 'integration-secret') RETURNING id`,
+                [`shared-${label}-${suffix}.myshopify.com`],
+            );
+            shopIds.push(id);
+        }
+        ({ rows: [{ id: pixelId }] } = await pool.query(
+            `INSERT INTO pixels
+                (shop_id, platform, name, pixel_id, access_token, credential_scope)
+             VALUES ($1, 'facebook', 'shared-integration', $2, 'shared-token', $3)
+             RETURNING id`,
+            [shopIds[0], suffix, `scope-${suffix}`],
+        ));
+        for (let index = 0; index < shopIds.length; index += 1) {
+            const { rows: [{ id: routeId }] } = await pool.query(
+                `INSERT INTO shop_pixel_routes (shop_id, pixel_id, test_event_code)
+                 VALUES ($1, $2, $3) RETURNING id`,
+                [shopIds[index], pixelId, index === 0 ? 'TEST-SHOP-A' : null],
+            );
+            routeIds.push(routeId);
+            const { rows: [{ id: eventStoreId }] } = await pool.query(
+                `INSERT INTO event_store
+                    (shop_id, event_name, event_id, request_payload, delivery_route_snapshot)
+                 VALUES ($1, 'Purchase', 'same-local-order', '{}'::jsonb, ARRAY[$2]::bigint[])
+                 RETURNING id`,
+                [shopIds[index], routeId],
+            );
+            eventIds.push(eventStoreId);
+            await pool.query(
+                'INSERT INTO event_deliveries (event_store_id, route_id) VALUES ($1, $2)',
+                [eventStoreId, routeId],
+            );
+        }
+
+        await assert.rejects(
+            pool.query(
+                'INSERT INTO event_deliveries (event_store_id, route_id) VALUES ($1, $2)',
+                [eventIds[0], routeIds[1]],
+            ),
+            error => error?.code === '23514',
+        );
+        const { rows } = await pool.query(
+            `SELECT event.shop_id, delivery.route_id, route.test_event_code
+             FROM event_store event
+             JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+             JOIN shop_pixel_routes route ON route.id = delivery.route_id
+             WHERE event.id = ANY($1::bigint[])
+             ORDER BY event.shop_id`,
+            [eventIds],
+        );
+        assert.equal(rows.length, 2);
+        assert.equal(String(rows[0].route_id), String(routeIds[0]));
+        assert.equal(rows[0].test_event_code, 'TEST-SHOP-A');
+        assert.equal(String(rows[1].route_id), String(routeIds[1]));
+        assert.equal(rows[1].test_event_code, null);
+    } finally {
+        if (eventIds.length) {
+            await pool.query('DELETE FROM event_store WHERE id = ANY($1::bigint[])', [eventIds]).catch(() => {});
+        }
+        if (routeIds.length) {
+            await pool.query('DELETE FROM shop_pixel_routes WHERE id = ANY($1::bigint[])', [routeIds]).catch(() => {});
+        }
+        if (pixelId) await pool.query('DELETE FROM pixels WHERE id = $1', [pixelId]).catch(() => {});
+        if (shopIds.length) {
+            await pool.query('DELETE FROM shops WHERE id = ANY($1::int[])', [shopIds]).catch(() => {});
+        }
+        await pool.end().catch(() => {});
+    }
+});
+
 test('Redis outage keeps liveness green but makes readiness fail closed', { skip: !enabled }, async () => {
     const port = Number(process.env.INTEGRATION_DEGRADED_PORT || 39092);
     const server = spawn(process.execPath, ['src/server.js'], {

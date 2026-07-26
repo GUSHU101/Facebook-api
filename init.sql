@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS pixels (
     rate_limit_group VARCHAR(100),
     quality_access_token TEXT,
     test_event_code VARCHAR(100),
+    credential_version BIGINT NOT NULL DEFAULT 1,
     rate_limit_until TIMESTAMPTZ,
     last_rate_limit_at TIMESTAMPTZ,
     last_usage_pct NUMERIC(5,2),
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS shop_pixel_routes (
     id BIGSERIAL PRIMARY KEY,
     shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
     pixel_id INTEGER NOT NULL REFERENCES pixels(id) ON DELETE RESTRICT,
+    test_event_code VARCHAR(100),
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (shop_id, pixel_id)
@@ -235,6 +237,7 @@ ALTER TABLE pixels
     ADD COLUMN IF NOT EXISTS credential_scope VARCHAR(64),
     ADD COLUMN IF NOT EXISTS rate_limit_group VARCHAR(100),
     ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS credential_version BIGINT NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS rate_limit_until TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_rate_limit_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_usage_pct NUMERIC(5,2),
@@ -246,6 +249,9 @@ ALTER TABLE pixels
 
 ALTER TABLE pixels
     ALTER COLUMN shop_id DROP NOT NULL;
+
+ALTER TABLE shop_pixel_routes
+    ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100);
 
 DO $$
 BEGIN
@@ -346,6 +352,22 @@ SELECT p.shop_id, p.id
 FROM pixels p
 WHERE p.shop_id IS NOT NULL
 ON CONFLICT (shop_id, pixel_id) DO NOTHING;
+
+-- Test Event Code is a delivery-route setting, not a shared credential
+-- setting. Copy legacy values to every existing route before new releases
+-- begin allowing each shop to configure it independently.
+UPDATE shop_pixel_routes route
+SET test_event_code = pixel.test_event_code
+FROM pixels pixel
+WHERE pixel.id = route.pixel_id
+  AND route.test_event_code IS NULL
+  AND pixel.test_event_code IS NOT NULL;
+
+-- Remove the legacy credential-wide value after copying it. Leaving it as a
+-- fallback would silently re-enable test mode when one route clears its code.
+UPDATE pixels
+SET test_event_code = NULL
+WHERE test_event_code IS NOT NULL;
 
 ALTER TABLE event_store
     ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

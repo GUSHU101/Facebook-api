@@ -13,6 +13,7 @@ process.env.ADMIN_USERNAME ||= 'admin';
 process.env.ADMIN_PASSWORD ||= 'password';
 
 const {
+    buildCustomData,
     missingCommerceSignals,
     normalizeEventId,
     stripPrivateFields,
@@ -921,6 +922,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(schema, /indexdef NOT LIKE '%\(shop_id, event_name, event_id\)%'/);
     assert.match(schema, /rate_limit_until TIMESTAMPTZ/);
     assert.match(schema, /credential_scope VARCHAR\(64\)/);
+    assert.match(schema, /credential_version BIGINT NOT NULL DEFAULT 1/);
+    assert.match(schema, /shop_pixel_routes \([\s\S]*?test_event_code VARCHAR\(100\)/);
+    assert.match(schema, /SET test_event_code = pixel\.test_event_code/);
+    assert.match(schema, /UPDATE pixels[\s\S]*?SET test_event_code = NULL[\s\S]*?WHERE test_event_code IS NOT NULL/);
     assert.match(schema, /ALTER TABLE event_store SET \([\s\S]*?autovacuum_vacuum_scale_factor = 0\.02/);
     assert.match(scaleIndexes, /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_store_pending_shop_time/);
     assert.match(scaleIndexes, /WHERE status = 'PENDING'/);
@@ -940,6 +945,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(workerSource, /lock:delivery-shop:\$\{normalizedShopId\}/);
     assert.match(workerSource, /lock:delivery-credential:\$\{credentialScope\}/);
     assert.match(workerSource, /credentialFingerprint\(\s*pixel\.platform,\s*decryptedCredential,\s*pixel\.rate_limit_group,?\s*\)/);
+    assert.match(workerSource, /credential_version = \$3/);
+    assert.match(workerSource, /LOCAL_CREDENTIAL_CHANGED/);
+    assert.match(workerSource, /p\.rate_limit_group,[\s\S]*?r\.test_event_code/);
+    assert.match(workerSource, /WHERE credential_scope = \$1/);
     assert.match(workerSource, /snapshot_delivery\.event_store_id = ANY\(\$2::bigint\[\]\)/);
     assert.match(workerSource, /SET delivery_route_snapshot = active_routes\.route_ids/);
     assert.match(workerSource, /CARDINALITY\(active_routes\.route_ids\) > 0/);
@@ -985,9 +994,15 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
     assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
     assert.match(serverSource, /tenant_id: shopDomain/);
-    assert.match(serverSource, /order_id: tenantScopedIdentifier\(/);
     assert.match(serverSource, /customer_segmentation: normalizeCustomerSegmentation/);
     assert.match(serverSource, /WHERE platform = \$1 AND pixel_id = \$2/);
+    assert.match(serverSource, /credential_version = credential_version \+ CASE WHEN \$8::boolean THEN 1 ELSE 0 END/);
+    assert.match(serverSource, /RECOVERABLE_META_CREDENTIAL_CODES/);
+    assert.match(serverSource, /recovered_credential_failures: recoveredCredentialFailures/);
+    assert.match(serverSource, /delivery\.error_code = ANY\(\$2::text\[\]\)/);
+    assert.match(serverSource, /INSERT INTO shop_pixel_routes \(shop_id, pixel_id, test_event_code\)/);
+    assert.match(serverSource, /'test_event_code', r\.test_event_code/);
+    assert.match(serverSource, /lock:delivery-credential:\$\{pixel\.credential_scope \|\| pixel\.id\}/);
     assert.match(serverSource, /UNNEST\(\$1::int\[\]\) AS requested\(shop_id\)/);
     assert.match(serverSource, /SET status = 'inactive'[\s\S]*?WHERE pixel_id = \$1/);
     assert.match(serverSource, /error_code = 'ROUTE_INACTIVE'/);
@@ -999,6 +1014,8 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /if \(statusCode >= 500\) throw error/);
     assert.match(serverSource, /requireBoundedString\(trustedPayload\.event_id, 'event_id', 4096\)/);
     assert.match(serverSource, /err\.statusCode \|\| err\.status \|\| 500/);
+    assert.match(serverSource, /payloadWeight = Math\.ceil\(Number\(req\.rawBody\?\.length \|\| 0\) \/ 16_384\)/);
+    assert.match(serverSource, /buildCustomData\(enrichedPayload, config\.commerceItemLimit\)/);
     const redisSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'utils', 'redis.js'), 'utf8');
     assert.match(redisSource, /maxRetriesPerRequest: 1/);
     assert.match(redisSource, /enableOfflineQueue: false/);
@@ -1009,6 +1026,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(migrateSource, /indisunique/);
     assert.match(migrateSource, /Duplicate external Pixel credentials must be consolidated/);
     assert.match(migrateSource, /DROP INDEX CONCURRENTLY IF EXISTS/);
+    assert.match(migrateSource, /FROM pixels[\s\S]*?WHERE status = 'active'[\s\S]*?ORDER BY id/);
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_webhook_inbox/);
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_reconcile_state/);
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_privacy_inbox/);
@@ -1052,6 +1070,43 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
     assert.notEqual(excessiveJsonLimit.status, 0);
     assert.match(excessiveJsonLimit.stderr, /JSON_LIMIT must be between 1kb and 16mb/);
 
+    const excessiveCommerceItems = probeConfig({ COMMERCE_ITEM_LIMIT: '5001' });
+    assert.notEqual(excessiveCommerceItems.status, 0);
+    assert.match(excessiveCommerceItems.stderr, /COMMERCE_ITEM_LIMIT must not exceed 5000/);
+
+    const productionWithoutIngestSecret = probeConfig({
+        NODE_ENV: 'production',
+        ADMIN_PASSWORD: 'production-password-strong',
+        INGEST_TOKEN_SECRET: '',
+    });
+    assert.notEqual(productionWithoutIngestSecret.status, 0);
+    assert.match(productionWithoutIngestSecret.stderr, /INGEST_TOKEN_SECRET must be set separately/);
+
+    const productionSharedSecrets = probeConfig({
+        NODE_ENV: 'production',
+        ADMIN_PASSWORD: 'production-password-strong',
+        INGEST_TOKEN_SECRET: 'test-secret-key-with-at-least-32-chars',
+    });
+    assert.notEqual(productionSharedSecrets.status, 0);
+    assert.match(productionSharedSecrets.stderr, /INGEST_TOKEN_SECRET must differ from AES_SECRET_KEY/);
+
+    const productionWeakAdminPassword = probeConfig({
+        NODE_ENV: 'production',
+        ADMIN_PASSWORD: 'short',
+        INGEST_TOKEN_SECRET: 'separate-ingest-secret-with-32-characters',
+    });
+    assert.notEqual(productionWeakAdminPassword.status, 0);
+    assert.match(productionWeakAdminPassword.stderr, /ADMIN_PASSWORD must be at least 16 characters/);
+
+    const productionWithoutIngestEnforcement = probeConfig({
+        NODE_ENV: 'production',
+        ADMIN_PASSWORD: 'production-password-strong',
+        INGEST_TOKEN_SECRET: 'separate-ingest-secret-with-32-characters',
+        REQUIRE_INGEST_TOKEN: 'false',
+    });
+    assert.notEqual(productionWithoutIngestEnforcement.status, 0);
+    assert.match(productionWithoutIngestEnforcement.stderr, /REQUIRE_INGEST_TOKEN must remain enabled/);
+
     const malformedApiVersion = probeConfig({ FB_API_VERSION: '../latest' });
     assert.notEqual(malformedApiVersion.status, 0);
     assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v25\.0/);
@@ -1092,7 +1147,16 @@ test('CORS and partial-delivery safeguards remain wired into the runtime', () =>
     const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
     const workerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'worker.js'), 'utf8');
 
-    assert.match(serverSource, /app\.use\('\/api\/pixel-event', cors\(/);
+    assert.match(serverSource, /app\.use\(\['\/api\/pixel-event', '\/api\/pixel-config'\], cors\(/);
+    assert.ok(
+        serverSource.indexOf("app.use('/api/admin', adminLimiter, authMw")
+            < serverSource.indexOf('app.use(express.json'),
+        'admin authentication must run before JSON body parsing',
+    );
+    assert.match(serverSource, /Cache-Control', 'private, no-store'/);
+    assert.match(serverSource, /app\.post\('\/api\/pixel-config', asyncHandler/);
+    assert.match(serverSource, /pixel\.platform = 'facebook'/);
+    assert.match(serverSource, /PIXEL_CONFIG_CACHE_TTL_MS/);
     assert.doesNotMatch(serverSource, /app\.use\(cors\(/);
     assert.doesNotMatch(serverSource, /contentSecurityPolicy: false/);
     assert.doesNotMatch(serverSource, /https:\/\/cdn\.tailwindcss\.com/);
@@ -1113,7 +1177,30 @@ test('long event IDs retain a collision-resistant suffix before persistence', ()
     assert.equal(normalizeEventId('gid://shopify/Order/12345'), '12345');
 });
 
-test('generated Shopify pixel uses unique checkout stage event IDs while preserving Purchase dedupe ID', async () => {
+test('commerce events retain multi-page order contents up to the configured safety boundary', () => {
+    const contents = Array.from({ length: 300 }, (_, index) => ({
+        id: `variant-${index + 1}`,
+        quantity: 1,
+        item_price: index + 0.5,
+    }));
+    const customData = buildCustomData({
+        shop_domain: 'demo.myshopify.com',
+        order_id: '#1001',
+        value: 999,
+        currency: 'usd',
+        contents,
+        content_ids: ['stale-product'],
+    }, 1000);
+
+    assert.equal(customData.contents.length, 300);
+    assert.equal(customData.content_ids.length, 300);
+    assert.equal(customData.content_ids.includes('stale-product'), false);
+    assert.equal(customData.order_id, 'demo.myshopify.com:#1001');
+    assert.equal(customData.currency, 'USD');
+    assert.equal(buildCustomData({ contents }, 250).contents.length, 250);
+});
+
+test('generated Shopify pixel sends Meta browser and CAPI events with identical dedupe IDs', async () => {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
     const match = html.match(/generatedCode\(\)\s*{\s*return `([\s\S]*?)`;\s*}\s*,\s*}\s*,\s*methods:/);
     assert.ok(match, 'generatedCode template should exist');
@@ -1129,11 +1216,11 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     // the code a merchant copies from the admin UI.
     const generated = Function(`return \`${renderedTemplate}\`;`)();
 
-    assert.equal(generated.includes('document.createElement'), false);
-    assert.equal(generated.includes('typeof document'), false);
-    assert.equal(generated.includes('connect.facebook.net'), false);
+    assert.equal(generated.includes('document.createElement'), true);
+    assert.equal(generated.includes('typeof document'), true);
+    assert.equal(generated.includes('connect.facebook.net/en_US/fbevents.js'), true);
     assert.equal(generated.includes('analytics.tiktok.com'), false);
-    assert.equal(generated.includes('fbq'), false);
+    assert.equal(generated.includes('fbq'), true);
     assert.equal(generated.includes('ttq'), false);
     assert.equal(generated.includes('FB_PIXEL_ID'), false);
     assert.equal(generated.includes('TIKTOK_PIXEL_ID'), false);
@@ -1146,8 +1233,16 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
     assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
     assert.equal(generated.includes('requeueFailedEvents'), true);
-    assert.equal(generated.includes('sendDualChannelEvent'), false);
-    assert.equal(generated.includes('sendGatewayEvent'), true);
+    assert.equal(generated.includes('sendDualChannelEvent'), true);
+    assert.equal(generated.includes('sendGatewayEvent'), false);
+    assert.equal(generated.includes('trackSingleCustom'), true);
+    assert.equal(generated.includes("var options = { eventID: String(eventId) }"), true);
+    assert.equal(generated.includes('META_PIXEL_MAX_LOAD_ATTEMPTS = 3'), true);
+    assert.equal(generated.includes('META_PIXEL_MAX_QUEUE_SIZE = 500'), true);
+    assert.equal(generated.includes('CAPI_PIXEL_CONFIG_URL'), true);
+    assert.equal(generated.includes('refreshMetaRouteConfig'), true);
+    assert.equal(generated.includes('_shopify_y'), false);
+    assert.equal(generated.includes('_shopify_s'), false);
     assert.equal(generated.includes('browser.localStorage'), true);
     assert.equal(generated.includes('MAX_CLIENT_RETRIES = 32'), true);
     assert.equal(generated.includes('CLIENT_RETRY_MAX_AGE_MS'), true);
@@ -1161,11 +1256,23 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
 
     const callbacks = {};
     const requests = [];
+    const configRequests = [];
     const cookies = new Map();
     const localStorage = new Map();
+    const metaScriptNodes = [];
+    const metaPixelWarnings = [];
     let uuidCounter = 0;
+    const firstScript = {
+        parentNode: {
+            insertBefore: node => metaScriptNodes.push(node),
+        },
+    };
     const sandbox = {
-        console,
+        console: {
+            log: console.log,
+            error: console.error,
+            warn: message => metaPixelWarnings.push(String(message)),
+        },
         URL,
         Date,
         Math,
@@ -1176,6 +1283,11 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
         },
         setTimeout: () => 1,
         clearTimeout: () => {},
+        window: {},
+        document: {
+            createElement: tagName => ({ tagName }),
+            getElementsByTagName: tagName => tagName === 'script' ? [firstScript] : [],
+        },
         analytics: {
             subscribe: (name, fn) => {
                 callbacks[name] = fn;
@@ -1201,6 +1313,16 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
             },
         },
         fetch: async (url, options) => {
+            if (String(url).endsWith('/api/pixel-config')) {
+                configRequests.push({ url, options, body: JSON.parse(options.body) });
+                return {
+                    ok: true,
+                    json: async () => ({
+                        shop_domain: 'demo.myshopify.com',
+                        pixel_ids: ['1234567890', '2222222222'],
+                    }),
+                };
+            }
             requests.push({ url, options, body: JSON.parse(options.body) });
             return { ok: true };
         },
@@ -1301,6 +1423,9 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     const sentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
     const ids = Object.fromEntries(sentEvents.map(body => [body.event_name, body.event_id]));
     assert.equal(requests.length, 1);
+    assert.equal(configRequests.length, 1);
+    assert.equal(configRequests[0].body.shop_domain, 'demo.myshopify.com');
+    assert.equal(configRequests[0].body.ingest_token, 'test-ingest-token');
     assert.equal(requests[0].options.keepalive, true);
     assert.equal(requests[0].body.shop_domain, 'demo.myshopify.com');
     assert.equal(localStorage.has('capi_gateway_event_queue_v3:demo.myshopify.com'), false);
@@ -1313,7 +1438,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v11');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v14');
     assert.equal(generated.includes('getOrCreateTtp'), false);
     assert.equal(generated.includes('getOrCreateFbp'), false);
     assert.equal(generated.includes("return getCookieValue('_fbp')"), true);
@@ -1323,6 +1448,7 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(sentEvents[0].customer_segmentation, 'new_customer_to_business');
     assert.equal(sentEvents[0].event_source_url, 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1');
     assert.equal(sentEvents[0].external_id, 'client-1');
+    assert.equal(sentEvents[0].client_id, 'client-1');
     assert.equal(sentEvents[0].email, undefined);
     assert.equal(sentEvents[0].phone, undefined);
     assert.equal(sentEvents[0].email_hash, hashFor('Buyer@Example.com', 'email'));
@@ -1340,6 +1466,117 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
         AddPaymentInfo: 'demo.myshopify.com:checkout-token-1:AddPaymentInfo',
         Purchase: 'demo.myshopify.com:checkout-token-1',
     });
+    assert.equal(
+        sentEvents.find(body => body.event_name === 'Purchase').order_id,
+        'demo.myshopify.com:987',
+    );
+
+    assert.equal(metaScriptNodes.length, 1);
+    assert.equal(metaScriptNodes[0].src, 'https://connect.facebook.net/en_US/fbevents.js');
+    const metaQueue = Array.from(sandbox.window.fbq.queue, call => Array.from(call));
+    const metaInitCalls = metaQueue.filter(call => call[0] === 'init');
+    const metaTrackCalls = metaQueue.filter(call => call[0] === 'trackSingle' || call[0] === 'trackSingleCustom');
+    assert.deepEqual(metaInitCalls.map(call => call[1]).sort(), ['1234567890', '2222222222']);
+    assert.equal(metaTrackCalls.length, 10);
+    assert.deepEqual([...new Set(metaTrackCalls.map(call => call[1]))].sort(), ['1234567890', '2222222222']);
+    metaTrackCalls.forEach(call => {
+        assert.equal(call[4].eventID, ids[call[2]]);
+    });
+    const browserPurchase = metaTrackCalls.filter(call => call[2] === 'Purchase');
+    assert.equal(browserPurchase.length, 2);
+    assert.ok(browserPurchase.every(call => call[0] === 'trackSingle'));
+    assert.ok(browserPurchase.every(call => call[3].value === 46 && call[3].currency === 'USD'));
+    assert.ok(browserPurchase.every(call => call[3].order_id === 'demo.myshopify.com:987'));
+    const browserCheckoutContact = metaTrackCalls.filter(call => call[2] === 'CheckoutContactInfoSubmitted');
+    assert.ok(browserCheckoutContact.every(call => call[0] === 'trackSingleCustom'));
+
+    requests.length = 0;
+    const longLocalEventId = `checkout-${'x'.repeat(400)}-browser-capi`;
+    await callbacks.page_viewed({
+        id: longLocalEventId,
+        timestamp: '2026-06-24T00:00:20Z',
+        clientId: 'client-long-id',
+        context: {
+            document: { location: { href: 'https://demo.myshopify.com/long-id' } },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {},
+    });
+    await sandbox.flushEventQueue();
+    const longCapiEvent = requests.flatMap(request => (
+        Array.isArray(request.body.events) ? request.body.events : [request.body]
+    )).find(body => body.client_id === 'client-long-id');
+    const expectedLongId = tenantScopedIdentifier('demo.myshopify.com', longLocalEventId);
+    const longBrowserCalls = Array.from(sandbox.window.fbq.queue, call => Array.from(call))
+        .filter(call => call[2] === 'PageView' && call[4]?.eventID === expectedLongId);
+    assert.equal(longCapiEvent.event_id, expectedLongId);
+    assert.equal(longCapiEvent.event_id.length, 255);
+    assert.equal(longBrowserCalls.length, 2);
+    const longOrderId = `order-${'y'.repeat(400)}-browser-capi`;
+    assert.equal(
+        await sandbox.shopScopedIdentifier(longOrderId),
+        tenantScopedIdentifier('demo.myshopify.com', longOrderId),
+    );
+
+    metaScriptNodes[0].onerror();
+    sandbox.metaBrowserSdkRetryAt = 0;
+    requests.length = 0;
+    await callbacks.page_viewed({
+        id: 'sdk-load-retry',
+        timestamp: '2026-06-24T00:00:30Z',
+        clientId: 'client-sdk-retry',
+        context: {
+            document: { location: { href: 'https://demo.myshopify.com/sdk-retry' } },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {},
+    });
+    await sandbox.flushEventQueue();
+    assert.equal(metaScriptNodes.length, 2);
+    assert.equal(metaPixelWarnings.some(message => message.includes('SDK failed to load (attempt 1)')), true);
+
+    for (let index = 0; index < 600; index += 1) {
+        sandbox.sendMetaBrowserEvent('PageView', `queue-pressure-${index}`, {});
+    }
+    sandbox.sendMetaBrowserEvent('Purchase', 'queue-critical-purchase', { value: 1, currency: 'USD' });
+    const boundedMetaQueue = Array.from(sandbox.window.fbq.queue, call => Array.from(call));
+    assert.ok(boundedMetaQueue.length <= 500);
+    assert.deepEqual(
+        boundedMetaQueue.filter(call => call[0] === 'init').map(call => call[1]).sort(),
+        ['1234567890', '2222222222'],
+    );
+    assert.equal(boundedMetaQueue.some(call => call[2] === 'Purchase' && call[4]?.eventID === 'queue-critical-purchase'), true);
+
+    const originalFetch = sandbox.fetch;
+    sandbox.fetch = async (url, options) => {
+        if (String(url).endsWith('/api/pixel-config')) {
+            return {
+                ok: true,
+                json: async () => ({
+                    shop_domain: 'demo.myshopify.com',
+                    pixel_ids: ['3333333333'],
+                }),
+            };
+        }
+        return originalFetch(url, options);
+    };
+    await sandbox.refreshMetaRouteConfig();
+    sandbox.sendMetaBrowserEvent('ViewContent', 'dynamic-route-refresh', {});
+    const dynamicRouteCalls = Array.from(sandbox.window.fbq.queue, call => Array.from(call))
+        .filter(call => call[2] === 'ViewContent' && call[4]?.eventID === 'dynamic-route-refresh');
+    assert.deepEqual(dynamicRouteCalls.map(call => call[1]), ['3333333333']);
+    assert.equal(
+        Array.from(sandbox.window.fbq.queue, call => Array.from(call))
+            .some(call => call[0] === 'init' && call[1] === '3333333333'),
+        true,
+    );
+    sandbox.applyMetaRoutePixelIds(['1234567890', '2222222222']);
+    sandbox.fetch = originalFetch;
+
+    const priorFbc = cookies.get('_fbc');
+    assert.equal(await sandbox.getOrCreateFbc(`https://demo.myshopify.com/?fbclid=${'x'.repeat(1025)}`), priorFbc);
+    assert.equal(await sandbox.getOrCreateFbc('https://demo.myshopify.com/?fbclid=invalid%20click'), priorFbc);
+    assert.equal(cookies.get('_fbc'), priorFbc);
 
     requests.length = 0;
     await Promise.all(Array.from({ length: 25 }, (_, index) => (
@@ -1494,6 +1731,27 @@ test('generated Shopify pixel uses unique checkout stage event IDs while preserv
     assert.equal(zeroPurchase.currency, 'USD');
 
     requests.length = 0;
+    const queuedFbq = sandbox.window.fbq;
+    sandbox.window.fbq = () => {
+        throw new Error('simulated browser pixel failure');
+    };
+    await callbacks.page_viewed({
+        id: 'browser-pixel-failure',
+        timestamp: '2026-06-24T00:05:30Z',
+        clientId: 'client-browser-failure',
+        context: {
+            document: { location: { href: 'https://demo.myshopify.com/browser-pixel-failure' } },
+            navigator: { userAgent: 'Mozilla/5.0' },
+        },
+        data: {},
+    });
+    await sandbox.flushEventQueue();
+    const capiFallbackEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
+    assert.equal(capiFallbackEvent.event_id, 'demo.myshopify.com:browser-pixel-failure');
+    assert.equal(metaPixelWarnings.filter(message => message.includes('Meta browser Pixel event failed')).length, 2);
+    sandbox.window.fbq = queuedFbq;
+
+    requests.length = 0;
     let releaseInFlightRequest;
     sandbox.fetch = async (url, options) => {
         requests.push({ url, options, body: JSON.parse(options.body) });
@@ -1531,7 +1789,7 @@ test('admin page script parses and handles admin action failures', async () => {
     assert.match(serverSource, /app\.get\('\/admin\/assets\/admin\.css'/);
     assert.match(html, /<script src="\/admin\/assets\/vue\.global\.prod\.js"><\/script>/);
     assert.doesNotMatch(html, /https:\/\/(?:unpkg\.com|cdn\.tailwindcss\.com)/);
-    assert.match(html, /只有两边的事件名称和 eventID 完全一致时 Meta 才能浏览器\/服务端去重/);
+    assert.match(html, /生成代码已经同时发送 Meta 浏览器 Pixel 与本项目 CAPI，并自动复用同一 eventID/);
     const localVue = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'vue.global.prod.js'), 'utf8');
     assert.match(localVue, /vue v3\.5\.40/);
     assert.match(serverSource, /app\.get\('\/admin\/assets\/vue\.global\.prod\.js'/);

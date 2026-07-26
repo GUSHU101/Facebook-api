@@ -204,7 +204,7 @@ async function markDeliverySuccess(routeId, claims, response) {
     return rows.map(row => String(row.event_store_id));
 }
 
-async function markDeliveryFailure(routeId, claims, classification) {
+async function markDeliveryFailure(routeId, claims, classification, expectedCredentialVersion = null) {
     if (claims.length === 0) return [];
     const retryDelay = retryDelayWithJitterSeconds(
         classification.attempt,
@@ -234,6 +234,16 @@ async function markDeliveryFailure(routeId, claims, classification) {
            AND ed.event_store_id = c.event_store_id
            AND ed.attempt_count = c.attempt_count
            AND ed.status = 'IN_PROGRESS'
+           AND (
+               $8::bigint IS NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM shop_pixel_routes route
+                   JOIN pixels pixel ON pixel.id = route.pixel_id
+                   WHERE route.id = ed.route_id
+                     AND pixel.credential_version = $8
+               )
+           )
          RETURNING ed.event_store_id`,
         [
             routeId,
@@ -243,6 +253,7 @@ async function markDeliveryFailure(routeId, claims, classification) {
             retryDelay,
             classification.code === undefined ? null : String(classification.code),
             classification.message,
+            expectedCredentialVersion,
         ],
     );
     return rows.map(row => String(row.event_store_id));
@@ -752,34 +763,34 @@ async function sendToPlatform(pixel, dbEvents) {
     return sendToFacebookPixel(pixel, dbEvents);
 }
 
-async function credentialCooldownSeconds(credentialId, credentialScope) {
+async function credentialCooldownSeconds(credentialScope) {
     const [{ rows }, sharedTtlMs] = await Promise.all([
         pool.query(`SELECT GREATEST(
                     0,
                     CEIL(EXTRACT(EPOCH FROM (rate_limit_until - NOW())))
                 )::int AS seconds
          FROM pixels
-         WHERE id = $1 OR credential_scope = $2
+         WHERE credential_scope = $1
          ORDER BY seconds DESC
          LIMIT 1`,
-        [credentialId, credentialScope]),
+        [credentialScope]),
         redis.pttl(`cooldown:delivery-credential:${credentialScope}`).catch(() => -1),
     ]);
     return Math.max(Number(rows[0]?.seconds || 0), Math.ceil(Math.max(0, Number(sharedTtlMs)) / 1000));
 }
 
-async function recordCredentialSuccess(credentialId, credentialScope, rateControl = {}) {
+async function recordCredentialSuccess(credentialScope, rateControl = {}) {
     const cooldownSeconds = Math.max(0, Math.ceil(Number(rateControl.cooldownSeconds || 0)));
     await pool.query(
         `UPDATE pixels
          SET consecutive_failures = 0,
              last_delivery_at = NOW(),
-             last_usage_pct = COALESCE($2, last_usage_pct),
+             last_usage_pct = COALESCE($1, last_usage_pct),
               rate_limit_until = CASE
-                  WHEN $3::int > 0
+                  WHEN $2::int > 0
                   THEN GREATEST(
                       COALESCE(rate_limit_until, NOW()),
-                      NOW() + ($3::int * INTERVAL '1 second')
+                      NOW() + ($2::int * INTERVAL '1 second')
                   )
                   -- A successful request may finish after another in-flight
                   -- request has already rate-limited the same shared scope.
@@ -787,10 +798,9 @@ async function recordCredentialSuccess(credentialId, credentialScope, rateContro
                   WHEN rate_limit_until <= NOW() THEN NULL
                   ELSE rate_limit_until
               END,
-             last_rate_limit_at = CASE WHEN $3::int > 0 THEN NOW() ELSE last_rate_limit_at END
-         WHERE id = $1 OR credential_scope = $4`,
+             last_rate_limit_at = CASE WHEN $2::int > 0 THEN NOW() ELSE last_rate_limit_at END
+         WHERE credential_scope = $3`,
         [
-            credentialId,
             rateControl.maxUsagePercent === undefined ? null : Number(rateControl.maxUsagePercent),
             cooldownSeconds,
             credentialScope,
@@ -801,7 +811,7 @@ async function recordCredentialSuccess(credentialId, credentialScope, rateContro
     }
 }
 
-async function recordCredentialFailure(credentialId, credentialScope, classification) {
+async function recordCredentialFailure(credentialScope, classification) {
     const isRateLimit = Number(classification.code) === 429
         || [4, 17, 32, 613, 80004].includes(Number(classification.code));
     const cooldownSeconds = classification.retryable
@@ -814,19 +824,18 @@ async function recordCredentialFailure(credentialId, credentialScope, classifica
     await pool.query(
         `UPDATE pixels
          SET consecutive_failures = consecutive_failures + 1,
-             last_usage_pct = COALESCE($2, last_usage_pct),
+             last_usage_pct = COALESCE($1, last_usage_pct),
              rate_limit_until = CASE
-                 WHEN $3::int > 0
+                 WHEN $2::int > 0
                  THEN GREATEST(
                      COALESCE(rate_limit_until, NOW()),
-                     NOW() + ($3::int * INTERVAL '1 second')
+                     NOW() + ($2::int * INTERVAL '1 second')
                  )
                  ELSE rate_limit_until
              END,
-             last_rate_limit_at = CASE WHEN $3::int > 0 THEN NOW() ELSE last_rate_limit_at END
-         WHERE id = $1 OR credential_scope = $4`,
+             last_rate_limit_at = CASE WHEN $2::int > 0 THEN NOW() ELSE last_rate_limit_at END
+         WHERE credential_scope = $3`,
         [
-            credentialId,
             classification.rateControl?.maxUsagePercent === undefined
                 ? null
                 : Number(classification.rateControl.maxUsagePercent),
@@ -876,6 +885,18 @@ async function acquireRedisLease(key, minimumTtlMs = config.credentialLeaseMs) {
 
 async function acquireCredentialLease(credentialScope) {
     return acquireRedisLease(`lock:delivery-credential:${credentialScope}`);
+}
+
+async function credentialVersionStillCurrent(credentialId, credentialVersion) {
+    const { rowCount } = await pool.query(
+        `SELECT 1
+         FROM pixels
+         WHERE id = $1
+           AND credential_version = $2
+           AND status = 'active'`,
+        [credentialId, credentialVersion],
+    );
+    return rowCount > 0;
 }
 
 function startRedisLeaseHeartbeat(lease, label) {
@@ -1026,8 +1047,9 @@ const worker = new Worker('capi-events', async job => {
                 p.pixel_id,
                 p.access_token,
                 p.credential_scope,
+                p.credential_version,
                 p.rate_limit_group,
-                p.test_event_code
+                r.test_event_code
          FROM shop_pixel_routes r
          JOIN pixels p ON p.id = r.pixel_id
          JOIN event_deliveries snapshot_delivery
@@ -1062,11 +1084,37 @@ const worker = new Worker('capi-events', async job => {
             decryptedCredential,
             pixel.rate_limit_group,
         ) || String(pixel.credential_id);
-        if (pixel.credential_scope !== credentialScope) {
-            await pool.query(
-                'UPDATE pixels SET credential_scope = $2 WHERE id = $1',
-                [pixel.credential_id, credentialScope],
+        const scopeRefresh = await pool.query(
+            `UPDATE pixels
+             SET credential_scope = $2
+             WHERE id = $1
+               AND credential_version = $3
+               AND status = 'active'
+             RETURNING id`,
+            [pixel.credential_id, credentialScope, pixel.credential_version],
+        );
+        if (scopeRefresh.rowCount === 0) {
+            const delaySeconds = config.credentialBusyDelaySeconds;
+            const deferred = await deferRouteEvents(
+                pixel.route_id,
+                idsToUpdate,
+                delaySeconds,
+                'LOCAL_CREDENTIAL_CHANGED',
+                'Shared Pixel credential changed before delivery; events will reload the new credential',
             );
+            if (deferred > 0) {
+                deliveries.push({
+                    route_id: pixel.route_id,
+                    platform: pixel.platform,
+                    pixel_id: pixel.pixel_id,
+                    status: 'RETRYABLE_FAILED',
+                    code: 'LOCAL_CREDENTIAL_CHANGED',
+                    message: 'Credential changed before delivery; no platform attempt was consumed',
+                });
+                retryNeeded = true;
+                retryAfterSeconds = Math.max(retryAfterSeconds, delaySeconds);
+            }
+            continue;
         }
         pixel.credential_scope = credentialScope;
         const credentialLease = await acquireCredentialLease(credentialScope);
@@ -1098,7 +1146,7 @@ const worker = new Worker('capi-events', async job => {
         let claimedEvents = new Map();
         let claims = [];
         try {
-            const cooldownSeconds = await credentialCooldownSeconds(pixel.credential_id, credentialScope);
+            const cooldownSeconds = await credentialCooldownSeconds(credentialScope);
             if (cooldownSeconds > 0) {
                 const deferred = await deferRouteEvents(
                     pixel.route_id,
@@ -1136,7 +1184,7 @@ const worker = new Worker('capi-events', async job => {
             }
 
             await applyPlatformResult(pixel, pixelDbEvents, claimedEvents, result, deliveries);
-            await recordCredentialSuccess(pixel.credential_id, credentialScope, result.rate_control);
+            await recordCredentialSuccess(credentialScope, result.rate_control);
         } catch (error) {
             if (error.partialDelivery) {
                 await applyPlatformResult(
@@ -1161,7 +1209,7 @@ const worker = new Worker('capi-events', async job => {
                 if (claims.length === 0) continue;
             }
 
-            const classification = pixel.platform === 'tiktok'
+            let classification = pixel.platform === 'tiktok'
                 ? classifyTikTokError(error)
                 : classifyFacebookError(error);
             const maxAttempt = Math.max(1, ...claims.map(item => item.attemptCount));
@@ -1170,8 +1218,19 @@ const worker = new Worker('capi-events', async job => {
                 classification.code = 'LOCAL_LEASE_LOST';
                 classification.message = 'Delivery lease was lost; stable event IDs make the retry deduplicatable';
             }
+            if (!await credentialVersionStillCurrent(pixel.credential_id, pixel.credential_version)) {
+                classification = {
+                    retryable: true,
+                    code: 'LOCAL_CREDENTIAL_CHANGED',
+                    message: 'Credential changed while the platform request was in flight; retrying with the current configuration',
+                    retryAfterSeconds: config.credentialBusyDelaySeconds,
+                    rateControl: {},
+                    scope: 'configuration',
+                };
+            }
             if (
                 classification.retryable
+                && classification.code !== 'LOCAL_CREDENTIAL_CHANGED'
                 && config.deliveryMaxAttempts > 0
                 && maxAttempt >= config.deliveryMaxAttempts
             ) {
@@ -1179,25 +1238,46 @@ const worker = new Worker('capi-events', async job => {
                 classification.message = `Retry limit reached: ${classification.message}`;
             }
             classification.attempt = maxAttempt;
-            const credentialDelay = await recordCredentialFailure(pixel.credential_id, credentialScope, classification);
+            const credentialDelay = classification.code === 'LOCAL_CREDENTIAL_CHANGED'
+                ? 0
+                : await recordCredentialFailure(credentialScope, classification);
             classification.retryAfterSeconds = Math.max(
                 Number(classification.retryAfterSeconds || 0),
                 credentialDelay,
             );
-            const failure = {
-                route_id: pixel.route_id,
-                platform: pixel.platform,
-                pixel_id: pixel.pixel_id,
-                name: pixel.name,
-                status: classification.retryable ? 'RETRYABLE_FAILED' : 'FAILED',
-                code: classification.code,
-                message: classification.message,
-                event_ids: eventIds(pixelDbEvents),
-                event_store_ids: eventStoreIds(pixelDbEvents),
-            };
-
-            const updatedIds = await markDeliveryFailure(pixel.route_id, claims, classification);
-            if (updatedIds.length > 0) deliveries.push(failure);
+            let updatedIds = await markDeliveryFailure(
+                pixel.route_id,
+                claims,
+                classification,
+                pixel.credential_version,
+            );
+            if (
+                updatedIds.length === 0
+                && claims.length > 0
+                && !await credentialVersionStillCurrent(pixel.credential_id, pixel.credential_version)
+            ) {
+                classification = {
+                    retryable: true,
+                    code: 'LOCAL_CREDENTIAL_CHANGED',
+                    message: 'Credential version changed before the delivery result was committed',
+                    retryAfterSeconds: config.credentialBusyDelaySeconds,
+                    attempt: maxAttempt,
+                };
+                updatedIds = await markDeliveryFailure(pixel.route_id, claims, classification);
+            }
+            if (updatedIds.length > 0) {
+                deliveries.push({
+                    route_id: pixel.route_id,
+                    platform: pixel.platform,
+                    pixel_id: pixel.pixel_id,
+                    name: pixel.name,
+                    status: classification.retryable ? 'RETRYABLE_FAILED' : 'FAILED',
+                    code: classification.code,
+                    message: classification.message,
+                    event_ids: eventIds(pixelDbEvents),
+                    event_store_ids: eventStoreIds(pixelDbEvents),
+                });
+            }
             if (classification.retryable) {
                 retryNeeded = true;
                 retryAfterSeconds = Math.max(

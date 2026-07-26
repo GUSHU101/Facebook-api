@@ -29,6 +29,7 @@ const {
 } = require('./utils/crypto');
 const { calculateEMQ, missingMatchSignals } = require('./utils/emq');
 const {
+    buildCustomData,
     compactObject,
     firstPresent,
     missingCommerceSignals,
@@ -89,10 +90,32 @@ app.use(helmet({
         },
     },
 }));
-// Only the storefront ingestion endpoint needs browser CORS. Keeping CORS off
+
+// Authenticate and rate-limit the administration surface before parsing JSON.
+// This prevents unauthenticated callers from repeatedly consuming the full
+// request-body allowance on credential and replay endpoints.
+const adminLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: config.adminRateLimitPerWindow,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+const authMw = basicAuth({
+    users: { [config.adminUsername]: config.adminPassword },
+    challenge: true,
+});
+app.use('/admin', adminLimiter, authMw, (req, res, next) => {
+    res.set('Cache-Control', 'private, no-store');
+    next();
+});
+app.use('/api/admin', adminLimiter, authMw, (req, res, next) => {
+    res.set('Cache-Control', 'private, no-store');
+    next();
+});
+// Only storefront pixel endpoints need browser CORS. Keeping CORS off
 // admin routes prevents an unrelated website from reading authenticated admin
 // responses through a browser session that already has Basic Auth credentials.
-app.use('/api/pixel-event', cors({ origin: config.corsOrigin, credentials: false }));
+app.use(['/api/pixel-event', '/api/pixel-config'], cors({ origin: config.corsOrigin, credentials: false }));
 app.use(express.json({
     limit: config.jsonLimit,
     verify: (req, res, buf) => {
@@ -149,7 +172,10 @@ async function pixelLimiter(req, res, next) {
     // Redis keys merely by rotating a forged shop_domain value.
     const identity = pixelRateLimitIdentity(req);
     const digest = crypto.createHash('sha256').update(identity).digest('hex');
-    const eventWeight = Math.max(1, pixelPayloadsFromBody(req.body).length);
+    // Charge both event count and payload volume. One oversized event must not
+    // cost the same as one small PageView during abuse or a client bug.
+    const payloadWeight = Math.ceil(Number(req.rawBody?.length || 0) / 16_384);
+    const eventWeight = Math.max(1, pixelPayloadsFromBody(req.body).length, payloadWeight);
     try {
         const [count, ttl] = await redis.eval(
             DISTRIBUTED_RATE_LIMIT_SCRIPT,
@@ -189,16 +215,29 @@ async function pixelLimiter(req, res, next) {
     }
 }
 
-const adminLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: config.adminRateLimitPerWindow,
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_PIXEL_BATCH_SIZE = 50;
+const PIXEL_CONFIG_CACHE_TTL_MS = 5000;
+const MAX_PIXEL_CONFIG_CACHE_ENTRIES = 5000;
+const pixelConfigCache = new Map();
+const RECOVERABLE_META_CREDENTIAL_CODES = [
+    '10', '102', '190', '200', '401', '403', '463', '467', '803', '2500',
+];
+
+function invalidatePixelConfigCache(shopIdsOrDomains) {
+    for (const value of shopIdsOrDomains || []) {
+        if (typeof value === 'string' && value.includes('.')) {
+            pixelConfigCache.delete(normalizeShopDomain(value));
+            continue;
+        }
+        const numericId = Number(value);
+        if (!Number.isInteger(numericId)) continue;
+        for (const [shopDomain, cached] of pixelConfigCache) {
+            if (Number(cached.shopId) === numericId) pixelConfigCache.delete(shopDomain);
+        }
+    }
+}
 const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
 const META_CUSTOMER_SEGMENTS = new Set([
     'new_customer_to_business',
@@ -667,7 +706,10 @@ async function deleteShopDataById(shopId) {
     } finally {
         client.release();
     }
-    if (deleted) await clearShopRuntimeData(shopId, shopDomain);
+    if (deleted) {
+        invalidatePixelConfigCache([shopDomain]);
+        await clearShopRuntimeData(shopId, shopDomain);
+    }
     return { deleted, shopDomain };
 }
 
@@ -788,15 +830,37 @@ async function fetchMetaQualityForPixel(pixel) {
     return response;
 }
 
+async function sharedCredentialCooldownSeconds(credentialScope) {
+    if (!credentialScope) return 0;
+    const [{ rows }, redisTtlMs] = await Promise.all([
+        pool.query(
+            `SELECT GREATEST(
+                        0,
+                        CEIL(EXTRACT(EPOCH FROM (rate_limit_until - NOW())))
+                    )::int AS seconds
+             FROM pixels
+             WHERE credential_scope = $1
+             ORDER BY seconds DESC
+             LIMIT 1`,
+            [credentialScope],
+        ),
+        redis.pttl(`cooldown:delivery-credential:${credentialScope}`).catch(() => -1),
+    ]);
+    return Math.max(
+        Number(rows[0]?.seconds || 0),
+        Math.ceil(Math.max(0, Number(redisTtlMs || 0)) / 1000),
+    );
+}
+
 async function refreshMetaQualityForPixel(pixel) {
     if (pixel.platform !== 'facebook') return null;
     const shopIds = Array.isArray(pixel.shop_ids) ? pixel.shop_ids : [pixel.shop_id].filter(Boolean);
-    const rateLimitUntil = Date.parse(pixel.rate_limit_until);
-    if (Number.isFinite(rateLimitUntil) && rateLimitUntil > Date.now()) {
+    const cooldownSeconds = await sharedCredentialCooldownSeconds(pixel.credential_scope);
+    if (cooldownSeconds > 0) {
         return {
             pixel_id: pixel.pixel_id,
             status: 'DEFERRED',
-            retry_after_seconds: Math.ceil((rateLimitUntil - Date.now()) / 1000),
+            retry_after_seconds: cooldownSeconds,
         };
     }
 
@@ -806,21 +870,21 @@ async function refreshMetaQualityForPixel(pixel) {
         const rateControl = metaRateControlFromHeaders(response.headers);
         await pool.query(
             `UPDATE pixels
-             SET last_usage_pct = COALESCE($2, last_usage_pct),
+             SET last_usage_pct = COALESCE($1, last_usage_pct),
                  rate_limit_until = CASE
-                     WHEN $3::int > 0
+                     WHEN $2::int > 0
                      THEN GREATEST(
                          COALESCE(rate_limit_until, NOW()),
-                         NOW() + ($3::int * INTERVAL '1 second')
+                         NOW() + ($2::int * INTERVAL '1 second')
                      )
                      ELSE rate_limit_until
                  END,
-                 last_rate_limit_at = CASE WHEN $3::int > 0 THEN NOW() ELSE last_rate_limit_at END
-             WHERE id = $1`,
+                 last_rate_limit_at = CASE WHEN $2::int > 0 THEN NOW() ELSE last_rate_limit_at END
+             WHERE credential_scope = $3`,
             [
-                pixel.id,
                 rateControl.maxUsagePercent === undefined ? null : Number(rateControl.maxUsagePercent),
                 Math.ceil(Number(rateControl.cooldownSeconds || 0)),
+                pixel.credential_scope,
             ],
         );
         let summary;
@@ -842,17 +906,17 @@ async function refreshMetaQualityForPixel(pixel) {
                 `UPDATE pixels
                  SET rate_limit_until = GREATEST(
                          COALESCE(rate_limit_until, NOW()),
-                         NOW() + ($2::int * INTERVAL '1 second')
+                         NOW() + ($1::int * INTERVAL '1 second')
                      ),
                      last_rate_limit_at = NOW(),
-                     last_usage_pct = COALESCE($3, last_usage_pct)
-                 WHERE id = $1`,
+                     last_usage_pct = COALESCE($2, last_usage_pct)
+                 WHERE credential_scope = $3`,
                 [
-                    pixel.id,
                     Math.ceil(cooldownSeconds),
                     classification.rateControl?.maxUsagePercent === undefined
                         ? null
                         : Number(classification.rateControl.maxUsagePercent),
+                    pixel.credential_scope,
                 ],
             );
         }
@@ -874,6 +938,7 @@ async function refreshMetaQualitySnapshots(shopId = null) {
                 p.pixel_id,
                 p.access_token,
                 p.quality_access_token,
+                p.credential_scope,
                 p.rate_limit_until
          FROM shop_pixel_routes r
          JOIN pixels p ON p.id = r.pixel_id
@@ -890,7 +955,7 @@ async function refreshMetaQualitySnapshots(shopId = null) {
 
     const results = [];
     for (const pixel of pixels) {
-        const lockKey = `lock:delivery-credential:${pixel.id}`;
+        const lockKey = `lock:delivery-credential:${pixel.credential_scope || pixel.id}`;
         const lockToken = crypto.randomUUID();
         const ttlSeconds = Math.max(30, Math.ceil(config.credentialLeaseMs / 1000));
         const lock = await redis.set(lockKey, lockToken, 'EX', ttlSeconds, 'NX');
@@ -1012,53 +1077,6 @@ function buildPlatformData(payload) {
             ttp: payload.ttp,
             ttclid: payload.ttclid,
         }),
-    });
-}
-
-function buildCustomData(payload) {
-    const contents = Array.isArray(payload.contents)
-        ? payload.contents.slice(0, 200)
-            .filter(Boolean)
-            .map(item => compactObject({
-                id: firstPresent(item.id, item.content_id) ? String(firstPresent(item.id, item.content_id)) : undefined,
-                quantity: Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0
-                    ? Number(item.quantity)
-                    : undefined,
-                item_price: Number.isFinite(Number(firstPresent(item.item_price, item.price)))
-                    && Number(firstPresent(item.item_price, item.price)) >= 0
-                    ? Number(firstPresent(item.item_price, item.price))
-                    : undefined,
-            }))
-            .filter(item => item.id)
-        : undefined;
-    // Item-level contents are the authoritative cart snapshot. Deriving IDs
-    // from them prevents a stale caller-supplied content_ids list from
-    // referring to products that are not present in the event contents.
-    const contentIds = contents?.length
-        ? contents.map(item => String(item.id))
-        : (Array.isArray(payload.content_ids)
-            ? payload.content_ids.slice(0, 200).filter(Boolean).map(String)
-            : undefined);
-    const numItems = Number.isFinite(Number(payload.num_items))
-        ? Number(payload.num_items)
-        : contents?.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
-
-    return compactObject({
-        value: payload.value !== undefined && Number.isFinite(Number(payload.value)) && Number(payload.value) >= 0
-            ? Number(payload.value)
-            : undefined,
-        currency: payload.currency ? String(payload.currency).trim().toUpperCase() : undefined,
-        content_ids: contentIds?.length ? contentIds : undefined,
-        contents: contents?.length ? contents : undefined,
-        content_type: payload.content_type,
-        content_name: payload.content_name,
-        content_category: payload.content_category,
-        num_items: numItems > 0 ? numItems : undefined,
-        order_id: tenantScopedIdentifier(
-            firstPresent(payload.tenant_id, payload.shop_domain),
-            payload.order_id,
-        ),
-        search_string: payload.search_string,
     });
 }
 
@@ -1632,7 +1650,7 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         'attribution save',
     );
     const userData = buildUserData(req, enrichedPayload, options);
-    const customData = buildCustomData(enrichedPayload);
+    const customData = buildCustomData(enrichedPayload, config.commerceItemLimit);
     const requiresPaymentConfirmation = eventName === 'Purchase'
         && options.requirePaymentConfirmation === true;
     const paymentConfirmed = eventName === 'Purchase'
@@ -1652,8 +1670,10 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         _quality: {
             missing_match_signals: missingMatchSignals(userData),
             missing_event_parameters: missingCommerceSignals(eventName, customData),
-            commerce_items_truncated: (Array.isArray(enrichedPayload.contents) && enrichedPayload.contents.length > 200)
-                || (Array.isArray(enrichedPayload.content_ids) && enrichedPayload.content_ids.length > 200),
+            commerce_items_truncated: (Array.isArray(enrichedPayload.contents)
+                && enrichedPayload.contents.length > config.commerceItemLimit)
+                || (Array.isArray(enrichedPayload.content_ids)
+                    && enrichedPayload.content_ids.length > config.commerceItemLimit),
         },
         _platform_data: buildPlatformData(enrichedPayload),
         _requires_payment_confirmation: requiresPaymentConfirmation,
@@ -1819,6 +1839,59 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
         deduplicated,
         rejected,
         results,
+    });
+}));
+
+app.post('/api/pixel-config', asyncHandler(async (req, res) => {
+    const shopDomain = requireMyshopifyDomain(req.body?.shop_domain);
+    const suppliedIngestToken = String(
+        req.headers['x-capi-ingest-token']
+        || req.body?.ingest_token
+        || '',
+    ).trim();
+    // Route topology is not accepted from the storefront. Even when event
+    // ingestion token enforcement is disabled for a legacy deployment, this
+    // read endpoint always requires the per-shop token.
+    if (!validShopIngestToken(shopDomain, suppliedIngestToken)) {
+        return res.status(401).json({ error: 'Invalid shop ingest token' });
+    }
+
+    let pixelIds;
+    const cached = pixelConfigCache.get(shopDomain);
+    if (cached && cached.expiresAt > Date.now()) {
+        pixelIds = cached.pixelIds;
+    } else {
+        const { rows } = await pool.query(
+            `SELECT shop.id AS shop_id, pixel.pixel_id
+             FROM shops shop
+             JOIN shop_pixel_routes route
+               ON route.shop_id = shop.id
+              AND route.status = 'active'
+             JOIN pixels pixel
+               ON pixel.id = route.pixel_id
+              AND pixel.status = 'active'
+              AND pixel.platform = 'facebook'
+             WHERE shop.shop_domain = $1
+               AND shop.status = 'active'
+             ORDER BY pixel.id`,
+            [shopDomain],
+        );
+        pixelIds = [...new Set(rows.map(row => String(row.pixel_id || '').trim()).filter(Boolean))];
+        if (pixelConfigCache.size >= MAX_PIXEL_CONFIG_CACHE_ENTRIES) {
+            pixelConfigCache.delete(pixelConfigCache.keys().next().value);
+        }
+        pixelConfigCache.set(shopDomain, {
+            pixelIds,
+            shopId: rows[0]?.shop_id,
+            expiresAt: Date.now() + PIXEL_CONFIG_CACHE_TTL_MS,
+        });
+    }
+
+    res.set('Cache-Control', 'private, no-store');
+    return res.json({
+        shop_domain: shopDomain,
+        pixel_ids: pixelIds,
+        fetched_at: new Date().toISOString(),
     });
 }));
 
@@ -2924,14 +2997,6 @@ scheduleCron(config.cleanupCron, async () => {
     }
 });
 
-const authMw = basicAuth({
-    users: { [config.adminUsername]: config.adminPassword },
-    challenge: true,
-});
-
-app.use('/admin', adminLimiter, authMw);
-app.use('/api/admin', adminLimiter, authMw);
-
 app.get('/admin/assets/admin.css', (req, res) => {
     res.set('Cache-Control', 'private, no-cache');
     res.sendFile(path.join(__dirname, 'public', 'admin.css'));
@@ -2987,6 +3052,7 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
 app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
         SELECT p.id, p.shop_id, owner.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code,
+               p.credential_version,
                p.rate_limit_group,
                p.rate_limit_until, p.last_usage_pct, p.consecutive_failures, p.last_delivery_at,
                (p.quality_access_token IS NOT NULL AND p.quality_access_token <> '') AS has_quality_token,
@@ -2996,6 +3062,7 @@ app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
                            'route_id', r.id,
                            'shop_id', s.id,
                            'shop_domain', s.shop_domain,
+                           'test_event_code', r.test_event_code,
                            'status', r.status
                        )
                        ORDER BY s.shop_domain
@@ -3045,7 +3112,7 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
         await client.query('BEGIN');
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${platform}:${pixelId}`]);
         const existing = await client.query(
-            `SELECT id, rate_limit_group
+            `SELECT id, access_token, rate_limit_group, credential_version
              FROM pixels
              WHERE platform = $1 AND pixel_id = $2
              ORDER BY (status = 'active') DESC, id ASC
@@ -3055,19 +3122,32 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
         );
         let credentialId;
         let reused = false;
+        let credentialMaterialChanged = false;
+        let tokenChanged = false;
+        let recoveredCredentialFailures = 0;
         if (existing.rowCount > 0) {
             credentialId = existing.rows[0].id;
             reused = true;
             const effectiveRateLimitGroup = rateLimitGroup || existing.rows[0].rate_limit_group || null;
+            const previousToken = decryptTokenIfPossible(existing.rows[0].access_token);
+            tokenChanged = previousToken !== accessToken;
+            credentialMaterialChanged = tokenChanged
+                || String(existing.rows[0].rate_limit_group || '').trim().toLowerCase()
+                    !== String(effectiveRateLimitGroup || '').trim().toLowerCase();
             await client.query(
                 `UPDATE pixels
                  SET shop_id = COALESCE(shop_id, $2),
                      name = $3,
                      access_token = $4,
                      quality_access_token = COALESCE($5, quality_access_token),
-                     test_event_code = $6,
-                     credential_scope = $7,
-                     rate_limit_group = $8,
+                     test_event_code = NULL,
+                     credential_scope = $6,
+                     rate_limit_group = $7,
+                     credential_version = credential_version + CASE WHEN $8::boolean THEN 1 ELSE 0 END,
+                     consecutive_failures = CASE WHEN $8::boolean THEN 0 ELSE consecutive_failures END,
+                     rate_limit_until = CASE WHEN $8::boolean THEN NULL ELSE rate_limit_until END,
+                     last_rate_limit_at = CASE WHEN $8::boolean THEN NULL ELSE last_rate_limit_at END,
+                     last_usage_pct = CASE WHEN $8::boolean THEN NULL ELSE last_usage_pct END,
                      status = 'active',
                      archived_at = NULL
                  WHERE id = $1`,
@@ -3077,16 +3157,16 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
                     name,
                     encryptToken(accessToken),
                     qualityAccessToken ? encryptToken(qualityAccessToken) : null,
-                    testEventCode,
                     credentialFingerprint(platform, accessToken, effectiveRateLimitGroup),
                     effectiveRateLimitGroup,
+                    credentialMaterialChanged,
                 ],
             );
         } else {
             const inserted = await client.query(
                 `INSERT INTO pixels
-                    (shop_id, platform, name, pixel_id, access_token, quality_access_token, test_event_code, credential_scope, rate_limit_group)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    (shop_id, platform, name, pixel_id, access_token, quality_access_token, credential_scope, rate_limit_group)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  RETURNING id`,
                 [
                     shopId,
@@ -3095,7 +3175,6 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
                     pixelId,
                     encryptToken(accessToken),
                     qualityAccessToken ? encryptToken(qualityAccessToken) : null,
-                    testEventCode,
                     credentialFingerprint(platform, accessToken, rateLimitGroup),
                     rateLimitGroup,
                 ],
@@ -3109,15 +3188,68 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
             );
         }
         await client.query(
-            `INSERT INTO shop_pixel_routes (shop_id, pixel_id)
-             SELECT shop_id, $2
+            `INSERT INTO shop_pixel_routes (shop_id, pixel_id, test_event_code)
+             SELECT shop_id, $2, $3
              FROM UNNEST($1::int[]) AS requested(shop_id)
-             ON CONFLICT (shop_id, pixel_id) DO UPDATE SET status = 'active'`,
-            [shopIds, credentialId],
+             ON CONFLICT (shop_id, pixel_id) DO UPDATE
+             SET status = 'active',
+                 test_event_code = EXCLUDED.test_event_code`,
+            [shopIds, credentialId, testEventCode || null],
+        );
+        if (tokenChanged) {
+            const reopened = await client.query(
+                `UPDATE event_deliveries delivery
+                 SET status = 'PENDING',
+                     attempt_count = 0,
+                     next_attempt_at = NOW(),
+                     lease_expires_at = NULL,
+                     error_code = NULL,
+                     error_message = NULL,
+                     updated_at = NOW()
+                 FROM shop_pixel_routes route
+                 WHERE delivery.route_id = route.id
+                   AND route.pixel_id = $1
+                   AND route.status = 'active'
+                   AND delivery.status = 'FAILED_PERMANENT'
+                   AND delivery.error_code = ANY($2::text[])
+                 RETURNING delivery.event_store_id`,
+                [credentialId, RECOVERABLE_META_CREDENTIAL_CODES],
+            );
+            recoveredCredentialFailures = reopened.rowCount;
+            const reopenedEventIds = [...new Set(
+                reopened.rows.map(row => String(row.event_store_id)),
+            )];
+            if (reopenedEventIds.length > 0) {
+                await client.query(
+                    `UPDATE event_store
+                     SET status = 'PENDING'
+                     WHERE id = ANY($1::bigint[])
+                       AND status IN ('FAILED', 'PARTIAL_FAILED')`,
+                    [reopenedEventIds],
+                );
+            }
+        }
+        const activeRoutes = await client.query(
+            `SELECT DISTINCT shop.id, shop.shop_domain
+             FROM shop_pixel_routes route
+             JOIN shops shop ON shop.id = route.shop_id
+             WHERE route.pixel_id = $1
+               AND route.status = 'active'
+               AND shop.status = 'active'`,
+            [credentialId],
         );
         await client.query('COMMIT');
-        await wakeShopOutboxes(shopIds);
-        res.status(reused ? 200 : 201).json({ success: true, id: credentialId, reused, shop_ids: shopIds });
+        const affectedShopIds = activeRoutes.rows.map(row => Number(row.id));
+        invalidatePixelConfigCache(activeRoutes.rows.map(row => row.shop_domain));
+        await wakeShopOutboxes(affectedShopIds);
+        res.status(reused ? 200 : 201).json({
+            success: true,
+            id: credentialId,
+            reused,
+            credential_updated: credentialMaterialChanged,
+            recovered_credential_failures: recoveredCredentialFailures,
+            shop_ids: shopIds,
+        });
     } catch (error) {
         await client.query('ROLLBACK');
         throw error;
@@ -3143,7 +3275,10 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
             return res.status(404).json({ error: 'Pixel not found' });
         }
         const routeShopResult = await client.query(
-            'SELECT shop_id FROM shop_pixel_routes WHERE pixel_id = $1',
+            `SELECT route.shop_id, shop.shop_domain
+             FROM shop_pixel_routes route
+             JOIN shops shop ON shop.id = route.shop_id
+             WHERE route.pixel_id = $1`,
             [pixelId],
         );
         const lockedShopIds = [...new Set([
@@ -3157,7 +3292,7 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
             );
         }
         const shopsResult = await client.query(
-            "SELECT id FROM shops WHERE id = ANY($1::int[]) AND status = 'active'",
+            "SELECT id, shop_domain FROM shops WHERE id = ANY($1::int[]) AND status = 'active'",
             [shopIds],
         );
         if (shopsResult.rowCount !== shopIds.length) {
@@ -3185,7 +3320,8 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
         );
         await client.query(
             `UPDATE shop_pixel_routes
-             SET status = 'inactive'
+             SET status = 'inactive',
+                 test_event_code = NULL
              WHERE pixel_id = $1
                AND NOT (shop_id = ANY($2::int[]))
                AND status <> 'inactive'`,
@@ -3241,6 +3377,10 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
             [shopIds, pixelId],
         );
         await client.query('COMMIT');
+        invalidatePixelConfigCache([
+            ...routeShopResult.rows.map(row => row.shop_domain),
+            ...shopsResult.rows.map(row => row.shop_domain),
+        ]);
         await wakeShopOutboxes(shopIds);
         res.json({ success: true, pixel_id: pixelId, shop_ids: shopIds });
     } catch (error) {
@@ -3265,7 +3405,11 @@ app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
             return res.status(404).json({ error: 'Pixel route not found' });
         }
         const routeShopResult = await client.query(
-            'SELECT shop_id FROM shop_pixel_routes WHERE pixel_id = $1 ORDER BY shop_id',
+            `SELECT route.shop_id, shop.shop_domain
+             FROM shop_pixel_routes route
+             JOIN shops shop ON shop.id = route.shop_id
+             WHERE route.pixel_id = $1
+             ORDER BY route.shop_id`,
             [pixelId],
         );
         for (const row of routeShopResult.rows) {
@@ -3289,7 +3433,11 @@ app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
             [pixelId],
         );
         await client.query(
-            "UPDATE shop_pixel_routes SET status = 'inactive' WHERE pixel_id = $1 AND status <> 'inactive'",
+            `UPDATE shop_pixel_routes
+             SET status = 'inactive',
+                 test_event_code = NULL
+             WHERE pixel_id = $1
+               AND status <> 'inactive'`,
             [pixelId],
         );
         await client.query(
@@ -3349,6 +3497,7 @@ app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
             );
         }
         await client.query('COMMIT');
+        invalidatePixelConfigCache(routeShopResult.rows.map(row => row.shop_domain));
         res.json({ success: true, archived: true, affected_events: affectedEventIds.length });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
