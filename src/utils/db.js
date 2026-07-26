@@ -3,9 +3,18 @@ const config = require('../config');
 
 const pool = new Pool({
     connectionString: config.databaseUrl,
-    max: Number(process.env.DB_POOL_MAX || 20),
-    idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS || 30000),
-    connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 10000),
+    max: config.dbPoolMax,
+    idleTimeoutMillis: config.dbIdleTimeoutMs,
+    connectionTimeoutMillis: config.dbConnectionTimeoutMs,
+    statement_timeout: config.dbStatementTimeoutMs,
+    query_timeout: config.dbStatementTimeoutMs + 5000,
+    maxUses: config.dbPoolMaxUses,
+    keepAlive: true,
+    application_name: 'capi-saas-pro',
+    // The schema contains legacy TIMESTAMP columns. Pin every application
+    // session to UTC so retention, retry and lease comparisons remain stable
+    // regardless of the VPS or PostgreSQL server timezone.
+    options: '-c timezone=UTC',
 });
 
 pool.on('error', error => {

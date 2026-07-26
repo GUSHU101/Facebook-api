@@ -44,6 +44,13 @@ function timingSafeCompare(generatedHash, hmacHeader) {
     return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
+function timingSafeStringCompare(expected, supplied) {
+    if (!expected || !supplied) return false;
+    const left = Buffer.from(String(expected), 'utf8');
+    const right = Buffer.from(String(supplied), 'utf8');
+    return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
 function normalizeForHash(data, type = 'default') {
     if (data === undefined || data === null) return undefined;
     let normalized = String(data).trim().toLowerCase();
@@ -68,6 +75,7 @@ module.exports = {
     decryptToken,
     decryptTokenIfPossible,
     timingSafeCompare,
+    timingSafeStringCompare,
     hashUserData,
     normalizeForHash,
 };

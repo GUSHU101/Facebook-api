@@ -1,6 +1,6 @@
 function tiktokEventName(metaEventName) {
     return {
-        Purchase: 'CompletePayment',
+        Purchase: 'Purchase',
         AddToCart: 'AddToCart',
         InitiateCheckout: 'InitiateCheckout',
         AddPaymentInfo: 'AddPaymentInfo',
@@ -20,7 +20,7 @@ function tiktokContents(customData) {
     return contents.map(item => ({
         content_id: item.id || item.content_id,
         quantity: item.quantity,
-        price: item.item_price || item.price,
+        price: item.item_price ?? item.price,
         content_type: customData.content_type,
         content_name: customData.content_name,
         content_category: customData.content_category,
@@ -32,6 +32,10 @@ function buildTikTokPayload(pixel, event) {
     const customData = payload.custom_data || {};
     const userData = payload.user_data || {};
     const platformData = payload._platform_data?.tiktok || {};
+    const contents = tiktokContents(customData);
+    const contentIds = Array.isArray(customData.content_ids) && customData.content_ids.length
+        ? customData.content_ids.map(String)
+        : contents.map(item => String(item.content_id));
     const tiktokPayload = {
         pixel_code: pixel.pixel_id,
         event: tiktokEventName(payload.event_name),
@@ -52,10 +56,16 @@ function buildTikTokPayload(pixel, event) {
             ip: userData.client_ip_address,
         },
         properties: {
-            contents: tiktokContents(customData),
+            contents,
+            content_ids: contentIds.length ? contentIds : undefined,
+            content_type: customData.content_type,
+            quantity: customData.num_items,
             currency: customData.currency,
             value: customData.value,
             query: customData.search_string,
+            search_string: customData.search_string,
+            content_name: customData.content_name,
+            content_category: customData.content_category,
             description: customData.content_name,
             order_id: customData.order_id,
         },

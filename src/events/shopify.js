@@ -1,11 +1,17 @@
-const crypto = require('crypto');
 const { compactObject, firstPresent, normalizeShopifyId } = require('./common');
 
 function toAbsoluteShopUrl(shopDomain, value) {
-    if (!value) return `https://${shopDomain}`;
-    const text = String(value);
-    if (/^https?:\/\//i.test(text)) return text;
-    return `https://${shopDomain}${text.startsWith('/') ? text : `/${text}`}`;
+    const shopRoot = `https://${shopDomain}`;
+    if (!value) return shopRoot;
+    try {
+        const parsed = new URL(String(value), `${shopRoot}/`);
+        // Webhook fields can contain an external referrer or a private order
+        // status URL. CAPI event_source_url must remain the merchant website.
+        if (parsed.hostname.toLowerCase() !== String(shopDomain).toLowerCase()) return shopRoot;
+        return parsed.toString();
+    } catch (error) {
+        return shopRoot;
+    }
 }
 
 function readOrderAttribute(order, names) {
@@ -33,16 +39,53 @@ function normalizeContentId(value) {
     return normalizeShopifyId(value);
 }
 
+function paidOrderIgnoreReason(order = {}, allowedSources = ['web']) {
+    if (order.test === true) return 'test_order';
+    const sourceName = String(order.source_name || order.sourceName || '').trim().toLowerCase();
+    if (!sourceName) return 'missing_order_source';
+    const allowed = new Set(allowedSources.map(source => String(source).trim().toLowerCase()).filter(Boolean));
+    return allowed.has(sourceName) ? undefined : `non_web_order_source:${sourceName}`;
+}
+
+function allocatedDiscount(item) {
+    const directDiscount = Number(item.total_discount);
+    const allocationTotal = (Array.isArray(item.discount_allocations) ? item.discount_allocations : [])
+        .reduce((sum, allocation) => {
+            const amount = Number(allocation?.amount);
+            return sum + (Number.isFinite(amount) && amount >= 0 ? amount : 0);
+        }, 0);
+    return Math.max(
+        Number.isFinite(directDiscount) && directDiscount >= 0 ? directDiscount : 0,
+        allocationTotal,
+    );
+}
+
+function discountedUnitPrice(item, quantity) {
+    const explicitlyDiscounted = Number(firstPresent(
+        item.discounted_unit_price,
+        item.discounted_price,
+        item.discountedUnitPriceAfterAllDiscountsSet?.shopMoney?.amount,
+        item.discountedUnitPriceSet?.shopMoney?.amount,
+    ));
+    if (Number.isFinite(explicitlyDiscounted) && explicitlyDiscounted >= 0) return explicitlyDiscounted;
+
+    const baseUnitPrice = Number(item.price);
+    if (!Number.isFinite(baseUnitPrice) || baseUnitPrice < 0) return undefined;
+    const discount = allocatedDiscount(item);
+    return Math.max(0, ((baseUnitPrice * quantity) - discount) / quantity);
+}
+
 function buildOrderContents(order) {
     const lineItems = Array.isArray(order.line_items) ? order.line_items : [];
     return lineItems.map(item => {
         const id = normalizeContentId(firstPresent(item.variant_id, item.product_id, item.sku, item.id));
         if (!id) return undefined;
-        const quantity = Number(item.quantity || 1);
-        const itemPrice = Number(firstPresent(item.price, item.pre_tax_price, item.discounted_price));
+        const requestedQuantity = Number(item.quantity);
+        const quantity = Number.isFinite(requestedQuantity) && requestedQuantity > 0 ? requestedQuantity : 1;
+        const itemPrice = discountedUnitPrice(item, quantity);
         return compactObject({
             id,
-            quantity: Number.isFinite(quantity) ? quantity : 1,
+            quantity,
             item_price: Number.isFinite(itemPrice) ? itemPrice : undefined,
         });
     }).filter(Boolean);
@@ -54,7 +97,7 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const customer = order.customer || {};
     const address = Object.keys(billingAddress).length ? billingAddress : shippingAddress;
     const contents = buildOrderContents(order);
-    const sourceUrl = toAbsoluteShopUrl(shopDomain, firstPresent(order.landing_site, order.referring_site, order.order_status_url));
+    const sourceUrl = toAbsoluteShopUrl(shopDomain, order.landing_site);
     const checkoutToken = firstPresent(order.checkout_token, order.cart_token, order.token);
     const fbp = firstPresent(
         readOrderAttribute(order, ['_fbp', 'fbp', 'facebook_browser_id']),
@@ -84,10 +127,19 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const clientId = firstPresent(readOrderAttribute(order, ['client_id', 'shopify_client_id']), shopifyY);
     const orderId = normalizeShopifyId(order.id);
     const orderName = firstPresent(order.name, order.order_number, orderId);
+    const stableEventId = firstPresent(
+        readOrderAttribute(order, ['event_id', 'capi_event_id']),
+        checkoutToken,
+        orderId,
+        orderName,
+    );
 
     return {
         event_name: 'Purchase',
-        event_id: firstPresent(readOrderAttribute(order, ['event_id', 'capi_event_id']), checkoutToken, orderId, orderName, crypto.randomUUID()).toString(),
+        // Never invent a Purchase ID: a random fallback would turn every
+        // Shopify webhook retry into a distinct conversion. The authenticated
+        // webhook handler rejects payloads that lack this stable identity.
+        event_id: stableEventId === undefined ? undefined : String(stableEventId),
         email: firstPresent(order.email, order.contact_email, customer.email),
         phone: firstPresent(order.phone, customer.phone, billingAddress.phone, shippingAddress.phone),
         firstName: firstPresent(billingAddress.first_name, shippingAddress.first_name, customer.first_name),
@@ -123,7 +175,10 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
         order_id: orderName,
         source_url: sourceUrl,
-        timestamp: order.created_at || order.processed_at || order.updated_at,
+        // For orders/paid, the webhook trigger time is the closest available
+        // timestamp to the actual payment transition. Checkout creation time
+        // can be hours or days earlier for deferred/manual payment flows.
+        timestamp: firstPresent(options.eventTimestamp, order.processed_at, order.updated_at, order.created_at),
     };
 }
 
@@ -131,7 +186,9 @@ module.exports = {
     buildFbcFromUrl,
     buildOrderContents,
     buildShopifyOrderPurchasePayload,
+    discountedUnitPrice,
     normalizeContentId,
+    paidOrderIgnoreReason,
     readOrderAttribute,
     toAbsoluteShopUrl,
 };

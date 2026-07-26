@@ -5,8 +5,16 @@ const Redis = require('ioredis');
 const config = require('../src/config');
 
 const checks = [];
-const runtimeTables = ['shops', 'pixels', 'event_store', 'dead_letters'];
-const runtimeSequences = ['shops_id_seq', 'pixels_id_seq', 'event_store_id_seq', 'dead_letters_id_seq'];
+const runtimeTables = ['shops', 'pixels', 'shop_pixel_routes', 'event_store', 'event_id_aliases', 'event_deliveries', 'dead_letters'];
+const runtimeSequences = [
+    'shops_id_seq',
+    'pixels_id_seq',
+    'shop_pixel_routes_id_seq',
+    'event_store_id_seq',
+    'event_id_aliases_id_seq',
+    'event_deliveries_id_seq',
+    'dead_letters_id_seq',
+];
 
 async function check(name, fn) {
     try {
@@ -18,7 +26,10 @@ async function check(name, fn) {
 }
 
 async function main() {
-    const pool = new Pool({ connectionString: config.databaseUrl });
+    const pool = new Pool({
+        connectionString: config.databaseUrl,
+        options: '-c timezone=UTC',
+    });
     const redis = new Redis(config.redisUrl, { maxRetriesPerRequest: 1, connectTimeout: 5000 });
     redis.on('error', () => {});
 
@@ -35,6 +46,15 @@ async function main() {
         if (String(process.env.AES_SECRET_KEY).length < 32) {
             throw new Error('AES_SECRET_KEY should be at least 32 characters');
         }
+        if (String(process.env.ADMIN_PASSWORD).length < 16) {
+            throw new Error('ADMIN_PASSWORD should be at least 16 characters');
+        }
+        if (process.env.ADMIN_PASSWORD === process.env.ADMIN_USERNAME) {
+            throw new Error('ADMIN_PASSWORD must differ from ADMIN_USERNAME');
+        }
+        if (!config.requireIngestToken) {
+            throw new Error('REQUIRE_INGEST_TOKEN must remain enabled in production');
+        }
         return 'required variables present';
     });
 
@@ -49,8 +69,15 @@ async function main() {
             ['shops', 'app_secret'],
             ['pixels', 'platform'],
             ['pixels', 'access_token'],
+            ['pixels', 'rate_limit_until'],
+            ['pixels', 'consecutive_failures'],
+            ['shop_pixel_routes', 'shop_id'],
+            ['shop_pixel_routes', 'pixel_id'],
             ['event_store', 'request_payload'],
             ['event_store', 'fb_response'],
+            ['event_id_aliases', 'canonical_event_id'],
+            ['event_deliveries', 'route_id'],
+            ['event_deliveries', 'status'],
             ['dead_letters', 'status'],
         ];
 
@@ -77,6 +104,153 @@ async function main() {
             throw new Error('shops.app_secret should be TEXT; run npm run migrate');
         }
         return 'required columns present';
+    });
+
+    await check('tenant delivery isolation', async () => {
+        const { rows: [result] } = await pool.query(
+            `SELECT COUNT(*)::int AS violations
+             FROM event_deliveries delivery
+             JOIN event_store event ON event.id = delivery.event_store_id
+             JOIN shop_pixel_routes route ON route.id = delivery.route_id
+             WHERE event.shop_id <> route.shop_id`,
+        );
+        if (Number(result.violations) > 0) {
+            throw new Error(`${result.violations} delivery rows cross shop ownership boundaries`);
+        }
+        return 'event_store.shop_id matches every delivery route shop_id';
+    });
+
+    await check('routing state integrity', async () => {
+        const { rows: [result] } = await pool.query(
+            `SELECT
+                 COUNT(*) FILTER (
+                     WHERE route.status <> 'active'
+                       AND delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                 )::int AS inactive_outstanding,
+                 (
+                     SELECT COUNT(*)::int
+                     FROM event_store event
+                     WHERE event.status = 'PENDING'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM shop_pixel_routes active_route
+                           WHERE active_route.shop_id = event.shop_id
+                             AND active_route.status = 'active'
+                       )
+                 ) AS unrouted_pending
+             FROM event_deliveries delivery
+             JOIN shop_pixel_routes route ON route.id = delivery.route_id`,
+        );
+        if (Number(result.inactive_outstanding) > 0) {
+            throw new Error(`${result.inactive_outstanding} outstanding deliveries belong to inactive routes`);
+        }
+        if (Number(result.unrouted_pending) > 0) {
+            throw new Error(`${result.unrouted_pending} pending events are safely retained but need an active Pixel route`);
+        }
+        return 'no inactive outstanding deliveries or unrouted pending events';
+    });
+
+    await check('event aggregate consistency', async () => {
+        const { rows: [result] } = await pool.query(
+            `WITH delivery_summary AS (
+                 SELECT event_store_id,
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (WHERE status = 'SUCCESS') AS succeeded,
+                        COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT') AS permanent_failed,
+                        COUNT(*) FILTER (
+                            WHERE status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                        ) AS outstanding
+                 FROM event_deliveries
+                 GROUP BY event_store_id
+             ),
+             expected AS (
+                 SELECT event_store_id,
+                        CASE
+                            WHEN total > 0 AND succeeded = total THEN 'SUCCESS'
+                            WHEN outstanding > 0 THEN 'PENDING'
+                            WHEN succeeded > 0 AND permanent_failed > 0 THEN 'PARTIAL_FAILED'
+                            WHEN permanent_failed = total THEN 'FAILED'
+                        END AS status
+                 FROM delivery_summary
+             )
+             SELECT COUNT(*)::int AS mismatches
+             FROM expected
+             JOIN event_store event ON event.id = expected.event_store_id
+             WHERE expected.status IS NOT NULL
+               AND event.status IS DISTINCT FROM expected.status
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM shop_pixel_routes route
+                   WHERE route.shop_id = event.shop_id
+                     AND route.status = 'active'
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM event_deliveries missing
+                         WHERE missing.event_store_id = event.id
+                           AND missing.route_id = route.id
+                     )
+               )`,
+        );
+        if (Number(result.mismatches) > 0) {
+            throw new Error(`${result.mismatches} event aggregate statuses disagree with the delivery ledger`);
+        }
+        return 'event_store status agrees with per-route delivery ledger';
+    });
+
+    await check('shared pixel credential identity', async () => {
+        const { rows } = await pool.query(
+            `SELECT platform, pixel_id, COUNT(*)::int AS credentials
+             FROM pixels
+             GROUP BY platform, pixel_id
+             HAVING COUNT(*) > 1
+             ORDER BY credentials DESC, platform, pixel_id
+             LIMIT 20`,
+        );
+        if (rows.length > 0) {
+            const examples = rows.map(row => `${row.platform}:${row.pixel_id} (${row.credentials})`).join(', ');
+            throw new Error(`Duplicate external pixel credentials would bypass shared cooldown/leases: ${examples}`);
+        }
+        return 'each external platform/pixel identity has one shared credential row';
+    });
+
+    await check('postgres scale indexes', async () => {
+        const required = [
+            'idx_event_store_pending_shop_time',
+            'idx_event_store_terminal_retention',
+            'idx_event_store_timestamp_brin',
+            'idx_event_id_aliases_updated',
+            'idx_dead_letters_failed_at',
+            'idx_meta_quality_snapshots_retention',
+            'idx_pixels_platform_external_id',
+        ];
+        const { rows } = await pool.query(
+            `SELECT index_class.relname AS index_name,
+                    index_meta.indisvalid,
+                    index_meta.indisunique,
+                    pg_get_indexdef(index_meta.indexrelid) AS definition
+             FROM pg_index index_meta
+             JOIN pg_class index_class ON index_class.oid = index_meta.indexrelid
+             JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace
+             WHERE namespace.nspname = 'public'
+               AND index_class.relname = ANY($1::text[])`,
+            [required],
+        );
+        const valid = new Set(rows.filter(row => row.indisvalid).map(row => row.index_name));
+        const missing = required.filter(name => !valid.has(name));
+        if (missing.length > 0) throw new Error(`Missing/invalid scale indexes: ${missing.join(', ')}; rerun npm run migrate`);
+        const pixelIdentity = rows.find(row => row.index_name === 'idx_pixels_platform_external_id');
+        if (!pixelIdentity?.indisunique || !/\(platform, pixel_id\)\s*$/i.test(pixelIdentity.definition || '')) {
+            throw new Error('Pixel identity index must be UNIQUE on exactly (platform, pixel_id); rerun npm run migrate');
+        }
+        return `${valid.size} online scale indexes valid`;
+    });
+
+    await check('postgres autovacuum', async () => {
+        const { rows: [setting] } = await pool.query('SHOW autovacuum');
+        if (String(setting.autovacuum).toLowerCase() !== 'on') {
+            throw new Error('autovacuum must be enabled for bounded-retention tables');
+        }
+        return 'enabled';
     });
 
     await check('postgres privileges', async () => {
@@ -126,11 +300,38 @@ async function main() {
         return 'connected';
     });
 
+    await check('redis eviction policy', async () => {
+        try {
+            const result = await redis.config('GET', 'maxmemory-policy');
+            const policy = Array.isArray(result) ? result[1] : undefined;
+            if (policy && policy !== 'noeviction') {
+                throw new Error(`maxmemory-policy=${policy}; BullMQ requires noeviction to protect queue keys`);
+            }
+            return `maxmemory-policy=${policy || 'unknown'}`;
+        } catch (error) {
+            if (/NOPERM|unknown command/i.test(error.message)) return 'CONFIG unavailable; verify noeviction in provider console';
+            throw error;
+        }
+    });
+
     await check('queue config', async () => {
         if (config.workerConcurrency < 1) throw new Error('WORKER_CONCURRENCY must be positive');
         if (config.batchSize < 1) throw new Error('BATCH_SIZE must be positive');
-        if (config.stalePendingMinutes < 1) throw new Error('STALE_PENDING_MINUTES must be positive');
-        return `batch=${config.batchSize}, concurrency=${config.workerConcurrency}, stale_pending=${config.stalePendingMinutes}m`;
+        if (config.workerEventBatchSize < 1) throw new Error('WORKER_EVENT_BATCH_SIZE must be positive');
+        if (config.aggregateReconcileBatchSize < 1) throw new Error('AGGREGATE_RECONCILE_BATCH_SIZE must be positive');
+        if (config.httpHeadersTimeoutMs <= config.httpKeepAliveTimeoutMs) {
+            throw new Error('HTTP_HEADERS_TIMEOUT_MS must exceed HTTP_KEEP_ALIVE_TIMEOUT_MS');
+        }
+        if (config.httpRequestTimeoutMs < config.httpHeadersTimeoutMs) {
+            throw new Error('HTTP_REQUEST_TIMEOUT_MS must be at least HTTP_HEADERS_TIMEOUT_MS');
+        }
+        if (config.shutdownTimeoutMs <= config.httpRequestTimeoutMs) {
+            throw new Error('SHUTDOWN_TIMEOUT_MS must exceed HTTP_REQUEST_TIMEOUT_MS');
+        }
+        if (config.facebookBatchSize > 1000) throw new Error('FACEBOOK_BATCH_SIZE must not exceed 1000');
+        if (config.deliveryRescueMinutes < 1) throw new Error('DELIVERY_RESCUE_MINUTES must be positive');
+        if (config.aliasRetentionDays < 30) throw new Error('ALIAS_RETENTION_DAYS must be at least 30');
+        return `legacy_drain=${config.legacyRedisDrainEnabled}, pack_batch=${config.batchSize}, worker_batch=${config.workerEventBatchSize}, concurrency=${config.workerConcurrency}, rescue_after=${config.deliveryRescueMinutes}m`;
     });
 
     await redis.quit();

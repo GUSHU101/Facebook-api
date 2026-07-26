@@ -17,16 +17,44 @@ const { ExpressAdapter } = require('@bull-board/express');
 const config = require('./config');
 const pool = require('./utils/db');
 const redis = require('./utils/redis');
-const { hashUserData, encryptToken, decryptTokenIfPossible, timingSafeCompare } = require('./utils/crypto');
+const { hashUserData, encryptToken, decryptTokenIfPossible, timingSafeCompare, timingSafeStringCompare } = require('./utils/crypto');
 const { calculateEMQ, missingMatchSignals } = require('./utils/emq');
-const { compactObject, firstPresent, normalizeShopifyId } = require('./events/common');
-const { buildShopifyOrderPurchasePayload } = require('./events/shopify');
+const {
+    compactObject,
+    firstPresent,
+    missingCommerceSignals,
+    normalizeEventId,
+    normalizeShopifyId,
+    tenantScopedExternalId,
+} = require('./events/common');
+const { buildShopifyOrderPurchasePayload, paidOrderIgnoreReason } = require('./events/shopify');
+const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
 
 const app = express();
 app.set('trust proxy', config.trustProxy);
 
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: config.corsOrigin, credentials: false }));
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: [
+                "'self'",
+                "'unsafe-inline'",
+                "'unsafe-eval'",
+            ],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", 'data:'],
+            connectSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            baseUri: ["'self'"],
+            frameAncestors: ["'self'"],
+        },
+    },
+}));
+// Only the storefront ingestion endpoint needs browser CORS. Keeping CORS off
+// admin routes prevents an unrelated website from reading authenticated admin
+// responses through a browser session that already has Basic Auth credentials.
+app.use('/api/pixel-event', cors({ origin: config.corsOrigin, credentials: false }));
 app.use(express.json({
     limit: config.jsonLimit,
     verify: (req, res, buf) => {
@@ -44,13 +72,15 @@ const capiQueue = new Queue('capi-events', {
     },
 });
 
-const pixelLimiter = rateLimit({
-    windowMs: 60_000,
-    max: config.pixelRateLimitPerMinute,
-    keyGenerator: req => `${normalizeShopDomain(shopDomainFromPixelBody(req.body)) || 'unknown'}:${firstForwardedIp(req)}`,
-    standardHeaders: true,
-    legacyHeaders: false,
-});
+const pixelLimiter = config.pixelRateLimitPerMinute > 0
+    ? rateLimit({
+        windowMs: 60_000,
+        max: config.pixelRateLimitPerMinute,
+        keyGenerator: req => `${normalizeShopDomain(shopDomainFromPixelBody(req.body)) || 'unknown'}:${firstForwardedIp(req)}`,
+        standardHeaders: true,
+        legacyHeaders: false,
+    })
+    : (req, res, next) => next();
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -61,13 +91,18 @@ const adminLimiter = rateLimit({
 
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
-const DEDUPE_TTL_SECONDS = 7 * 24 * 60 * 60;
-const PURCHASE_DEDUPE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_PIXEL_BATCH_SIZE = 50;
 const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+}
+
+function shopIngestToken(shopDomain) {
+    return crypto
+        .createHmac('sha256', config.aesSecretKey)
+        .update(`shop-ingest:${normalizeShopDomain(shopDomain)}`)
+        .digest('hex');
 }
 
 function requireMyshopifyDomain(value) {
@@ -245,43 +280,79 @@ function shopDomainFromPixelBody(body) {
     return body?.shop_domain;
 }
 
-function normalizeEventId(value) {
-    const normalized = normalizeShopifyId(value);
-    return normalized ? String(normalized).trim().slice(0, 255) : undefined;
-}
+function durableAliasEntries(eventName, eventId, payload) {
+    if (eventName !== 'Purchase') return [];
+    const entries = [
+        ['id', eventId],
+        ['checkout', payload.checkout_token],
+        ['order', payload.order_id],
+        ['cart', payload.cart_token],
+    ];
 
-function dedupeAliasKeys(shopId, eventName, eventId, payload) {
-    const candidates = [['id', eventId]];
-    if (eventName === 'Purchase') {
-        candidates.push(
-            ['checkout', payload.checkout_token],
-            ['order', payload.order_id],
-            ['cart', payload.cart_token],
-        );
-    }
-
-    const keys = [];
     const seen = new Set();
-    for (const [type, rawValue] of candidates) {
-        const value = cleanKeyPart(normalizeEventId(rawValue) || rawValue);
-        if (!value) continue;
-        const key = `dedup-alias:${shopId}:${eventName}:${type}:${value}`;
-        if (!seen.has(key)) {
-            seen.add(key);
-            keys.push(key);
-        }
-    }
-    return keys;
+    return entries.map(([type, rawValue]) => ({
+        type,
+        value: cleanKeyPart(normalizeEventId(rawValue) || rawValue),
+    })).filter(entry => {
+        if (!entry.value) return false;
+        const key = `${entry.type}:${entry.value}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
-async function resolveCanonicalEventId(shopId, eventName, proposedEventId, payload, ttlSeconds) {
-    const aliasKeys = dedupeAliasKeys(shopId, eventName, proposedEventId, payload);
-    if (aliasKeys.length === 0) return proposedEventId;
+async function resolveCanonicalEventIdDurably(shopId, eventName, proposedEventId, payload) {
+    const entries = durableAliasEntries(eventName, proposedEventId, payload);
+    if (entries.length === 0) return proposedEventId;
 
-    const existing = (await redis.mget(aliasKeys)).find(Boolean);
-    const canonicalEventId = existing || proposedEventId;
-    await Promise.all(aliasKeys.map(key => redis.set(key, canonicalEventId, 'EX', ttlSeconds, 'NX')));
-    return canonicalEventId;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const lockKeys = entries
+            .map(entry => `${shopId}:${eventName}:${entry.type}:${entry.value}`)
+            .sort();
+        for (const lockKey of lockKeys) {
+            await client.query(
+                'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+                [lockKey],
+            );
+        }
+
+        const aliasTypes = entries.map(entry => entry.type);
+        const aliasValues = entries.map(entry => entry.value);
+        const existing = await client.query(
+            `SELECT a.canonical_event_id, a.created_at, a.id
+             FROM event_id_aliases a
+             JOIN UNNEST($3::text[], $4::text[]) requested(alias_type, alias_value)
+               ON requested.alias_type = a.alias_type
+              AND requested.alias_value = a.alias_value
+             WHERE a.shop_id = $1
+               AND a.event_name = $2
+             ORDER BY a.created_at ASC, a.id ASC`,
+            [shopId, eventName, aliasTypes, aliasValues],
+        );
+        const canonicalEventId = existing.rows[0]?.canonical_event_id || proposedEventId;
+
+        await client.query(
+            `INSERT INTO event_id_aliases
+                (shop_id, event_name, alias_type, alias_value, canonical_event_id)
+             SELECT $1, $2, requested.alias_type, requested.alias_value, $5
+             FROM UNNEST($3::text[], $4::text[]) requested(alias_type, alias_value)
+             ON CONFLICT (shop_id, event_name, alias_type, alias_value)
+             DO UPDATE SET
+                 canonical_event_id = EXCLUDED.canonical_event_id,
+                 updated_at = NOW()`,
+            [shopId, eventName, aliasTypes, aliasValues, canonicalEventId],
+        );
+        await client.query('COMMIT');
+        return canonicalEventId;
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 function attributionKeys(shopId, payload) {
@@ -360,7 +431,12 @@ async function saveAttributionSnapshot(shopId, payload) {
     const snapshot = attributionSnapshot(payload);
     if (Object.keys(snapshot).length === 0) return;
 
-    await Promise.all(keys.map(key => redis.set(key, JSON.stringify(snapshot), 'EX', ATTRIBUTION_TTL_SECONDS)));
+    const serialized = JSON.stringify(snapshot);
+    const pipeline = redis.pipeline();
+    for (const key of keys) pipeline.set(key, serialized, 'EX', ATTRIBUTION_TTL_SECONDS);
+    const results = await pipeline.exec();
+    const failed = results.find(([error]) => error);
+    if (failed) throw failed[0];
 }
 
 async function deleteKeysByPattern(pattern) {
@@ -393,6 +469,31 @@ async function releaseRedisLock(key, token) {
         return 0
     `;
     await redis.eval(script, 1, key, token);
+}
+
+function startRedisLockHeartbeat(key, token, ttlSeconds) {
+    const renewScript = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        end
+        return 0
+    `;
+    const intervalMs = Math.max(1000, Math.floor((ttlSeconds * 1000) / 3));
+    let stopped = false;
+    let inFlight = Promise.resolve();
+    const timer = setInterval(() => {
+        inFlight = inFlight.then(async () => {
+            if (stopped) return;
+            const renewed = Number(await redis.eval(renewScript, 1, key, token, ttlSeconds));
+            if (renewed !== 1) console.warn(`[Lock] lost ${key}; idempotency fencing remains active`);
+        }).catch(error => console.error(`[Lock] heartbeat failed for ${key}:`, error.message));
+    }, intervalMs);
+    timer.unref?.();
+    return async () => {
+        stopped = true;
+        clearInterval(timer);
+        await inFlight;
+    };
 }
 
 async function removeQueuedSendJobsForShop(shopId = null) {
@@ -490,7 +591,7 @@ function summarizeMetaQuality(rawPayload) {
     };
 }
 
-async function insertMetaQualitySnapshot(pixel, status, rawPayload, errorMessage = null) {
+async function insertMetaQualitySnapshot(pixel, shopId, status, rawPayload, errorMessage = null) {
     const summary = status === 'SUCCESS' ? summarizeMetaQuality(rawPayload) : null;
     await pool.query(
         `INSERT INTO meta_quality_snapshots
@@ -498,7 +599,7 @@ async function insertMetaQualitySnapshot(pixel, status, rawPayload, errorMessage
          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8)`,
         [
             pixel.id,
-            pixel.shop_id,
+            shopId,
             pixel.pixel_id,
             status,
             META_QUALITY_METRIC_TYPE,
@@ -517,52 +618,142 @@ async function fetchMetaQualityForPixel(pixel) {
     const url = `https://graph.facebook.com/${config.fbApiVersion}/dataset_quality`;
     const response = await axios.get(url, {
         timeout: config.fbRequestTimeoutMs,
+        headers: {
+            Authorization: `Bearer ${token}`,
+        },
         params: {
             dataset_id: pixel.pixel_id,
             web_metric_type: META_QUALITY_METRIC_TYPE,
-            access_token: token,
         },
     });
-    return response.data;
+    return response;
 }
 
 async function refreshMetaQualityForPixel(pixel) {
     if (pixel.platform !== 'facebook') return null;
+    const shopIds = Array.isArray(pixel.shop_ids) ? pixel.shop_ids : [pixel.shop_id].filter(Boolean);
+    const rateLimitUntil = Date.parse(pixel.rate_limit_until);
+    if (Number.isFinite(rateLimitUntil) && rateLimitUntil > Date.now()) {
+        return {
+            pixel_id: pixel.pixel_id,
+            status: 'DEFERRED',
+            retry_after_seconds: Math.ceil((rateLimitUntil - Date.now()) / 1000),
+        };
+    }
 
     try {
-        const rawPayload = await fetchMetaQualityForPixel(pixel);
-        const summary = await insertMetaQualitySnapshot(pixel, 'SUCCESS', rawPayload);
+        const response = await fetchMetaQualityForPixel(pixel);
+        const rawPayload = response.data;
+        const rateControl = metaRateControlFromHeaders(response.headers);
+        await pool.query(
+            `UPDATE pixels
+             SET last_usage_pct = COALESCE($2, last_usage_pct),
+                 rate_limit_until = CASE
+                     WHEN $3::int > 0
+                     THEN GREATEST(
+                         COALESCE(rate_limit_until, NOW()),
+                         NOW() + ($3::int * INTERVAL '1 second')
+                     )
+                     ELSE rate_limit_until
+                 END,
+                 last_rate_limit_at = CASE WHEN $3::int > 0 THEN NOW() ELSE last_rate_limit_at END
+             WHERE id = $1`,
+            [
+                pixel.id,
+                rateControl.maxUsagePercent === undefined ? null : Number(rateControl.maxUsagePercent),
+                Math.ceil(Number(rateControl.cooldownSeconds || 0)),
+            ],
+        );
+        let summary;
+        for (const shopId of shopIds) {
+            summary = await insertMetaQualitySnapshot(pixel, shopId, 'SUCCESS', rawPayload);
+        }
         return { pixel_id: pixel.pixel_id, status: 'SUCCESS', summary };
     } catch (error) {
         const responsePayload = error.response?.data || null;
-        const message = responsePayload?.error?.message || error.message;
-        await insertMetaQualitySnapshot(pixel, 'FAILED', responsePayload, message);
+        const classification = classifyFacebookError(error);
+        const message = classification.message;
+        if (classification.retryable) {
+            const cooldownSeconds = Math.max(
+                Number(classification.retryAfterSeconds || 0),
+                Number(classification.rateControl?.cooldownSeconds || 0),
+                60,
+            );
+            await pool.query(
+                `UPDATE pixels
+                 SET rate_limit_until = GREATEST(
+                         COALESCE(rate_limit_until, NOW()),
+                         NOW() + ($2::int * INTERVAL '1 second')
+                     ),
+                     last_rate_limit_at = NOW(),
+                     last_usage_pct = COALESCE($3, last_usage_pct)
+                 WHERE id = $1`,
+                [
+                    pixel.id,
+                    Math.ceil(cooldownSeconds),
+                    classification.rateControl?.maxUsagePercent === undefined
+                        ? null
+                        : Number(classification.rateControl.maxUsagePercent),
+                ],
+            );
+        }
+        for (const shopId of shopIds) {
+            await insertMetaQualitySnapshot(pixel, shopId, 'FAILED', responsePayload, message);
+        }
         return { pixel_id: pixel.pixel_id, status: 'FAILED', error: message };
     }
 }
 
 async function refreshMetaQualitySnapshots(shopId = null) {
     const params = shopId ? [shopId] : [];
-    const shopFilter = shopId ? 'AND p.shop_id = $1' : '';
+    const shopFilter = shopId ? 'AND r.shop_id = $1' : '';
     const { rows: pixels } = await pool.query(
-        `SELECT p.id, p.shop_id, p.platform, p.name, p.pixel_id, p.access_token, p.quality_access_token
-         FROM pixels p
-         JOIN shops s ON s.id = p.shop_id
+        `SELECT p.id,
+                ARRAY_AGG(DISTINCT r.shop_id ORDER BY r.shop_id) AS shop_ids,
+                p.platform,
+                p.name,
+                p.pixel_id,
+                p.access_token,
+                p.quality_access_token,
+                p.rate_limit_until
+         FROM shop_pixel_routes r
+         JOIN pixels p ON p.id = r.pixel_id
+         JOIN shops s ON s.id = r.shop_id
          WHERE p.platform = 'facebook'
+           AND r.status = 'active'
            AND s.status = 'active'
            ${shopFilter}
+         GROUP BY p.id
          ORDER BY p.id ASC`,
         params,
     );
 
     const results = [];
     for (const pixel of pixels) {
-        results.push(await refreshMetaQualityForPixel(pixel));
+        const lockKey = `lock:delivery-credential:${pixel.id}`;
+        const lockToken = crypto.randomUUID();
+        const ttlSeconds = Math.max(30, Math.ceil(config.credentialLeaseMs / 1000));
+        const lock = await redis.set(lockKey, lockToken, 'EX', ttlSeconds, 'NX');
+        if (!lock) {
+            results.push({
+                pixel_id: pixel.pixel_id,
+                status: 'SKIPPED',
+                reason: 'credential_busy',
+            });
+            continue;
+        }
+        const stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, ttlSeconds);
+        try {
+            results.push(await refreshMetaQualityForPixel(pixel));
+        } finally {
+            await stopLockHeartbeat().catch(() => {});
+            await releaseRedisLock(lockKey, lockToken).catch(() => {});
+        }
     }
     return results;
 }
 
-function buildUserData(req, payload) {
+function buildUserData(req, payload, options = {}) {
     const email = firstPresent(payload.email, payload.customer_email);
     const phone = firstPresent(payload.phone, payload.customer_phone);
     const firstName = firstPresent(payload.firstName, payload.first_name, payload.customer_first_name);
@@ -572,6 +763,11 @@ function buildUserData(req, payload) {
     const zip = firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip);
     const country = firstPresent(payload.country, payload.country_code, payload.customer_country);
     const externalId = primaryExternalId(payload);
+    const tenantId = normalizeShopDomain(firstPresent(payload.tenant_id, payload.shop_domain));
+    const scopedExternalId = tenantScopedExternalId(
+        tenantId,
+        firstPresent(externalId, firstScalar(payload.external_id_hash)),
+    );
 
     const hashed = {
         em: hashOrKeepMany([payload.email_hash, payload.email_sha256, payload.em, email], 'email'),
@@ -582,12 +778,20 @@ function buildUserData(req, payload) {
         st: hashOrKeepMany([payload.state_hash, payload.st, state], 'state'),
         zp: hashOrKeepMany([payload.zip_hash, payload.zp, zip], 'zip'),
         country: hashOrKeepMany([payload.country_hash, payload.country_sha256, payload.country_hashed, country], 'country'),
-        external_id: hashOrKeepMany([payload.external_id_hash, externalId], 'default'),
+        external_id: scopedExternalId ? [scopedExternalId] : undefined,
     };
 
     return compactObject({
-        client_ip_address: firstPresent(payload.client_ip, firstForwardedIp(req)),
-        client_user_agent: firstPresent(payload.user_agent, req.headers['user-agent']),
+        // Shopify webhook requests originate from Shopify infrastructure. Never
+        // mistake Shopify's IP or user agent for the shopper's match signals.
+        client_ip_address: firstPresent(
+            payload.client_ip,
+            options.allowRequestIdentifiers ? firstForwardedIp(req) : undefined,
+        ),
+        client_user_agent: firstPresent(
+            payload.user_agent,
+            options.allowRequestIdentifiers ? req.headers['user-agent'] : undefined,
+        ),
         fbc: firstPresent(payload.fbc, payload._fbc),
         fbp: firstPresent(payload.fbp, payload._fbp),
         em: hashed.em,
@@ -644,8 +848,13 @@ function buildCustomData(payload) {
             .filter(Boolean)
             .map(item => compactObject({
                 id: firstPresent(item.id, item.content_id) ? String(firstPresent(item.id, item.content_id)) : undefined,
-                quantity: Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : undefined,
-                item_price: Number.isFinite(Number(firstPresent(item.item_price, item.price))) ? Number(firstPresent(item.item_price, item.price)) : undefined,
+                quantity: Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0
+                    ? Number(item.quantity)
+                    : undefined,
+                item_price: Number.isFinite(Number(firstPresent(item.item_price, item.price)))
+                    && Number(firstPresent(item.item_price, item.price)) >= 0
+                    ? Number(firstPresent(item.item_price, item.price))
+                    : undefined,
             }))
             .filter(item => item.id)
         : undefined;
@@ -657,14 +866,16 @@ function buildCustomData(payload) {
         : contents?.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
 
     return compactObject({
-        value: payload.value !== undefined && Number.isFinite(Number(payload.value)) ? Number(payload.value) : undefined,
+        value: payload.value !== undefined && Number.isFinite(Number(payload.value)) && Number(payload.value) >= 0
+            ? Number(payload.value)
+            : undefined,
         currency: payload.currency ? String(payload.currency).trim().toUpperCase() : undefined,
         content_ids: contentIds?.length ? contentIds : undefined,
         contents: contents?.length ? contents : undefined,
         content_type: payload.content_type,
         content_name: payload.content_name,
         content_category: payload.content_category,
-        num_items: numItems || undefined,
+        num_items: numItems > 0 ? numItems : undefined,
         order_id: payload.order_id,
         search_string: payload.search_string,
     });
@@ -737,7 +948,10 @@ function mergeQueuedEvent(left, right) {
         _received_at: Math.min(Number(left._received_at || right._received_at), Number(right._received_at || left._received_at)),
     };
     merged._emq_estimate = Math.max(Number(left._emq_estimate || 0), Number(right._emq_estimate || 0), calculateEMQ(mergedUserData));
-    merged._quality = { missing_match_signals: missingMatchSignals(mergedUserData) };
+    merged._quality = {
+        missing_match_signals: missingMatchSignals(mergedUserData),
+        missing_event_parameters: missingCommerceSignals(merged.event_name, merged.custom_data),
+    };
     return compactObject(merged);
 }
 
@@ -757,49 +971,232 @@ function resolveEventTime(payload) {
     if (!Number.isFinite(fromPayload)) return now;
 
     const seconds = Math.floor(fromPayload / 1000);
-    const sevenDays = 7 * 24 * 60 * 60;
     if (seconds > now + 300) return now;
-    if (seconds < now - sevenDays) return now;
     return seconds;
 }
 
-function buildQueueJobId(shopId, dbEvents) {
-    const ids = dbEvents.map(event => String(event.id)).sort().join('|');
-    const digest = crypto.createHash('sha256').update(`${shopId}|${ids}`).digest('hex').slice(0, 32);
-    return `send-${shopId}-${digest}`;
-}
-
 async function queueStalePendingEvents() {
-    const { rows } = await pool.query(
-        `SELECT e.id, e.shop_id, e.request_payload, e.status, e.fb_response
+    const cursorKey = 'scheduler:stale_pending_shop_cursor';
+    const cursor = Number(await optionalRedis(
+        () => redis.get(cursorKey),
+        0,
+        'backlog rescue cursor',
+    ) || 0);
+    const loadShopsAfter = afterShopId => pool.query(
+        `SELECT e.shop_id, MIN(e.timestamp) AS oldest_pending_at
          FROM event_store e
          JOIN shops s ON s.id = e.shop_id
          WHERE e.status = 'PENDING'
            AND s.status = 'active'
+           AND e.shop_id > $2
            AND e.timestamp < NOW() - ($1::int * INTERVAL '1 minute')
-         ORDER BY e.shop_id ASC, e.id ASC
-         LIMIT $2`,
-        [config.stalePendingMinutes, config.batchSize],
+           AND EXISTS (
+                   SELECT 1
+                   FROM shop_pixel_routes active_route
+                   LEFT JOIN event_deliveries ready
+                     ON ready.event_store_id = e.id
+                    AND ready.route_id = active_route.id
+                   WHERE active_route.shop_id = e.shop_id
+                     AND active_route.status = 'active'
+                     AND (
+                         ready.id IS NULL
+                         OR (
+                             ready.next_attempt_at <= NOW()
+                             AND (
+                                 ready.status IN ('PENDING', 'RETRYABLE_FAILED')
+                                 OR (ready.status = 'IN_PROGRESS' AND ready.lease_expires_at < NOW())
+                             )
+                         )
+                     )
+           )
+         GROUP BY e.shop_id
+         ORDER BY e.shop_id ASC
+         LIMIT $3`,
+        [config.deliveryRescueMinutes, afterShopId, config.deliveryRescueShopLimit],
     );
+    let { rows } = await loadShopsAfter(cursor);
+    if (rows.length === 0 && cursor > 0) ({ rows } = await loadShopsAfter(0));
     if (rows.length === 0) return 0;
 
-    const byShop = new Map();
-    for (const row of rows) {
-        const events = byShop.get(row.shop_id) || [];
-        events.push(row);
-        byShop.set(row.shop_id, events);
-    }
-
     let queued = 0;
-    for (const [shopId, dbEvents] of byShop.entries()) {
+    const rescueMinute = Math.floor(Date.now() / 60000);
+    for (const row of rows) {
+        const shopId = Number(row.shop_id);
         await capiQueue.add(
             'send-fb-batch',
-            { shopId, dbEvents },
-            { jobId: buildQueueJobId(shopId, dbEvents) },
+            { shopId },
+            { jobId: `rescue-${shopId}-${rescueMinute}` },
         );
-        queued += dbEvents.length;
+        queued += 1;
     }
+    void optionalRedis(
+        () => redis.set(cursorKey, String(rows[rows.length - 1].shop_id)),
+        undefined,
+        'backlog rescue cursor save',
+    );
     return queued;
+}
+
+async function reconcileEventAggregateStatuses() {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { rows: [lock] } = await client.query(
+            "SELECT pg_try_advisory_xact_lock(hashtext('capi-saas-pro:aggregate-reconcile')) AS acquired",
+        );
+        if (lock?.acquired !== true) {
+            await client.query('ROLLBACK');
+            return 0;
+        }
+
+        const { rowCount } = await client.query(
+            `WITH candidates AS (
+                 SELECT event.id
+                 FROM event_store event
+                 WHERE event.status = 'PENDING'
+                   AND EXISTS (
+                       SELECT 1 FROM event_deliveries delivery
+                       WHERE delivery.event_store_id = event.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM event_deliveries outstanding
+                       WHERE outstanding.event_store_id = event.id
+                         AND outstanding.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM shop_pixel_routes route
+                       WHERE route.shop_id = event.shop_id
+                         AND route.status = 'active'
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM event_deliveries missing
+                             WHERE missing.event_store_id = event.id
+                               AND missing.route_id = route.id
+                         )
+                   )
+                 ORDER BY event.id ASC
+                 FOR UPDATE OF event SKIP LOCKED
+                 LIMIT $1
+             ),
+             delivery_summary AS (
+                 SELECT delivery.event_store_id,
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (WHERE delivery.status = 'SUCCESS') AS succeeded,
+                        COUNT(*) FILTER (WHERE delivery.status = 'FAILED_PERMANENT') AS permanent_failed,
+                        COUNT(*) FILTER (
+                            WHERE delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                        ) AS outstanding
+                 FROM event_deliveries delivery
+                 JOIN candidates candidate ON candidate.id = delivery.event_store_id
+                 GROUP BY delivery.event_store_id
+             ),
+             expected AS (
+                 SELECT event_store_id,
+                        CASE
+                            WHEN total > 0 AND succeeded = total THEN 'SUCCESS'
+                            WHEN outstanding > 0 THEN 'PENDING'
+                            WHEN succeeded > 0 AND permanent_failed > 0 THEN 'PARTIAL_FAILED'
+                            WHEN permanent_failed = total THEN 'FAILED'
+                        END AS status
+                 FROM delivery_summary
+             )
+             UPDATE event_store event
+             SET status = expected.status
+             FROM expected
+             WHERE event.id = expected.event_store_id
+               AND expected.status IS NOT NULL
+               AND event.status IS DISTINCT FROM expected.status`,
+            [config.aggregateReconcileBatchSize],
+        );
+        await client.query('COMMIT');
+        return rowCount;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+async function deleteRetentionBatches(query, retentionDays) {
+    let deleted = 0;
+    for (let batch = 0; batch < config.cleanupMaxBatches; batch += 1) {
+        const result = await pool.query(query, [retentionDays, config.cleanupBatchSize]);
+        deleted += result.rowCount;
+        if (result.rowCount < config.cleanupBatchSize) break;
+    }
+    return deleted;
+}
+
+async function cleanupExpiredOperationalData() {
+    const eventStore = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT id
+             FROM event_store
+             WHERE status IN ('SUCCESS', 'FAILED', 'PARTIAL_FAILED')
+               AND timestamp < NOW() - ($1::int * INTERVAL '1 day')
+             ORDER BY timestamp ASC, id ASC
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM event_store target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.eventRetentionDays,
+    );
+    const aliases = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT alias.id
+             FROM event_id_aliases alias
+             WHERE alias.updated_at < NOW() - ($1::int * INTERVAL '1 day')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM event_store event
+                   WHERE event.shop_id = alias.shop_id
+                     AND event.event_name = alias.event_name
+                     AND event.event_id = alias.canonical_event_id
+                     AND event.status IN ('PENDING', 'AWAITING_PAYMENT')
+               )
+             ORDER BY alias.updated_at ASC, alias.id ASC
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM event_id_aliases target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.aliasRetentionDays,
+    );
+    const deadLetters = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT id
+             FROM dead_letters
+             WHERE failed_at < NOW() - ($1::int * INTERVAL '1 day')
+             ORDER BY failed_at ASC, id ASC
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM dead_letters target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.deadLetterRetentionDays,
+    );
+    const qualitySnapshots = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT id
+             FROM meta_quality_snapshots
+             WHERE fetched_at < NOW() - ($1::int * INTERVAL '1 day')
+             ORDER BY fetched_at ASC, id ASC
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM meta_quality_snapshots target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.qualityRetentionDays,
+    );
+    return { eventStore, aliases, deadLetters, qualitySnapshots };
 }
 
 async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
@@ -827,7 +1224,7 @@ async function restoreReplayableEvents(shopId, dbEvents) {
         const { rows } = await pool.query(
             `INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload, fb_response)
              VALUES ($1, $2, $3, 'PENDING', $4, $5::jsonb, NULL)
-             ON CONFLICT (shop_id, event_name, md5(event_id)) DO UPDATE SET
+             ON CONFLICT (shop_id, event_name, event_id) DO UPDATE SET
                  status = 'PENDING',
                  request_payload = EXCLUDED.request_payload,
                  emq_estimate = COALESCE(event_store.emq_estimate, EXCLUDED.emq_estimate),
@@ -836,27 +1233,198 @@ async function restoreReplayableEvents(shopId, dbEvents) {
              RETURNING id, request_payload, status, fb_response`,
             [shopId, eventName, eventId, emqEstimate, JSON.stringify(payload)],
         );
-        restored.push(...rows);
+        if (rows.length > 0) {
+            const restoredIds = rows.map(row => row.id);
+            // Manual DLQ replay is an explicit retry decision. Reset only
+            // permanently failed deliveries on routes that are still active;
+            // successful routes remain immutable and inactive routes stay off.
+            await pool.query(
+                `UPDATE event_deliveries delivery
+                 SET status = 'PENDING',
+                     attempt_count = 0,
+                     next_attempt_at = NOW(),
+                     lease_expires_at = NULL,
+                     last_attempt_at = NULL,
+                     error_code = NULL,
+                     error_message = NULL,
+                     updated_at = NOW()
+                 FROM shop_pixel_routes route
+                 WHERE delivery.route_id = route.id
+                   AND route.shop_id = $1
+                   AND route.status = 'active'
+                   AND delivery.event_store_id = ANY($2::bigint[])
+                   AND delivery.status = 'FAILED_PERMANENT'`,
+                [shopId, restoredIds],
+            );
+            restored.push(...rows);
+        }
     }
     return restored;
 }
 
-async function queueEventForOutbox(req, payload, shopId) {
-    const eventName = requireBoundedString(payload.event_name, 'event_name', 50);
-    const proposedEventId = normalizeEventId(payload.event_id) || `${eventName}_${crypto.randomUUID()}`;
-    const attribution = await loadAttributionSnapshot(shopId, payload);
-    const enrichedPayload = { ...attribution, ...payload };
-    const ttlSeconds = eventName === 'Purchase' ? PURCHASE_DEDUPE_TTL_SECONDS : DEDUPE_TTL_SECONDS;
-    const eventId = await resolveCanonicalEventId(shopId, eventName, proposedEventId, enrichedPayload, ttlSeconds);
-    const dedupKey = `dedup:${shopId}:${eventName}:${eventId}`;
+function withTimeout(promise, timeoutMs, label) {
+    let timeoutId;
+    const timeout = new Promise((resolve, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+        timeoutId.unref?.();
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
 
-    await saveAttributionSnapshot(shopId, enrichedPayload);
-    const isNew = await redis.set(dedupKey, '1', 'EX', ttlSeconds, 'NX');
-    if (!isNew && eventName !== 'Purchase') {
-        return { statusCode: 200, body: { success: true, deduplicated: true, event_id: eventId } };
+async function optionalRedis(operation, fallback, label) {
+    if (redis.status !== 'ready') return fallback;
+    try {
+        return await withTimeout(Promise.resolve().then(operation), 1500, label);
+    } catch (error) {
+        console.warn(`[Ingest] ${label} unavailable; durable PostgreSQL path continues`);
+        return fallback;
     }
+}
 
-    const userData = buildUserData(req, enrichedPayload);
+async function persistOutboxEvent(shopId, payload) {
+    const purePayload = { ...payload };
+    const emqEstimate = purePayload._emq_estimate;
+    delete purePayload._emq_estimate;
+    const initialStatus = purePayload._requires_payment_confirmation
+        && !purePayload._payment_confirmed
+        ? 'AWAITING_PAYMENT'
+        : 'PENDING';
+    const { rows } = await pool.query(
+        `INSERT INTO event_store
+            (shop_id, event_name, event_id, status, emq_estimate, request_payload)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         ON CONFLICT (shop_id, event_name, event_id) DO UPDATE SET
+             status = CASE
+                 WHEN event_store.status = 'AWAITING_PAYMENT'
+                  AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                 THEN 'PENDING'
+                 ELSE event_store.status
+             END,
+             timestamp = CASE
+                 WHEN event_store.status = 'AWAITING_PAYMENT'
+                  AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                 THEN NOW()
+                 ELSE event_store.timestamp
+             END,
+             emq_estimate = GREATEST(event_store.emq_estimate, EXCLUDED.emq_estimate),
+             request_payload =
+                 event_store.request_payload ||
+                 EXCLUDED.request_payload ||
+                 jsonb_build_object(
+                      'event_time',
+                      CASE
+                          WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                          THEN (EXCLUDED.request_payload->>'event_time')::bigint
+                          WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
+                          THEN (event_store.request_payload->>'event_time')::bigint
+                          ELSE LEAST(
+                              (event_store.request_payload->>'event_time')::bigint,
+                              (EXCLUDED.request_payload->>'event_time')::bigint
+                          )
+                      END,
+                     'event_source_url',
+                     CASE
+                         WHEN LENGTH(COALESCE(EXCLUDED.request_payload->>'event_source_url', ''))
+                            > LENGTH(COALESCE(event_store.request_payload->>'event_source_url', ''))
+                         THEN EXCLUDED.request_payload->'event_source_url'
+                         ELSE event_store.request_payload->'event_source_url'
+                     END,
+                     'user_data',
+                     COALESCE(event_store.request_payload->'user_data', '{}'::jsonb) ||
+                     COALESCE(EXCLUDED.request_payload->'user_data', '{}'::jsonb),
+                     'custom_data',
+                     CASE
+                         WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                         THEN COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
+                              COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
+                         WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
+                         THEN COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb) ||
+                              COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb)
+                         ELSE COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
+                              COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
+                     END,
+                     '_platform_data',
+                     COALESCE(event_store.request_payload->'_platform_data', '{}'::jsonb) ||
+                     COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb),
+                     '_requires_payment_confirmation',
+                     COALESCE(event_store.request_payload->>'_requires_payment_confirmation', 'false')::boolean OR
+                     COALESCE(EXCLUDED.request_payload->>'_requires_payment_confirmation', 'false')::boolean,
+                     '_payment_confirmed',
+                     COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean OR
+                     COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                 )
+         WHERE event_store.status <> 'SUCCESS'
+         RETURNING id, shop_id, event_name, event_id, request_payload, emq_estimate, status, fb_response`,
+        [
+             shopId,
+             purePayload.event_name,
+             purePayload.event_id,
+             initialStatus,
+             emqEstimate,
+             JSON.stringify(purePayload),
+        ],
+    );
+    return rows[0] || null;
+}
+
+async function scheduleDurableDispatch(shopId, eventName) {
+    if (redis.status !== 'ready') throw new Error('Redis is not ready');
+    const isPurchase = eventName === 'Purchase';
+    const queueClass = isPurchase ? 'purchase' : 'realtime';
+    const timeBucket = Math.floor(Date.now() / 1000);
+    const delay = isPurchase ? config.purchaseSettleMs : 0;
+    return withTimeout(
+        capiQueue.add(
+            'send-fb-batch',
+            { shopId },
+            {
+                delay,
+                jobId: `dispatch-${shopId}-${queueClass}-${timeBucket}`,
+            },
+        ),
+        1500,
+        'BullMQ dispatch',
+    );
+}
+
+async function wakeShopOutboxes(shopIds) {
+    const uniqueShopIds = [...new Set(shopIds.map(Number).filter(Number.isInteger))];
+    const results = await Promise.allSettled(
+        uniqueShopIds.map(shopId => scheduleDurableDispatch(shopId, 'RouteActivated')),
+    );
+    const failed = results.filter(result => result.status === 'rejected').length;
+    if (failed > 0) {
+        console.warn(`[Routing] ${failed} shop outbox wakeups deferred to the PostgreSQL rescue scan`);
+    }
+}
+
+async function queueEventForOutbox(req, payload, shopId, options = {}) {
+    const eventName = requireBoundedString(payload.event_name, 'event_name', 50);
+    const rawEventId = requireBoundedString(payload.event_id, 'event_id', 4096);
+    const proposedEventId = normalizeEventId(rawEventId);
+    const attribution = await optionalRedis(
+        () => loadAttributionSnapshot(shopId, payload),
+        {},
+        'attribution lookup',
+    );
+    const enrichedPayload = { ...attribution, ...payload };
+    const eventId = await resolveCanonicalEventIdDurably(
+        shopId,
+        eventName,
+        proposedEventId,
+        enrichedPayload,
+    );
+    optionalRedis(
+        () => saveAttributionSnapshot(shopId, enrichedPayload),
+        undefined,
+        'attribution save',
+    );
+    const userData = buildUserData(req, enrichedPayload, options);
+    const customData = buildCustomData(enrichedPayload);
+    const requiresPaymentConfirmation = eventName === 'Purchase'
+        && options.requirePaymentConfirmation === true;
+    const paymentConfirmed = eventName === 'Purchase'
+        && options.paymentConfirmed === true;
     const fbEventData = {
         event_name: eventName,
         event_time: resolveEventTime(enrichedPayload),
@@ -864,27 +1432,81 @@ async function queueEventForOutbox(req, payload, shopId) {
         event_id: eventId,
         event_source_url: eventSourceUrlForPayload(req, enrichedPayload),
         user_data: userData,
-        custom_data: buildCustomData(enrichedPayload),
+        custom_data: customData,
         _emq_estimate: calculateEMQ(userData),
-        _quality: { missing_match_signals: missingMatchSignals(userData) },
+        _quality: {
+            missing_match_signals: missingMatchSignals(userData),
+            missing_event_parameters: missingCommerceSignals(eventName, customData),
+        },
         _platform_data: buildPlatformData(enrichedPayload),
-        _duplicate_candidate: !isNew,
+        _requires_payment_confirmation: requiresPaymentConfirmation,
+        _payment_confirmed: paymentConfirmed,
         _attribution_enriched: Object.keys(attribution).length > 0,
         _received_at: Date.now(),
     };
 
-    try {
-        await redis.rpush(`pending:events:${shopId}`, JSON.stringify(fbEventData));
-    } catch (error) {
-        if (isNew) await redis.del(dedupKey).catch(() => {});
-        throw error;
+    const dbEvent = await persistOutboxEvent(shopId, fbEventData);
+    if (!dbEvent) {
+        return {
+            statusCode: 200,
+            body: {
+                success: true,
+                deduplicated: true,
+                durable: true,
+                event_id: eventId,
+            },
+        };
+    }
+    if (dbEvent.status === 'AWAITING_PAYMENT') {
+        return {
+            statusCode: 202,
+            body: {
+                success: true,
+                queued: true,
+                durable: true,
+                dispatch_scheduled: false,
+                awaiting_payment_confirmation: true,
+                event_id: eventId,
+            },
+        };
+    }
+    if (dbEvent.status !== 'PENDING') {
+        return {
+            statusCode: 200,
+            body: {
+                success: true,
+                deduplicated: true,
+                durable: true,
+                terminal_status: dbEvent.status,
+                event_id: eventId,
+            },
+        };
     }
 
-    return { statusCode: 202, body: { success: true, queued: true, event_id: eventId, duplicate_candidate: !isNew } };
+    let dispatchScheduled = true;
+    try {
+        await scheduleDurableDispatch(shopId, eventName);
+    } catch (error) {
+        // The PostgreSQL outbox is authoritative. The watchdog will dispatch
+        // this row when Redis/BullMQ recovers.
+        dispatchScheduled = false;
+        console.warn(`[Ingest] event ${dbEvent.id} persisted; immediate dispatch unavailable`);
+    }
+
+    return {
+        statusCode: 202,
+        body: {
+            success: true,
+            queued: true,
+            durable: true,
+            dispatch_scheduled: dispatchScheduled,
+            event_id: eventId,
+        },
+    };
 }
 
-async function queueForOutbox(req, res, payload, shopId) {
-    const result = await queueEventForOutbox(req, payload, shopId);
+async function queueForOutbox(req, res, payload, shopId, options = {}) {
+    const result = await queueEventForOutbox(req, payload, shopId, options);
     return res.status(result.statusCode).json(result.body);
 }
 
@@ -897,10 +1519,22 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
 
     const shopDomain = normalizeShopDomain(shopDomainFromPixelBody(req.body));
     if (!shopDomain) return res.status(400).json({ error: 'Missing shop_domain' });
+    const suppliedIngestToken = String(
+        req.headers['x-capi-ingest-token']
+        || req.body?.ingest_token
+        || req.body?.events?.[0]?.ingest_token
+        || '',
+    ).trim();
+    if (config.requireIngestToken && !timingSafeStringCompare(shopIngestToken(shopDomain), suppliedIngestToken)) {
+        return res.status(401).json({ error: 'Invalid shop ingest token' });
+    }
 
     const normalizedPayloads = payloads.map(payload => ({
         ...payload,
         shop_domain: normalizeShopDomain(payload.shop_domain) || shopDomain,
+        // Tenant metadata is server-authoritative. Client route hints are
+        // diagnostic only and can never change shop ownership or routing.
+        tenant_id: shopDomain,
     }));
     if (normalizedPayloads.some(payload => payload.shop_domain !== shopDomain)) {
         return res.status(400).json({ error: 'Batch events must belong to one shop_domain' });
@@ -913,23 +1547,51 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
     if (rows.length === 0) return res.status(401).json({ error: 'Shop inactive' });
 
     if (normalizedPayloads.length === 1) {
-        return queueForOutbox(req, res, { ...normalizedPayloads[0], shop_domain: shopDomain }, rows[0].id);
+        return queueForOutbox(
+            req,
+            res,
+            { ...normalizedPayloads[0], shop_domain: shopDomain, tenant_id: shopDomain },
+            rows[0].id,
+            { allowRequestIdentifiers: true, requirePaymentConfirmation: true },
+        );
     }
 
     const results = [];
     for (const payload of normalizedPayloads) {
-        const result = await queueEventForOutbox(req, { ...payload, shop_domain: shopDomain }, rows[0].id);
-        results.push(result.body);
+        try {
+            const result = await queueEventForOutbox(
+                req,
+                { ...payload, shop_domain: shopDomain, tenant_id: shopDomain },
+                rows[0].id,
+                { allowRequestIdentifiers: true, requirePaymentConfirmation: true },
+            );
+            results.push(result.body);
+        } catch (error) {
+            const statusCode = Number(error.statusCode || 500);
+            // Continue past malformed individual events so one bad payload
+            // cannot prevent later valid events in the batch from becoming
+            // durable. Infrastructure failures abort the request; the browser
+            // then retries the whole batch with stable IDs.
+            if (statusCode >= 500) throw error;
+            results.push({
+                success: false,
+                rejected: true,
+                status: statusCode,
+                error: error.message,
+            });
+        }
     }
 
     const queued = results.filter(result => result.queued).length;
     const deduplicated = results.filter(result => result.deduplicated).length;
+    const rejected = results.filter(result => result.rejected).length;
     return res.status(queued > 0 ? 202 : 200).json({
         success: true,
         batch: true,
         received: normalizedPayloads.length,
         queued,
         deduplicated,
+        rejected,
         results,
     });
 }));
@@ -938,6 +1600,8 @@ async function handleShopifyPurchaseWebhook(req, res) {
     const shopDomain = normalizeShopDomain(req.headers['x-shopify-shop-domain']);
     const hmacHeader = req.headers['x-shopify-hmac-sha256'];
     const webhookId = req.headers['x-shopify-webhook-id'];
+    const webhookTopic = String(req.headers['x-shopify-topic'] || '').trim().toLowerCase();
+    const triggeredAt = req.headers['x-shopify-triggered-at'];
     if (!shopDomain || !hmacHeader) return res.status(400).send('Missing Headers');
 
     const { rows } = await pool.query(
@@ -949,23 +1613,75 @@ async function handleShopifyPurchaseWebhook(req, res) {
     const appSecret = decryptTokenIfPossible(rows[0].app_secret);
     const generatedHash = crypto.createHmac('sha256', appSecret).update(req.rawBody).digest('base64');
     if (!timingSafeCompare(generatedHash, hmacHeader)) return res.status(401).send('HMAC Failed');
-
-    let deliveryKey;
-    if (webhookId) {
-        deliveryKey = `shopify:webhook:${shopDomain}:${webhookId}`;
-        const isNewDelivery = await redis.set(deliveryKey, '1', 'EX', 7 * 24 * 60 * 60, 'NX');
-        if (!isNewDelivery) return res.status(200).json({ success: true, duplicate_webhook: true });
+    if (webhookTopic !== 'orders/paid') {
+        return res.status(400).send('Unexpected webhook topic');
     }
 
     const order = req.body || {};
-    const payload = buildShopifyOrderPurchasePayload(order, shopDomain);
-
-    try {
-        return await queueForOutbox(req, res, payload, rows[0].id);
-    } catch (error) {
-        if (deliveryKey) await redis.del(deliveryKey).catch(() => {});
-        throw error;
+    const ignoreReason = paidOrderIgnoreReason(order, config.shopifyWebOrderSources);
+    if (ignoreReason) {
+        return res.status(200).json({ success: true, ignored: true, reason: ignoreReason });
     }
+    const financialStatus = String(order.financial_status || '').trim().toLowerCase();
+    if (financialStatus && financialStatus !== 'paid') {
+        return res.status(422).json({
+            success: false,
+            error: `orders/paid payload has unexpected financial_status: ${financialStatus}`,
+        });
+    }
+    const hasStableOrderIdentity = firstPresent(
+        order.checkout_token,
+        order.cart_token,
+        order.token,
+        normalizeShopifyId(order.id),
+        order.name,
+        order.order_number,
+    );
+    if (!hasStableOrderIdentity) {
+        return res.status(422).json({ success: false, error: 'Missing stable order identity' });
+    }
+    const payload = buildShopifyOrderPurchasePayload(order, shopDomain, {
+        eventTimestamp: Number.isFinite(Date.parse(String(triggeredAt || ''))) ? triggeredAt : undefined,
+    });
+    const purchaseValue = Number(payload.value);
+    if (!Number.isFinite(purchaseValue) || purchaseValue < 0 || !/^[A-Z]{3}$/.test(String(payload.currency || '').toUpperCase())) {
+        return res.status(422).json({ success: false, error: 'Invalid paid order value or currency' });
+    }
+
+    // This v2 receipt namespace is written only after the PostgreSQL outbox is
+    // durable. Therefore a cache hit can never represent an event that was
+    // acknowledged before persistence.
+    let deliveryKey;
+    if (webhookId) {
+        deliveryKey = `shopify:webhook:v2:${shopDomain}:${webhookId}`;
+        const existingReceipt = await optionalRedis(
+            () => redis.get(deliveryKey),
+            undefined,
+            'Shopify webhook delivery cache',
+        );
+        if (existingReceipt === '1') {
+            return res.status(200).json({ success: true, duplicate_webhook: true });
+        }
+    }
+
+    const result = await queueEventForOutbox(req, {
+        ...payload,
+        shop_domain: shopDomain,
+        tenant_id: shopDomain,
+    }, rows[0].id, {
+        allowRequestIdentifiers: false,
+        paymentConfirmed: true,
+    });
+    if (deliveryKey) {
+        // PostgreSQL is already committed, so this best-effort optimization
+        // must not delay Shopify's five-second acknowledgment deadline.
+        void optionalRedis(
+            () => redis.set(deliveryKey, '1', 'EX', 7 * 24 * 60 * 60),
+            undefined,
+            'Shopify webhook receipt save',
+        );
+    }
+    return res.status(result.statusCode).json(result.body);
 }
 
 app.post('/api/webhook/purchase', asyncHandler(handleShopifyPurchaseWebhook));
@@ -977,11 +1693,26 @@ app.get('/healthz', (req, res) => {
 
 app.get('/readyz', asyncHandler(async (req, res) => {
     await pool.query('SELECT 1');
-    await redis.ping();
-    res.json({ status: 'ready' });
+    let redisState = 'degraded';
+    if (redis.status === 'ready') {
+        try {
+            redisState = await withTimeout(redis.ping(), 1000, 'Redis readiness') === 'PONG'
+                ? 'ready'
+                : 'degraded';
+        } catch (error) {
+            redisState = 'degraded';
+        }
+    }
+    res.json({
+        status: redisState === 'ready' ? 'ready' : 'degraded',
+        postgres: 'ready',
+        redis: redisState,
+        durable_ingestion: true,
+    });
 }));
 
 cron.schedule(config.batchCron, async () => {
+    if (!config.legacyRedisDrainEnabled) return;
     try {
         const { rows: shops } = await pool.query("SELECT id FROM shops WHERE status = 'active'");
         for (const shop of shops) {
@@ -989,6 +1720,7 @@ cron.schedule(config.batchCron, async () => {
             const lockToken = crypto.randomUUID();
             const lock = await redis.set(lockKey, lockToken, 'EX', 55, 'NX');
             if (!lock) continue;
+            const stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, 55);
 
             const pendingKey = `pending:events:${shop.id}`;
             const processingKey = `processing:events:${shop.id}`;
@@ -1045,7 +1777,11 @@ cron.schedule(config.batchCron, async () => {
                     shopIds.push(shop.id);
                     eventNames.push(event.event_name);
                     eventIds.push(event.event_id);
-                    statuses.push('PENDING');
+                    statuses.push(
+                        event._requires_payment_confirmation && !event._payment_confirmed
+                            ? 'AWAITING_PAYMENT'
+                            : 'PENDING',
+                    );
                     emqs.push(event._emq_estimate);
                     payloads.push(JSON.stringify(purePayload));
                 });
@@ -1053,21 +1789,58 @@ cron.schedule(config.batchCron, async () => {
                 const outboxQuery = `
                     INSERT INTO event_store (shop_id, event_name, event_id, status, emq_estimate, request_payload)
                     SELECT * FROM UNNEST ($1::int[], $2::text[], $3::text[], $4::text[], $5::numeric[], $6::jsonb[])
-                    ON CONFLICT (shop_id, event_name, md5(event_id)) DO UPDATE SET
+                    ON CONFLICT (shop_id, event_name, event_id) DO UPDATE SET
+                        status = CASE
+                            WHEN event_store.status = 'AWAITING_PAYMENT'
+                             AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                            THEN 'PENDING'
+                            ELSE event_store.status
+                        END,
+                        timestamp = CASE
+                            WHEN event_store.status = 'AWAITING_PAYMENT'
+                             AND COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                            THEN NOW()
+                            ELSE event_store.timestamp
+                        END,
                         emq_estimate = GREATEST(event_store.emq_estimate, EXCLUDED.emq_estimate),
                         request_payload =
                             event_store.request_payload ||
                             EXCLUDED.request_payload ||
                             jsonb_build_object(
+                                'event_time',
+                                CASE
+                                    WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                                    THEN (EXCLUDED.request_payload->>'event_time')::bigint
+                                    WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
+                                    THEN (event_store.request_payload->>'event_time')::bigint
+                                    ELSE LEAST(
+                                        (event_store.request_payload->>'event_time')::bigint,
+                                        (EXCLUDED.request_payload->>'event_time')::bigint
+                                    )
+                                END,
                                 'user_data',
                                 COALESCE(event_store.request_payload->'user_data', '{}'::jsonb) ||
                                 COALESCE(EXCLUDED.request_payload->'user_data', '{}'::jsonb),
                                 'custom_data',
-                                COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
-                                COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb),
+                                CASE
+                                    WHEN COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
+                                    THEN COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
+                                         COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
+                                    WHEN COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean
+                                    THEN COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb) ||
+                                         COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb)
+                                    ELSE COALESCE(event_store.request_payload->'custom_data', '{}'::jsonb) ||
+                                         COALESCE(EXCLUDED.request_payload->'custom_data', '{}'::jsonb)
+                                END,
                                 '_platform_data',
                                 COALESCE(event_store.request_payload->'_platform_data', '{}'::jsonb) ||
-                                COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb)
+                                COALESCE(EXCLUDED.request_payload->'_platform_data', '{}'::jsonb),
+                                '_requires_payment_confirmation',
+                                COALESCE(event_store.request_payload->>'_requires_payment_confirmation', 'false')::boolean OR
+                                COALESCE(EXCLUDED.request_payload->>'_requires_payment_confirmation', 'false')::boolean,
+                                '_payment_confirmed',
+                                COALESCE(event_store.request_payload->>'_payment_confirmed', 'false')::boolean OR
+                                COALESCE(EXCLUDED.request_payload->>'_payment_confirmed', 'false')::boolean
                             )
                     WHERE event_store.status <> 'SUCCESS'
                     RETURNING id, request_payload, status, fb_response;
@@ -1077,15 +1850,19 @@ cron.schedule(config.batchCron, async () => {
                     [shopIds, eventNames, eventIds, statuses, emqs, payloads],
                 );
 
-                const eventsToSend = validDbEvents.filter(event => event.status !== 'SUCCESS');
+                const eventsToSend = validDbEvents.filter(event => event.status === 'PENDING');
                 if (eventsToSend.length > 0) {
-                    const jobId = buildQueueJobId(shop.id, eventsToSend);
-                    await capiQueue.add('send-fb-batch', { shopId: shop.id, dbEvents: eventsToSend }, { jobId });
+                    await capiQueue.add(
+                        'send-fb-batch',
+                        { shopId: shop.id },
+                        { jobId: `legacy-pack-${shop.id}-${Date.now()}` },
+                    );
                 }
 
                 await completeProcessingBatch(processingKey, pendingKey, deferredEvents);
                 await redis.del(heartbeatKey);
             } finally {
+                await stopLockHeartbeat().catch(() => {});
                 await releaseRedisLock(lockKey, lockToken);
             }
         }
@@ -1095,6 +1872,7 @@ cron.schedule(config.batchCron, async () => {
 });
 
 cron.schedule(config.watchdogCron, async () => {
+    if (!config.legacyRedisDrainEnabled) return;
     try {
         const { rows: shops } = await pool.query('SELECT id FROM shops');
         for (const shop of shops) {
@@ -1102,6 +1880,7 @@ cron.schedule(config.watchdogCron, async () => {
             const lockToken = crypto.randomUUID();
             const lock = await redis.set(lockKey, lockToken, 'EX', 50, 'NX');
             if (!lock) continue;
+            const stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, 50);
 
             const processingKey = `processing:events:${shop.id}`;
             const pendingKey = `pending:events:${shop.id}`;
@@ -1117,6 +1896,7 @@ cron.schedule(config.watchdogCron, async () => {
                     console.warn(`[Watchdog] restored ${restored} processing events for shop ${shop.id}`);
                 }
             } finally {
+                await stopLockHeartbeat().catch(() => {});
                 await releaseRedisLock(lockKey, lockToken);
             }
         }
@@ -1126,17 +1906,31 @@ cron.schedule(config.watchdogCron, async () => {
 });
 
 cron.schedule(config.watchdogCron, async () => {
+    try {
+        const reconciled = await reconcileEventAggregateStatuses();
+        if (reconciled > 0) {
+            console.warn(`[Watchdog] reconciled ${reconciled} event aggregate statuses from the delivery ledger`);
+        }
+    } catch (error) {
+        console.error('Event aggregate reconciliation error:', error);
+    }
+});
+
+cron.schedule(config.watchdogCron, async () => {
     const lockKey = 'lock:stale_pending_rescue';
     const lockToken = crypto.randomUUID();
+    let stopLockHeartbeat;
     try {
         const lock = await redis.set(lockKey, lockToken, 'EX', 50, 'NX');
         if (!lock) return;
+        stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, 50);
 
         const queued = await queueStalePendingEvents();
-        if (queued > 0) console.warn(`[Watchdog] re-queued ${queued} stale pending events`);
+        if (queued > 0) console.warn(`[Watchdog] scheduled fair backlog rescue for ${queued} shops`);
     } catch (error) {
         console.error('Stale pending rescue error:', error);
     } finally {
+        if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
         await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
 });
@@ -1144,9 +1938,11 @@ cron.schedule(config.watchdogCron, async () => {
 cron.schedule(config.metaQualityCron, async () => {
     const lockKey = 'lock:meta_quality_refresh';
     const lockToken = crypto.randomUUID();
+    let stopLockHeartbeat;
     try {
         const lock = await redis.set(lockKey, lockToken, 'EX', 300, 'NX');
         if (!lock) return;
+        stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, 300);
 
         const results = await refreshMetaQualitySnapshots();
         const failed = results.filter(result => result?.status === 'FAILED').length;
@@ -1156,6 +1952,26 @@ cron.schedule(config.metaQualityCron, async () => {
     } catch (error) {
         console.error('Meta quality refresh error:', error);
     } finally {
+        if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
+        await releaseRedisLock(lockKey, lockToken).catch(() => {});
+    }
+});
+
+cron.schedule(config.cleanupCron, async () => {
+    const lockKey = 'lock:operational_data_cleanup';
+    const lockToken = crypto.randomUUID();
+    let stopLockHeartbeat;
+    try {
+        const lock = await redis.set(lockKey, lockToken, 'EX', 55 * 60, 'NX');
+        if (!lock) return;
+        stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, 55 * 60);
+        const removed = await cleanupExpiredOperationalData();
+        const total = Object.values(removed).reduce((sum, value) => sum + Number(value || 0), 0);
+        if (total > 0) console.warn(`[Cleanup] removed ${total} expired rows`, removed);
+    } catch (error) {
+        console.error('Operational data cleanup error:', error);
+    } finally {
+        if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
         await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
 });
@@ -1168,6 +1984,17 @@ const authMw = basicAuth({
 app.use('/admin', adminLimiter, authMw);
 app.use('/api/admin', adminLimiter, authMw);
 
+app.get('/admin/assets/admin.css', (req, res) => {
+    res.set('Cache-Control', 'private, no-cache');
+    res.sendFile(path.join(__dirname, 'public', 'admin.css'));
+});
+
+app.get('/admin/assets/vue.global.prod.js', (req, res) => {
+    res.set('Cache-Control', 'private, no-cache');
+    res.type('application/javascript');
+    res.sendFile(path.join(__dirname, 'public', 'vue.global.prod.js'));
+});
+
 const serverAdapter = new ExpressAdapter();
 serverAdapter.setBasePath('/admin/queue');
 createBullBoard({ queues: [new BullMQAdapter(capiQueue)], serverAdapter });
@@ -1177,7 +2004,7 @@ app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ind
 
 app.get('/api/admin/shops', asyncHandler(async (req, res) => {
     const { rows } = await pool.query('SELECT id, shop_domain, status, created_at FROM shops ORDER BY id DESC');
-    res.json(rows);
+    res.json(rows.map(row => ({ ...row, ingest_token: shopIngestToken(row.shop_domain) })));
 }));
 
 app.post('/api/admin/shops', asyncHandler(async (req, res) => {
@@ -1206,6 +2033,12 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
         await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shopId]);
         const result = await client.query('DELETE FROM shops WHERE id = $1', [shopId]);
         rowCount = result.rowCount;
+        await client.query(
+            `DELETE FROM pixels p
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM shop_pixel_routes r WHERE r.pixel_id = p.id
+             )`,
+        );
         await client.query('COMMIT');
     } catch (error) {
         await client.query('ROLLBACK');
@@ -1231,10 +2064,28 @@ app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
 
 app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
-        SELECT p.id, p.shop_id, s.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code,
-               (p.quality_access_token IS NOT NULL AND p.quality_access_token <> '') AS has_quality_token
+        SELECT p.id, p.shop_id, owner.shop_domain, p.platform, p.name, p.pixel_id, p.test_event_code,
+               p.rate_limit_until, p.last_usage_pct, p.consecutive_failures, p.last_delivery_at,
+               (p.quality_access_token IS NOT NULL AND p.quality_access_token <> '') AS has_quality_token,
+               COALESCE(
+                   jsonb_agg(
+                       jsonb_build_object(
+                           'route_id', r.id,
+                           'shop_id', s.id,
+                           'shop_domain', s.shop_domain,
+                           'status', r.status
+                       )
+                       ORDER BY s.shop_domain
+                   ) FILTER (WHERE r.id IS NOT NULL),
+                   '[]'::jsonb
+               ) AS routes
         FROM pixels p
-        JOIN shops s ON p.shop_id = s.id
+        LEFT JOIN shops owner ON p.shop_id = owner.id
+        LEFT JOIN shop_pixel_routes r
+          ON r.pixel_id = p.id
+         AND r.status = 'active'
+        LEFT JOIN shops s ON s.id = r.shop_id
+        GROUP BY p.id, owner.shop_domain
         ORDER BY p.id DESC
     `);
     res.json(rows);
@@ -1242,6 +2093,10 @@ app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
 
 app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     const shopId = Number(req.body.shop_id);
+    const requestedShopIds = Array.isArray(req.body.shop_ids)
+        ? req.body.shop_ids.map(Number)
+        : [shopId];
+    const shopIds = [...new Set(requestedShopIds.filter(id => Number.isInteger(id) && id > 0))];
     const platform = String(req.body.platform || 'facebook').trim().toLowerCase();
     const pixelId = requireBoundedString(req.body.pixel_id, 'pixel_id', 64);
     const name = optionalBoundedString(req.body.name, 'name', 100) || `${platform}-${pixelId.slice(-6)}`;
@@ -1251,21 +2106,170 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
 
+    if (!shopIds.includes(shopId)) shopIds.unshift(shopId);
     const shopResult = await pool.query(
-        'SELECT id FROM shops WHERE id = $1 AND status = $2',
-        [shopId, 'active'],
+        'SELECT id FROM shops WHERE id = ANY($1::int[]) AND status = $2',
+        [shopIds, 'active'],
     );
-    if (shopResult.rowCount === 0) {
-        return res.status(400).json({ error: 'Shop not found or inactive. Save an active shop before adding a Pixel route.' });
+    if (shopResult.rowCount !== shopIds.length) {
+        return res.status(400).json({ error: 'One or more shops are missing or inactive.' });
     }
 
-    const { rows } = await pool.query(
-        `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token, quality_access_token, test_event_code)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id`,
-        [shopId, platform, name, pixelId, encryptToken(accessToken), qualityAccessToken ? encryptToken(qualityAccessToken) : null, testEventCode],
-    );
-    res.status(201).json({ success: true, id: rows[0].id });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${platform}:${pixelId}`]);
+        const existing = await client.query(
+            `SELECT id
+             FROM pixels
+             WHERE platform = $1 AND pixel_id = $2
+             ORDER BY id ASC
+             LIMIT 1
+             FOR UPDATE`,
+            [platform, pixelId],
+        );
+        let credentialId;
+        let reused = false;
+        if (existing.rowCount > 0) {
+            credentialId = existing.rows[0].id;
+            reused = true;
+            await client.query(
+                `UPDATE pixels
+                 SET shop_id = COALESCE(shop_id, $2),
+                     name = $3,
+                     access_token = $4,
+                     quality_access_token = COALESCE($5, quality_access_token),
+                     test_event_code = $6
+                 WHERE id = $1`,
+                [
+                    credentialId,
+                    shopId,
+                    name,
+                    encryptToken(accessToken),
+                    qualityAccessToken ? encryptToken(qualityAccessToken) : null,
+                    testEventCode,
+                ],
+            );
+        } else {
+            const inserted = await client.query(
+                `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token, quality_access_token, test_event_code)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 RETURNING id`,
+                [shopId, platform, name, pixelId, encryptToken(accessToken), qualityAccessToken ? encryptToken(qualityAccessToken) : null, testEventCode],
+            );
+            credentialId = inserted.rows[0].id;
+        }
+        await client.query(
+            `INSERT INTO shop_pixel_routes (shop_id, pixel_id)
+             SELECT shop_id, $2
+             FROM UNNEST($1::int[]) AS requested(shop_id)
+             ON CONFLICT (shop_id, pixel_id) DO UPDATE SET status = 'active'`,
+            [shopIds, credentialId],
+        );
+        await client.query('COMMIT');
+        await wakeShopOutboxes(shopIds);
+        res.status(reused ? 200 : 201).json({ success: true, id: credentialId, reused, shop_ids: shopIds });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
+}));
+
+app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
+    const pixelId = readPositiveId(req.params.id, 'pixel_id');
+    const shopIds = [...new Set((req.body.shop_ids || []).map(Number).filter(id => Number.isInteger(id) && id > 0))];
+    if (shopIds.length === 0) return res.status(400).json({ error: 'shop_ids must contain at least one shop' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const pixelResult = await client.query('SELECT id FROM pixels WHERE id = $1 FOR UPDATE', [pixelId]);
+        if (pixelResult.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Pixel not found' });
+        }
+        const shopsResult = await client.query(
+            "SELECT id FROM shops WHERE id = ANY($1::int[]) AND status = 'active'",
+            [shopIds],
+        );
+        if (shopsResult.rowCount !== shopIds.length) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'One or more shops are missing or inactive' });
+        }
+        // Preserve historical event_deliveries when a shop is unbound. Deleting
+        // the route would cascade-delete its audit ledger. Outstanding attempts
+        // become terminal first so an inactive route cannot leave an event
+        // permanently PENDING or be reclaimed by an in-flight stale worker.
+        const deactivatedDeliveries = await client.query(
+            `UPDATE event_deliveries delivery
+             SET status = 'FAILED_PERMANENT',
+                 lease_expires_at = NULL,
+                 error_code = 'ROUTE_INACTIVE',
+                 error_message = 'Route was disabled by an administrator before delivery completed',
+                 updated_at = NOW()
+             FROM shop_pixel_routes route
+             WHERE delivery.route_id = route.id
+               AND route.pixel_id = $1
+               AND NOT (route.shop_id = ANY($2::int[]))
+               AND delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+             RETURNING delivery.event_store_id`,
+            [pixelId, shopIds],
+        );
+        await client.query(
+            `UPDATE shop_pixel_routes
+             SET status = 'inactive'
+             WHERE pixel_id = $1
+               AND NOT (shop_id = ANY($2::int[]))
+               AND status <> 'inactive'`,
+            [pixelId, shopIds],
+        );
+        const affectedEventIds = [...new Set(
+            deactivatedDeliveries.rows.map(row => String(row.event_store_id)),
+        )];
+        if (affectedEventIds.length > 0) {
+            await client.query(
+                `WITH delivery_summary AS (
+                     SELECT event_store_id,
+                            COUNT(*) AS total,
+                            COUNT(*) FILTER (WHERE status = 'SUCCESS') AS succeeded,
+                            COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT') AS permanent_failed,
+                            COUNT(*) FILTER (
+                                WHERE status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                            ) AS outstanding
+                     FROM event_deliveries
+                     WHERE event_store_id = ANY($1::bigint[])
+                     GROUP BY event_store_id
+                 )
+                 UPDATE event_store event
+                 SET status = CASE
+                     WHEN summary.total > 0 AND summary.succeeded = summary.total THEN 'SUCCESS'
+                     WHEN summary.outstanding > 0 THEN 'PENDING'
+                     WHEN summary.succeeded > 0 AND summary.permanent_failed > 0 THEN 'PARTIAL_FAILED'
+                     WHEN summary.permanent_failed = summary.total THEN 'FAILED'
+                     ELSE event.status
+                 END
+                 FROM delivery_summary summary
+                 WHERE event.id = summary.event_store_id`,
+                [affectedEventIds],
+            );
+        }
+        await client.query(
+            `INSERT INTO shop_pixel_routes (shop_id, pixel_id)
+             SELECT shop_id, $2 FROM UNNEST($1::int[]) AS requested(shop_id)
+             ON CONFLICT (shop_id, pixel_id) DO UPDATE SET status = 'active'`,
+            [shopIds, pixelId],
+        );
+        await client.query('COMMIT');
+        await wakeShopOutboxes(shopIds);
+        res.json({ success: true, pixel_id: pixelId, shop_ids: shopIds });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
 }));
 
 app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
@@ -1281,9 +2285,30 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
     const shopFilter = shopId ? 'WHERE e.shop_id = $1' : '';
     const { rows } = await pool.query(`
         SELECT e.id, s.shop_domain, e.event_name, e.event_id, e.status, e.emq_estimate,
-               e.request_payload->'_quality' AS quality, e.fb_response, e.timestamp
+               e.request_payload->'_quality' AS quality, e.fb_response, e.timestamp,
+               COALESCE(d.deliveries, '[]'::jsonb) AS route_deliveries
         FROM event_store e
         JOIN shops s ON e.shop_id = s.id
+        LEFT JOIN LATERAL (
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'route_id', ed.route_id,
+                    'platform', p.platform,
+                    'pixel_id', p.pixel_id,
+                    'status', ed.status,
+                    'attempt_count', ed.attempt_count,
+                    'next_attempt_at', ed.next_attempt_at,
+                    'delivered_at', ed.delivered_at,
+                    'error_code', ed.error_code,
+                    'error_message', ed.error_message
+                )
+                ORDER BY ed.route_id
+            ) AS deliveries
+            FROM event_deliveries ed
+            JOIN shop_pixel_routes r ON r.id = ed.route_id
+            JOIN pixels p ON p.id = r.pixel_id
+            WHERE ed.event_store_id = e.id
+        ) d ON TRUE
         ${shopFilter}
         ORDER BY e.id DESC
         LIMIT 100
@@ -1325,7 +2350,6 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
     const params = shopId ? [shopId] : [];
     const eventShopFilter = shopId ? ' AND shop_id = $1' : '';
     const shopFilter = shopId ? ' AND id = $1' : '';
-    const pixelFilter = shopId ? 'WHERE shop_id = $1' : '';
     const dlqShopFilter = shopId ? ' AND shop_id = $1' : '';
     const [
         statusResult,
@@ -1335,6 +2359,8 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         dlqResult,
         shopsResult,
         pixelsResult,
+        integrityResult,
+        backlogResult,
         queueCounts,
     ] = await Promise.all([
         pool.query(`
@@ -1362,7 +2388,7 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
         `, params),
         pool.query(`
-            SELECT DISTINCT ON (m.pixel_route_id)
+            SELECT DISTINCT ON (m.pixel_route_id, m.shop_id)
                    m.pixel_route_id,
                    m.shop_id,
                    s.shop_domain,
@@ -1377,21 +2403,156 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             JOIN pixels p ON p.id = m.pixel_route_id
             JOIN shops s ON s.id = m.shop_id
             WHERE p.platform = 'facebook'${shopId ? ' AND m.shop_id = $1' : ''}
-            ORDER BY m.pixel_route_id, m.fetched_at DESC
+            ORDER BY m.pixel_route_id, m.shop_id, m.fetched_at DESC
         `, params),
         pool.query(`SELECT COUNT(*)::int AS count FROM dead_letters WHERE status = 'FAILED_PERMANENT'${dlqShopFilter}`, params),
         pool.query(`SELECT COUNT(*)::int AS count FROM shops WHERE status = 'active'${shopFilter}`, params),
-        pool.query(`SELECT platform, COUNT(*)::int AS count FROM pixels ${pixelFilter} GROUP BY platform`, params),
-        capiQueue.getJobCounts('waiting', 'active', 'delayed', 'failed', 'completed'),
+        pool.query(
+            `SELECT p.platform, COUNT(*)::int AS count
+             FROM shop_pixel_routes r
+             JOIN pixels p ON p.id = r.pixel_id
+             WHERE r.status = 'active'
+             ${shopId ? 'AND r.shop_id = $1' : ''}
+             GROUP BY p.platform`,
+            params,
+        ),
+        pool.query(`
+            WITH scoped_deliveries AS (
+                SELECT ed.*, e.shop_id AS event_shop_id, r.shop_id AS route_shop_id
+                FROM event_deliveries ed
+                JOIN event_store e ON e.id = ed.event_store_id
+                JOIN shop_pixel_routes r ON r.id = ed.route_id
+                WHERE ed.status IN ('IN_PROGRESS', 'RETRYABLE_FAILED')
+                  ${shopId ? 'AND e.shop_id = $1' : ''}
+            ),
+            scoped_pixels AS (
+                SELECT DISTINCT p.id, p.rate_limit_until, p.last_usage_pct, p.consecutive_failures
+                FROM pixels p
+                JOIN shop_pixel_routes r ON r.pixel_id = p.id
+                WHERE r.status = 'active'${shopId ? ' AND r.shop_id = $1' : ''}
+            ),
+            missing_ledger AS (
+                SELECT COUNT(*)::int AS count
+                FROM event_store e
+                WHERE e.timestamp < NOW() - INTERVAL '5 minutes'
+                  AND e.status = 'PENDING'
+                  ${shopId ? 'AND e.shop_id = $1' : ''}
+                  AND EXISTS (
+                      SELECT 1
+                      FROM shop_pixel_routes r
+                      WHERE r.shop_id = e.shop_id
+                        AND r.status = 'active'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM event_deliveries ed
+                            WHERE ed.event_store_id = e.id
+                              AND ed.route_id = r.id
+                        )
+                  )
+            ),
+            unrouted_pending AS (
+                SELECT COUNT(*)::int AS count
+                FROM event_store e
+                WHERE e.status = 'PENDING'
+                  ${shopId ? 'AND e.shop_id = $1' : ''}
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM shop_pixel_routes r
+                      WHERE r.shop_id = e.shop_id
+                        AND r.status = 'active'
+                  )
+            ),
+            aggregate_mismatch AS (
+                SELECT COUNT(*)::int AS count
+                FROM event_store e
+                WHERE e.status = 'PENDING'
+                  ${shopId ? 'AND e.shop_id = $1' : ''}
+                  AND EXISTS (
+                      SELECT 1
+                      FROM event_deliveries delivery
+                      WHERE delivery.event_store_id = e.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM event_deliveries outstanding
+                      WHERE outstanding.event_store_id = e.id
+                        AND outstanding.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM shop_pixel_routes route
+                      WHERE route.shop_id = e.shop_id
+                        AND route.status = 'active'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM event_deliveries missing
+                            WHERE missing.event_store_id = e.id
+                              AND missing.route_id = route.id
+                        )
+                  )
+            ),
+            awaiting_payment AS (
+                SELECT COUNT(*)::int AS count,
+                       COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(timestamp)))::bigint, 0) AS oldest_seconds
+                FROM event_store
+                WHERE status = 'AWAITING_PAYMENT'
+                  ${shopId ? 'AND shop_id = $1' : ''}
+            ),
+            pending_backlog AS (
+                SELECT COUNT(*)::int AS count,
+                       COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(timestamp)))::bigint, 0) AS oldest_seconds
+                FROM event_store
+                WHERE status = 'PENDING'
+                  ${shopId ? 'AND shop_id = $1' : ''}
+            )
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE d.status = 'IN_PROGRESS' AND d.lease_expires_at < NOW()
+                )::int AS stale_leases,
+                COUNT(*) FILTER (
+                    WHERE d.status = 'RETRYABLE_FAILED' AND d.next_attempt_at <= NOW()
+                )::int AS due_retries,
+                COALESCE(
+                    EXTRACT(EPOCH FROM (
+                        NOW() - MIN(d.next_attempt_at) FILTER (
+                            WHERE d.status = 'RETRYABLE_FAILED' AND d.next_attempt_at <= NOW()
+                        )
+                    ))::bigint,
+                    0
+                ) AS oldest_due_seconds,
+                COUNT(*) FILTER (WHERE d.event_shop_id <> d.route_shop_id)::int AS isolation_violations,
+                (SELECT count FROM missing_ledger)::int AS events_without_ledger,
+                (SELECT count FROM unrouted_pending)::int AS unrouted_pending,
+                (SELECT count FROM aggregate_mismatch)::int AS aggregate_mismatches,
+                (SELECT count FROM awaiting_payment)::int AS awaiting_payment,
+                (SELECT oldest_seconds FROM awaiting_payment)::bigint AS oldest_awaiting_payment_seconds,
+                (SELECT count FROM pending_backlog)::int AS pending_backlog,
+                (SELECT oldest_seconds FROM pending_backlog)::bigint AS oldest_pending_seconds,
+                (SELECT COUNT(*) FROM scoped_pixels WHERE rate_limit_until > NOW())::int AS active_cooldowns,
+                (SELECT MAX(last_usage_pct) FROM scoped_pixels) AS max_usage_pct,
+                (SELECT COALESCE(SUM(consecutive_failures), 0) FROM scoped_pixels)::int AS consecutive_failures
+            FROM scoped_deliveries d
+        `, params),
+        pool.query(`
+            SELECT e.shop_id,
+                   s.shop_domain,
+                   COUNT(*) FILTER (WHERE e.status = 'PENDING')::int AS pending,
+                   COUNT(*) FILTER (WHERE e.status = 'AWAITING_PAYMENT')::int AS awaiting_payment,
+                   COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(e.timestamp) FILTER (WHERE e.status = 'PENDING')))::bigint, 0) AS oldest_pending_seconds
+            FROM event_store e
+            JOIN shops s ON s.id = e.shop_id
+            WHERE e.status IN ('PENDING', 'AWAITING_PAYMENT')
+              ${shopId ? 'AND e.shop_id = $1' : ''}
+            GROUP BY e.shop_id, s.shop_domain
+            ORDER BY oldest_pending_seconds DESC, e.shop_id ASC
+            LIMIT 100
+        `, params),
+        optionalRedis(
+            () => capiQueue.getJobCounts('waiting', 'active', 'delayed', 'failed', 'completed'),
+            { waiting: 0, active: 0, delayed: 0, failed: 0, completed: 0 },
+            'BullMQ summary',
+        ),
     ]);
-
-    const { rows: shops } = await pool.query(`SELECT id FROM shops WHERE status = 'active'${shopFilter}`, params);
-    const pendingByShop = [];
-    for (const shop of shops) {
-        const pending = await redis.llen(`pending:events:${shop.id}`);
-        const processing = await redis.llen(`processing:events:${shop.id}`);
-        if (pending || processing) pendingByShop.push({ shop_id: shop.id, pending, processing });
-    }
 
     const signalLabels = [
         ['email', 'Email'],
@@ -1433,11 +2594,15 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             summary: row.summary_payload,
             error_message: row.error_message,
         })),
-        active_shops: shopsResult.rows[0]?.count || 0,
+        active_shops: Number(shopsResult.rows[0]?.count || 0),
         pixels_by_platform: pixelsResult.rows,
         dead_letters: dlqResult.rows[0]?.count || 0,
+        delivery_health: integrityResult.rows[0] || {},
         queue: queueCounts,
-        redis_pending: pendingByShop,
+        db_backlog_by_shop: backlogResult.rows,
+        // Kept for response compatibility. The legacy Redis-list transport is
+        // disabled by default; PostgreSQL backlog is authoritative.
+        redis_pending: [],
     });
 }));
 
@@ -1474,12 +2639,15 @@ app.get('/api/admin/dlq', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isInteger) : [];
-    const params = ids.length ? [ids] : [];
-    const query = ids.length
-        ? "SELECT id, shop_id, payload FROM dead_letters WHERE status = 'FAILED_PERMANENT' AND id = ANY($1::bigint[])"
-        : "SELECT id, shop_id, payload FROM dead_letters WHERE status = 'FAILED_PERMANENT'";
-    const { rows } = await pool.query(query, params);
+    const ids = Array.isArray(req.body?.ids)
+        ? [...new Set(req.body.ids.map(Number).filter(id => Number.isInteger(id) && id > 0))]
+        : [];
+    if (ids.length === 0) return res.status(400).json({ error: 'ids must contain at least one dead-letter ID' });
+    if (ids.length > 100) return res.status(413).json({ error: 'At most 100 dead letters can be replayed per request' });
+    const { rows } = await pool.query(
+        "SELECT id, shop_id, payload FROM dead_letters WHERE status = 'FAILED_PERMANENT' AND id = ANY($1::bigint[])",
+        [ids],
+    );
 
     let replayed = 0;
     let skipped = 0;
@@ -1501,8 +2669,8 @@ app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
         if (replayEvents.length > 0) {
             await capiQueue.add(
                 'send-fb-batch',
-                { shopId: row.shop_id, dbEvents: replayEvents },
-                { jobId: buildQueueJobId(row.shop_id, replayEvents) },
+                { shopId: row.shop_id },
+                { jobId: `replay-${row.shop_id}-${row.id}-${Date.now()}` },
             );
             await pool.query("UPDATE dead_letters SET status = 'REPLAYED' WHERE id = $1", [row.id]);
             replayed += 1;
@@ -1519,11 +2687,12 @@ app.post('/api/admin/dlq/replay', asyncHandler(async (req, res) => {
 }));
 
 app.use((err, req, res, next) => {
-    const statusCode = err.statusCode || 500;
+    const proposedStatus = Number(err.statusCode || err.status || 500);
+    const statusCode = proposedStatus >= 400 && proposedStatus <= 599 ? proposedStatus : 500;
     if (err.code === '42501') {
         console.error(err);
         return res.status(500).json({
-            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, event_store, dead_letters, and their sequences.',
+            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, shop_pixel_routes, event_store, event_deliveries, dead_letters, and their sequences.',
             code: err.code,
         });
     }
@@ -1534,16 +2703,32 @@ app.use((err, req, res, next) => {
 const server = app.listen(config.port, () => {
     console.log(`CAPI SaaS API listening on port ${config.port}`);
 });
+server.requestTimeout = config.httpRequestTimeoutMs;
+server.headersTimeout = config.httpHeadersTimeoutMs;
+server.keepAliveTimeout = config.httpKeepAliveTimeoutMs;
+server.maxRequestsPerSocket = 1000;
 
+let shuttingDown = false;
 async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`Received ${signal}, shutting down API server`);
+    const forceTimer = setTimeout(() => {
+        console.error('API shutdown deadline exceeded; closing remaining sockets');
+        server.closeAllConnections?.();
+        process.exit(1);
+    }, config.shutdownTimeoutMs);
+    forceTimer.unref?.();
+    server.closeIdleConnections?.();
     server.close(async () => {
         try {
             await capiQueue.close();
             await pool.end();
             await redis.quit();
+            clearTimeout(forceTimer);
             process.exit(0);
         } catch (error) {
+            clearTimeout(forceTimer);
             console.error('Shutdown error:', error);
             process.exit(1);
         }
