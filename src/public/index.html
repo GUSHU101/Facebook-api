@@ -118,7 +118,7 @@
                             <div class="surface-copy">重复提交同一域名会安全更新 Webhook 密钥并恢复店铺状态。</div>
                         </div>
                     </div>
-                    <div class="grid md:grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                    <div class="grid lg:grid-cols-[1fr_1fr_1fr_auto] gap-3 items-end">
                         <label class="block">
                             <span class="text-sm font-medium">Shopify 域名</span>
                             <input v-model.trim="newShop.shop_domain" placeholder="your-store.myshopify.com" class="mt-1 w-full border rounded-md p-2 font-mono">
@@ -127,20 +127,25 @@
                             <span class="text-sm font-medium">Webhook Secret</span>
                             <input v-model.trim="newShop.app_secret" type="password" autocomplete="new-password" placeholder="粘贴 Shopify Webhook 密钥" class="mt-1 w-full border rounded-md p-2 font-mono">
                         </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">Admin API Token（可选）</span>
+                            <input v-model.trim="newShop.admin_access_token" type="password" autocomplete="new-password" placeholder="用于 read_orders 支付对账" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
                         <button @click="addShop" :disabled="busy.addShop" class="primary-btn px-5 py-2">{{ busy.addShop ? '保存中…' : '保存店铺' }}</button>
                     </div>
                 </div>
                 <div class="table-shell"><div class="table-scroll">
                     <table class="data-table text-sm">
-                        <thead class="text-left"><tr><th>店铺域名</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+                        <thead class="text-left"><tr><th>店铺域名</th><th>状态</th><th>支付对账</th><th>创建时间</th><th>操作</th></tr></thead>
                         <tbody>
                             <tr v-for="s in shops" :key="s.id">
                                 <td class="font-mono font-semibold">{{ s.shop_domain }}</td>
                                 <td><span class="status-pill ready"><span class="live-dot"></span>{{ s.status }}</span></td>
+                                <td><span :class="['status-pill', s.has_admin_access_token ? 'ready' : 'pending']">{{ s.has_admin_access_token ? '已启用' : '仅 Webhook' }}</span></td>
                                 <td>{{ formatTime(s.created_at) }}</td>
                                 <td><button @click="deleteShop(s)" class="text-action text-red-600 font-medium">删除</button></td>
                             </tr>
-                            <tr v-if="!shops.length"><td colspan="4" class="table-empty">尚未添加店铺。请先配置 Shopify 域名和 Webhook 密钥。</td></tr>
+                            <tr v-if="!shops.length"><td colspan="5" class="table-empty">尚未添加店铺。请先配置 Shopify 域名和 Webhook 密钥。</td></tr>
                         </tbody>
                     </table>
                 </div></div>
@@ -198,12 +203,17 @@
                             <input v-model.trim="newPixel.test_event_code" placeholder="Meta Test Event Code" class="mt-1 w-full border rounded-md p-2 font-mono">
                             <span class="mt-1 block text-xs text-amber-700">仅用于短期联调；正式投放前必须清空。Meta 测试事件仍会进入测量流程。</span>
                         </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">平台限流组（可选）</span>
+                            <input v-model.trim="newPixel.rate_limit_group" placeholder="同一 Meta App / Business 使用相同值" class="mt-1 w-full border rounded-md p-2 font-mono">
+                            <span class="mt-1 block text-xs text-slate-500">不同 Token 若共享平台额度，可设置同一组名；留空时按 Token 自动隔离。</span>
+                        </label>
                         <button @click="addPixel" :disabled="busy.addPixel" class="primary-btn px-5 py-2 md:col-span-2">{{ busy.addPixel ? '保存中…' : '保存 Pixel 路由' }}</button>
                     </div>
                 </div>
                 <div class="table-shell"><div class="table-scroll">
                     <table class="data-table text-sm">
-                        <thead class="text-left"><tr><th>绑定店铺</th><th>平台</th><th>名称</th><th>Pixel / Dataset</th><th>限流状态</th><th>质量令牌</th><th>测试代码</th><th>操作</th></tr></thead>
+                        <thead class="text-left"><tr><th>绑定店铺</th><th>平台</th><th>名称</th><th>Pixel / Dataset</th><th>限流状态</th><th>限流组</th><th>质量令牌</th><th>测试代码</th><th>操作</th></tr></thead>
                         <tbody>
                         <tr v-for="p in pixels" :key="p.id">
                             <td class="font-mono">{{ (p.routes || []).map(route => route.shop_domain).join(', ') || p.shop_domain }}</td>
@@ -217,6 +227,7 @@
                                 </div>
                                 <div v-if="Number(p.consecutive_failures || 0) > 0" class="text-red-600">连续失败 {{ p.consecutive_failures }} 次</div>
                             </td>
+                            <td class="font-mono text-xs">{{ p.rate_limit_group || '按 Token' }}</td>
                             <td>{{ p.has_quality_token ? '已配置' : '—' }}</td>
                             <td class="font-mono">{{ p.test_event_code || '—' }}</td>
                             <td class="space-x-3 whitespace-nowrap">
@@ -224,7 +235,7 @@
                                 <button @click="deletePixel(p.id)" class="text-action text-red-600 font-medium">删除</button>
                             </td>
                         </tr>
-                        <tr v-if="!pixels.length"><td colspan="8" class="table-empty">尚未配置 Pixel 路由。请先添加店铺，再绑定 Meta 或 TikTok 凭据。</td></tr>
+                        <tr v-if="!pixels.length"><td colspan="9" class="table-empty">尚未配置 Pixel 路由。请先添加店铺，再绑定 Meta 或 TikTok 凭据。</td></tr>
                     </tbody>
                     </table>
                 </div></div>
@@ -316,6 +327,14 @@
                         <div class="border rounded-md p-3 bg-slate-50">
                             <div class="text-xs text-slate-500">最老付款等待</div>
                             <div class="text-xl font-semibold">{{ formatDuration(summary.delivery_health?.oldest_awaiting_payment_seconds) }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">Webhook 收件箱待处理</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.webhook_inbox_outstanding || 0) ? 'text-amber-700' : 'text-emerald-700'">{{ summary.delivery_health?.webhook_inbox_outstanding || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">Webhook 永久失败</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.webhook_inbox_permanent_failed || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.delivery_health?.webhook_inbox_permanent_failed || 0 }}</div>
                         </div>
                     </div>
                 </div>
@@ -443,8 +462,8 @@
                     deployShopId: '',
                     selectedShopId: '',
                     currentShop: 'your-store.myshopify.com',
-                    newShop: { shop_domain: '', app_secret: '' },
-                    newPixel: { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' },
+                    newShop: { shop_domain: '', app_secret: '', admin_access_token: '' },
+                    newPixel: { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '', rate_limit_group: '' },
                 };
             },
             computed: {
@@ -488,7 +507,7 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v10";
+const SOURCE_VERSION = "shopify-pixel-v11";
 const RECENT_EVENT_TTL_MS = 5000;
 const MAX_RECENT_EVENTS = 5000;
 const EVENT_QUEUE_FLUSH_MS = 1000;
@@ -957,7 +976,9 @@ function requestPayloadForEvents(events) {
 
 function serializedSize(value) {
     try {
-        return JSON.stringify(value).length;
+        var serialized = typeof value === 'string' ? value : JSON.stringify(value);
+        if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(serialized).byteLength;
+        return unescape(encodeURIComponent(serialized)).length;
     } catch (error) {
         return KEEPALIVE_LIMIT_BYTES + 1;
     }
@@ -1036,7 +1057,7 @@ function removeInFlightEvents(events) {
 function requestOptionsForBody(body) {
     var options = {
         method: 'POST',
-        keepalive: body.length < KEEPALIVE_LIMIT_BYTES,
+        keepalive: serializedSize(body) < KEEPALIVE_LIMIT_BYTES,
         headers: { 'Content-Type': 'application/json' },
         body: body,
     };
@@ -1388,22 +1409,7 @@ analytics.subscribe('search_submitted', function (event) {
     var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
     return sendGatewayEvent('Search', event, { search_string: query });
 });
-
-analytics.subscribe('alert_displayed', function (event) {
-    var alert = event.data && event.data.alert || {};
-    return sendGatewayEvent('ShopifyAlertDisplayed', event, {
-        content_name: alert.message || alert.type,
-        content_category: 'shopify_alert',
-    });
-});
-
-analytics.subscribe('ui_extension_errored', function (event) {
-    var error = event.data && event.data.error || {};
-    return sendGatewayEvent('ShopifyUiExtensionErrored', event, {
-        content_name: error.message || error.name,
-        content_category: 'shopify_ui_extension',
-    });
-});`;
+`;
                 },
             },
             methods: {
@@ -1497,7 +1503,7 @@ analytics.subscribe('ui_extension_errored', function (event) {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(this.newShop),
                         });
-                        this.newShop = { shop_domain: '', app_secret: '' };
+                        this.newShop = { shop_domain: '', app_secret: '', admin_access_token: '' };
                         await this.fetchShops();
                     }, '店铺已保存。');
                 },
@@ -1510,7 +1516,7 @@ analytics.subscribe('ui_extension_errored', function (event) {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ ...this.newPixel, shop_id: shopIds[0], shop_ids: shopIds }),
                         });
-                        this.newPixel = { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '' };
+                        this.newPixel = { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '', rate_limit_group: '' };
                         await Promise.all([this.fetchPixels(), this.fetchSummary()]);
                     }, 'Pixel 路由已保存。');
                 },

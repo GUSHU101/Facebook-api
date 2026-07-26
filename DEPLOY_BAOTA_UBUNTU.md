@@ -97,12 +97,17 @@ DATABASE_URL=postgres://capi_user:replace_with_a_strong_database_password@127.0.
 REDIS_URL=redis://127.0.0.1:6379
 
 AES_SECRET_KEY=replace_with_at_least_32_random_characters
+INGEST_TOKEN_SECRET=replace_with_a_different_32_character_random_secret
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=replace_with_a_strong_admin_password
 REQUIRE_INGEST_TOKEN=true
 
 # 只有这些 Shopify source_name 可生成网站 Purchase。
 SHOPIFY_WEB_ORDER_SOURCES=web
+SHOPIFY_API_VERSION=2026-07
+SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
+SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
+SHOPIFY_RECONCILE_MAX_ORDERS=1000
 
 # 建议填写实际店铺来源；多个来源用英文逗号分隔且不要带路径。
 CORS_ORIGIN=https://shop-a.example.com,https://shop-b.example.com
@@ -111,10 +116,11 @@ TRUST_PROXY_HOPS=1
 
 重要规则：
 
-- `AES_SECRET_KEY` 上线后必须永久保存。更换它会导致已保存的平台 Token 无法解密。
+- `AES_SECRET_KEY` 上线后必须永久保存。更换它会导致已保存的平台 Token 无法解密，`npm run doctor` 会直接报告失败而不是让密文被误当作令牌继续运行。
+- `INGEST_TOKEN_SECRET` 用于店铺采集 Token，应与 AES 密钥不同并永久备份；轮换时可把旧值暂存到 `INGEST_TOKEN_PREVIOUS_SECRET`，待所有 Shopify 像素更新后清空。
 - `SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值。只有确认某个 Headless/自定义销售渠道属于网站流量时，才加入对应 `source_name`。
 - 不建议把 `CORS_ORIGIN` 长期设为 `*`。
-- `PIXEL_RATE_LIMIT_PER_MINUTE=0` 表示不在应用层拒绝合法高峰流量；滥用防护应放在 CDN/WAF。
+- `PIXEL_RATE_LIMIT_PER_MINUTE=600` 是默认的店铺/IP 宽松保护；设为 `0` 前必须确认 CDN/WAF 已提供可靠的分布式限流。
 - 不要把 `.env` 上传到 GitHub、网盘或工单。
 
 ### 多实例容量
@@ -136,6 +142,7 @@ npm run doctor
 ```
 
 `migrate` 可重复运行：它不会清空店铺、像素、事件或投递历史；大型索引使用在线创建方式。`doctor` 会检查数据库结构、跨店路由一致性、事件汇总一致性、Redis 策略、连接权限和超时配置。
+它还会验证已保存凭据能否用当前 `AES_SECRET_KEY` 解密，并检查 Shopify 支付 webhook 收件箱；任何 `FAIL` 都必须在启动前处理。
 
 任何 `FAIL` 都应在启动前处理，不要跳过。
 
@@ -203,7 +210,7 @@ https://capi.example.com:8443/admin
 
 推荐顺序：
 
-1. 添加 Shopify 店铺，域名使用 `store.myshopify.com`，保存 webhook secret 和独立采集 Token。
+1. 添加 Shopify 店铺，域名使用 `store.myshopify.com`，保存 webhook secret；建议同时填写具备 `read_orders` 的 Admin API Token 以启用支付对账。店铺采集 Token 由系统独立生成。
 2. 添加 Meta Dataset/Pixel 或 TikTok Pixel 凭证。
 3. 在路由选择中把一个凭证关联到多个店铺，或把一个店铺关联到多个凭证。
 4. 复制该店铺生成的 Shopify Custom Pixel 代码到 `Settings → Customer events`。
@@ -239,7 +246,7 @@ https://capi.example.com:8443/admin
 
 ## 11. 安全升级、备份和回滚
 
-每次代码升级并通过健康检查后，都要进入管理后台重新复制当前生成的 Shopify Customer Events 代码到所有店铺。`shopify-pixel-v10` 的店铺级事件 ID 和离线队列修复位于店铺端，服务器更新不会自动替换 Shopify 中已粘贴的旧代码。
+每次代码升级并通过健康检查后，都要进入管理后台重新复制当前生成的 Shopify Customer Events 代码到所有店铺。`shopify-pixel-v11` 的店铺级事件 ID、离线队列和 UTF-8 字节容量修复位于店铺端，服务器更新不会自动替换 Shopify 中已粘贴的旧代码。
 
 升级前：
 
@@ -257,17 +264,16 @@ pm2 startOrReload ecosystem.config.js --update-env
 pm2 save
 ```
 
-不要覆盖已有 `.env`。备份目录默认为 `/www/wwwroot/capi-saas/backups`，其中的 `.env` 副本含解密密钥，权限必须保持 `600/700`，并应复制到受保护的异机存储。
+不要覆盖已有 `.env`。备份目录默认为 `/www/wwwroot/capi-saas/backups`，其中的 `.env` 副本含解密密钥，权限必须保持 `600/700`，并应复制到受保护的异机存储。默认保留 30 天，可通过 `BACKUP_RETENTION_DAYS` 调整；设为 `0` 表示不自动清理。
 
 数据库回滚：
 
 ```bash
 cd /www/wwwroot/capi-saas
 CONFIRM=RESTORE bash scripts/restore.sh backups/capi-db-YYYYMMDDTHHMMSSZ.dump
-npm run migrate
-npm run doctor
-pm2 startOrReload ecosystem.config.js --update-env
 ```
+
+恢复脚本会创建 `.maintenance`、停止可见的 PM2 API/Worker，并在单一数据库事务内恢复；迁移和自检通过后才重新加载进程。任何步骤失败时会保留维护态且不会启动可能不兼容的运行时；不要绕过该流程单独执行 `pg_restore --clean`。
 
 ## 12. 故障排查
 

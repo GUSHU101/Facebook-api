@@ -3,14 +3,16 @@ require('dotenv').config();
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const config = require('../src/config');
+const { credentialFingerprint, decryptTokenIfPossible } = require('../src/utils/crypto');
 
 const checks = [];
-const runtimeTables = ['shops', 'pixels', 'shop_pixel_routes', 'event_store', 'event_id_aliases', 'event_deliveries', 'dead_letters'];
+const runtimeTables = ['shops', 'pixels', 'shop_pixel_routes', 'event_store', 'shopify_webhook_inbox', 'shopify_reconcile_state', 'event_id_aliases', 'event_deliveries', 'dead_letters'];
 const runtimeSequences = [
     'shops_id_seq',
     'pixels_id_seq',
     'shop_pixel_routes_id_seq',
     'event_store_id_seq',
+    'shopify_webhook_inbox_id_seq',
     'event_id_aliases_id_seq',
     'event_deliveries_id_seq',
     'dead_letters_id_seq',
@@ -55,7 +57,10 @@ async function main() {
         if (!config.requireIngestToken) {
             throw new Error('REQUIRE_INGEST_TOKEN must remain enabled in production');
         }
-        return 'required variables present';
+        if (process.env.NODE_ENV === 'production' && !process.env.INGEST_TOKEN_SECRET) {
+            throw new Error('INGEST_TOKEN_SECRET must be set separately from AES_SECRET_KEY in production');
+        }
+        return 'required variables present and public token secret is separated in production';
     });
 
     await check('postgres connection', async () => {
@@ -67,14 +72,21 @@ async function main() {
         const requiredColumns = [
             ['shops', 'shop_domain'],
             ['shops', 'app_secret'],
+            ['shops', 'admin_access_token'],
             ['pixels', 'platform'],
             ['pixels', 'access_token'],
+            ['pixels', 'credential_scope'],
+            ['pixels', 'rate_limit_group'],
             ['pixels', 'rate_limit_until'],
             ['pixels', 'consecutive_failures'],
             ['shop_pixel_routes', 'shop_id'],
             ['shop_pixel_routes', 'pixel_id'],
             ['event_store', 'request_payload'],
             ['event_store', 'fb_response'],
+            ['shopify_webhook_inbox', 'webhook_id'],
+            ['shopify_webhook_inbox', 'status'],
+            ['shopify_reconcile_state', 'last_successful_at'],
+            ['shopify_reconcile_state', 'after_cursor'],
             ['event_id_aliases', 'canonical_event_id'],
             ['event_deliveries', 'route_id'],
             ['event_deliveries', 'status'],
@@ -104,6 +116,40 @@ async function main() {
             throw new Error('shops.app_secret should be TEXT; run npm run migrate');
         }
         return 'required columns present';
+    });
+
+    await check('encrypted credential key', async () => {
+        const sources = [
+            ['shop', 'shops', 'app_secret'],
+            ['shop_admin', 'shops', 'admin_access_token'],
+            ['pixel', 'pixels', 'access_token'],
+        ];
+        let checked = 0;
+        for (const [kind, table, field] of sources) {
+            let afterId = 0;
+            while (true) {
+                // Identifiers come only from the static allowlist above.
+                const { rows } = await pool.query(
+                    `SELECT id, ${field} AS encrypted_value
+                     FROM ${table}
+                     WHERE id > $1 AND ${field} IS NOT NULL AND ${field} <> ''
+                     ORDER BY id
+                     LIMIT 500`,
+                    [afterId],
+                );
+                for (const row of rows) {
+                    try {
+                        decryptTokenIfPossible(row.encrypted_value);
+                    } catch (error) {
+                        throw new Error(`${kind} credential ${row.id} cannot be decrypted with AES_SECRET_KEY`);
+                    }
+                    checked += 1;
+                    afterId = Number(row.id);
+                }
+                if (rows.length < 500) break;
+            }
+        }
+        return `${checked} stored credentials decrypt successfully`;
     });
 
     await check('tenant delivery isolation', async () => {
@@ -148,6 +194,41 @@ async function main() {
             throw new Error(`${result.unrouted_pending} pending events are safely retained but need an active Pixel route`);
         }
         return 'no inactive outstanding deliveries or unrouted pending events';
+    });
+
+    await check('Shopify webhook inbox', async () => {
+        const { rows: [result] } = await pool.query(
+            `SELECT
+                 COUNT(*) FILTER (WHERE status = 'FAILED_PERMANENT')::int AS permanent_failed,
+                 COUNT(*) FILTER (
+                     WHERE status = 'PROCESSING' AND lease_expires_at < NOW()
+                 )::int AS expired_leases,
+                 COUNT(*) FILTER (
+                     WHERE status IN ('PENDING', 'RETRYABLE_FAILED') AND next_attempt_at <= NOW()
+                 )::int AS due
+             FROM shopify_webhook_inbox`,
+        );
+        if (Number(result.permanent_failed) > 0) {
+            throw new Error(`${result.permanent_failed} paid-order webhooks failed permanently and require investigation`);
+        }
+        return `${result.due} paid-order webhooks due; ${result.expired_leases} expired leases are safely reclaimable`;
+    });
+
+    await check('Shopify paid-order reconciliation', async () => {
+        const { rows } = await pool.query(
+            `SELECT shop.shop_domain, state.last_error
+             FROM shops shop
+             JOIN shopify_reconcile_state state ON state.shop_id = shop.id
+             WHERE shop.admin_access_token IS NOT NULL
+               AND shop.admin_access_token <> ''
+               AND state.last_error IS NOT NULL
+             ORDER BY state.updated_at DESC
+             LIMIT 10`,
+        );
+        if (rows.length > 0) {
+            throw new Error(rows.map(row => `${row.shop_domain}: ${row.last_error}`).join(' | '));
+        }
+        return 'configured reconciliation jobs have no recorded GraphQL errors';
     });
 
     await check('event aggregate consistency', async () => {
@@ -221,7 +302,9 @@ async function main() {
             'idx_event_id_aliases_updated',
             'idx_dead_letters_failed_at',
             'idx_meta_quality_snapshots_retention',
+            'idx_shopify_webhook_inbox_due',
             'idx_pixels_platform_external_id',
+            'idx_pixels_credential_scope',
         ];
         const { rows } = await pool.query(
             `SELECT index_class.relname AS index_name,
@@ -243,6 +326,43 @@ async function main() {
             throw new Error('Pixel identity index must be UNIQUE on exactly (platform, pixel_id); rerun npm run migrate');
         }
         return `${valid.size} online scale indexes valid`;
+    });
+
+    await check('persistent credential throttle scopes', async () => {
+        const { rows: [result] } = await pool.query(
+            `SELECT COUNT(*)::int AS missing
+             FROM pixels
+             WHERE credential_scope IS NULL OR credential_scope = ''`,
+        );
+        if (Number(result.missing) > 0) {
+            throw new Error(`${result.missing} pixel credentials have no persisted throttle scope; rerun npm run migrate`);
+        }
+        let afterId = 0;
+        let checked = 0;
+        while (true) {
+            const { rows } = await pool.query(
+                `SELECT id, platform, access_token, rate_limit_group, credential_scope
+                 FROM pixels
+                 WHERE id > $1
+                 ORDER BY id
+                 LIMIT 500`,
+                [afterId],
+            );
+            for (const row of rows) {
+                const expected = credentialFingerprint(
+                    row.platform,
+                    decryptTokenIfPossible(row.access_token),
+                    row.rate_limit_group,
+                );
+                if (row.credential_scope !== expected) {
+                    throw new Error(`Pixel ${row.id} throttle scope disagrees with its platform/token/group; update the credential or rerun migration`);
+                }
+                checked += 1;
+                afterId = Number(row.id);
+            }
+            if (rows.length < 500) break;
+        }
+        return `${checked} platform credentials retain a restart-safe throttle scope`;
     });
 
     await check('postgres autovacuum', async () => {

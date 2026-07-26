@@ -73,6 +73,7 @@ Cloudflare Token 应只拥有目标 Zone 所需的 DNS 编辑权限。不要把 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
 | `APP_DIR` | `/www/wwwroot/capi-saas` | 必须是安全的绝对目录 |
+| `APP_USER` | `capi-saas` | API、Worker、Git 与备份使用的非 root 系统用户 |
 | `REPO_URL` | 无 | 必填 Git 仓库地址 |
 | `BRANCH` | `main` | 部署分支 |
 | `INTERNAL_PORT` | `3000` | Node 内部端口 |
@@ -83,6 +84,7 @@ Cloudflare Token 应只拥有目标 Zone 所需的 DNS 编辑权限。不要把 
 | `ADMIN_USERNAME` | `admin` | 后台账号 |
 | `ADMIN_PASSWORD` | 自动生成 | 后台强密码；自定义值不能含空白、`#` 或引号 |
 | `AES_SECRET_KEY` | 自动生成 | 至少 32 字符且不能含空白、`#` 或引号，永久保留 |
+| `INGEST_TOKEN_SECRET` | 自动生成 | 独立的店铺采集 Token 密钥，永久保留 |
 | `CORS_ORIGIN` | `*` | 建议改成逗号分隔的店铺 HTTPS Origin |
 | `SHOPIFY_WEB_ORDER_SOURCES` | `web` | 可生成网站 Purchase 的 Shopify 来源白名单 |
 | `DB_POOL_MAX` | `20` | 每个 API/Worker 进程的连接池上限 |
@@ -132,7 +134,7 @@ sudo env \
 
 ## 6. 重复执行和升级安全
 
-升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v10` 代码重新复制到每个 Shopify 店铺。服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。
+升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v11` 代码重新复制到每个 Shopify 店铺。服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。
 
 安装器可以重复运行。只要 `${APP_DIR}/.env` 已存在且 `FORCE_ENV_REWRITE` 不是 `1`，脚本会：
 
@@ -155,7 +157,7 @@ sudo env \
   bash /tmp/capi-install.sh
 ```
 
-不要在普通升级中使用 `FORCE_ENV_REWRITE=1`。如果确实要重建 `.env`，必须同时显式提供原有或计划使用的 `DB_PASSWORD`、`ADMIN_PASSWORD`、`AES_SECRET_KEY`；错误的 AES 密钥会让历史平台 Token 永久无法解密。
+不要在普通升级中使用 `FORCE_ENV_REWRITE=1`。如果确实要重建 `.env`，必须同时显式提供原有或计划使用的 `DB_PASSWORD`、`ADMIN_PASSWORD`、`AES_SECRET_KEY`、`INGEST_TOKEN_SECRET`；错误的 AES 密钥会让历史平台 Token 无法解密，错误的采集密钥会让尚未更新的 Shopify 像素返回 401。
 
 ## 7. 安装后配置
 
@@ -167,7 +169,7 @@ https://capi.example.com:8443/admin
 
 然后：
 
-1. 添加 Shopify 店铺及其 webhook secret。
+1. 添加 Shopify 店铺及其 webhook secret；建议同时填写具备 `read_orders` 的 Admin API Token，启用已付款订单对账。
 2. 为店铺添加一个或多个 Meta/TikTok 像素路由。
 3. 同一个平台凭证可关联多个店铺；一个店铺也可关联多个凭证。
 4. 复制生成的 Shopify Custom Pixel 代码。
@@ -184,11 +186,11 @@ https://capi.example.com:8443/admin
 ## 8. 上线验收
 
 ```bash
-pm2 status
+sudo -u capi-saas env HOME=/var/lib/capi-saas pm2 status
 curl -fsS http://127.0.0.1:3000/healthz
 curl -fsS http://127.0.0.1:3000/readyz
 curl -I https://capi.example.com:8443/admin
-cd /www/wwwroot/capi-saas && npm run doctor
+sudo -u capi-saas env HOME=/var/lib/capi-saas npm --prefix /www/wwwroot/capi-saas run doctor
 ```
 
 平台侧逐店验证 PageView、ViewContent、AddToCart、InitiateCheckout、AddPaymentInfo 和付款后的唯一 Purchase。一个像素故障时，其他已成功路由不应重发。
@@ -198,35 +200,33 @@ cd /www/wwwroot/capi-saas && npm run doctor
 备份：
 
 ```bash
-cd /www/wwwroot/capi-saas
-npm run backup
+sudo -u capi-saas env HOME=/var/lib/capi-saas npm --prefix /www/wwwroot/capi-saas run backup
 ```
 
-默认保存到 `/www/wwwroot/capi-saas/backups`。数据库 dump 与 `.env` 副本权限应保持严格，并复制到加密异机存储。
+默认保存到 `/www/wwwroot/capi-saas/backups`。数据库 dump 与 `.env` 副本权限应保持严格，并复制到加密异机存储。默认保留 30 天（`BACKUP_RETENTION_DAYS=30`），只自动删除该目录中符合项目备份命名规则的过期文件。
 
 恢复：
 
 ```bash
 cd /www/wwwroot/capi-saas
-CONFIRM=RESTORE bash scripts/restore.sh backups/capi-db-YYYYMMDDTHHMMSSZ.dump
-npm run migrate
-npm run doctor
-pm2 startOrReload ecosystem.config.js --update-env
+sudo CONFIRM=RESTORE bash scripts/restore.sh backups/capi-db-YYYYMMDDTHHMMSSZ.dump
 ```
+
+恢复脚本会进入维护态并停止 API/Worker，在单一数据库事务内恢复，然后执行迁移、凭据解密检查和运行时诊断；全部通过才重新加载 PM2。失败时维护态与停机状态会保留，避免未验证的数据被继续写入。
 
 代码回滚时先切换到已验证提交，再执行 `npm ci --omit=dev`、`migrate`、`doctor` 和 PM2 reload。不要在没有数据库备份时回退跨版本数据库结构。
 
 ## 10. 故障排查
 
 ```bash
-pm2 logs capi-api --lines 200 --nostream
-pm2 logs capi-worker --lines 200 --nostream
+sudo -u capi-saas env HOME=/var/lib/capi-saas pm2 logs capi-api --lines 200 --nostream
+sudo -u capi-saas env HOME=/var/lib/capi-saas pm2 logs capi-worker --lines 200 --nostream
 nginx -t
 journalctl -u nginx -n 100 --no-pager
 journalctl -u postgresql -n 100 --no-pager
 journalctl -u redis-server -n 100 --no-pager
 redis-cli INFO memory
-cd /www/wwwroot/capi-saas && npm run doctor
+sudo -u capi-saas env HOME=/var/lib/capi-saas npm --prefix /www/wwwroot/capi-saas run doctor
 ```
 
 - 后台无法访问：检查域名、证书、安全组、自定义 HTTPS 端口和 Nginx 错误日志。

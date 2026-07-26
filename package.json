@@ -16,7 +16,7 @@
     "doctor": "node scripts/doctor.js",
     "backup": "bash scripts/backup.sh",
     "test": "node --test",
-    "check": "node --check ecosystem.config.js && node --check src/config.js && node --check src/server.js && node --check src/worker.js && node --check src/events/attribution.js && node --check src/events/common.js && node --check src/events/merge.js && node --check src/events/shopify.js && node --check src/platforms/delivery.js && node --check src/platforms/delivery-state.js && node --check src/platforms/meta.js && node --check src/platforms/rate-control.js && node --check src/platforms/tiktok.js && node --check src/utils/crypto.js && node --check src/utils/db.js && node --check src/utils/redis.js && node --check src/utils/emq.js && node --check scripts/build-admin-assets.js && node --check scripts/migrate.js && node --check scripts/doctor.js && node --check test/events.test.js"
+    "check": "node --check ecosystem.config.js && node --check src/config.js && node --check src/server.js && node --check src/worker.js && node --check src/events/attribution.js && node --check src/events/common.js && node --check src/events/merge.js && node --check src/events/shopify.js && node --check src/platforms/delivery.js && node --check src/platforms/delivery-state.js && node --check src/platforms/meta.js && node --check src/platforms/rate-control.js && node --check src/platforms/tiktok.js && node --check src/utils/crypto.js && node --check src/utils/db.js && node --check src/utils/json.js && node --check src/utils/redis.js && node --check src/utils/emq.js && node --check scripts/build-admin-assets.js && node --check scripts/migrate.js && node --check scripts/doctor.js && node --check test/events.test.js"
   },
   "dependencies": {
     "@bull-board/api": "^8.3.0",
@@ -30,6 +30,7 @@
     "express-rate-limit": "^7.3.1",
     "helmet": "^7.1.0",
     "ioredis": "^5.4.1",
+    "json-bigint": "1.0.0",
     "node-cron": "^4.6.0",
     "pg": "^8.11.5"
   },

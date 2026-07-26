@@ -4,6 +4,10 @@ set -Eeuo pipefail
 APP_DIR="${APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 BACKUP_DIR="${BACKUP_DIR:-${APP_DIR}/backups}"
 INCLUDE_ENV="${INCLUDE_ENV:-1}"
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
+
+# shellcheck source=./dotenv.sh
+. "${APP_DIR}/scripts/dotenv.sh"
 
 log() {
   printf '\033[1;36m[backup]\033[0m %s\n' "$*"
@@ -15,13 +19,17 @@ fail() {
 }
 
 load_env() {
-  if [ -f "${APP_DIR}/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . "${APP_DIR}/.env"
-    set +a
-  fi
+  load_dotenv_file "${APP_DIR}/.env"
   [ -n "${DATABASE_URL:-}" ] || fail "DATABASE_URL is missing. Set it or create ${APP_DIR}/.env"
+}
+
+prune_old_backups() {
+  [[ "$BACKUP_RETENTION_DAYS" =~ ^[0-9]+$ ]] || fail "BACKUP_RETENTION_DAYS must be a non-negative integer"
+  [ "$BACKUP_RETENTION_DAYS" -gt 0 ] || return 0
+  [ -n "$BACKUP_DIR" ] && [ "$BACKUP_DIR" != "/" ] || fail "Refusing unsafe BACKUP_DIR: ${BACKUP_DIR}"
+  find "$BACKUP_DIR" -maxdepth 1 -type f \
+    \( -name 'capi-db-*.dump' -o -name 'capi-env-*.env' \) \
+    -mtime "+$BACKUP_RETENTION_DAYS" -delete
 }
 
 main() {
@@ -45,6 +53,8 @@ main() {
     cp "${APP_DIR}/.env" "$env_file"
     chmod 600 "$env_file"
   fi
+
+  prune_old_backups
 
   log "Backup complete"
 }

@@ -28,13 +28,31 @@ function decryptToken(text) {
     ]).toString('utf8');
 }
 
+function looksLikeEncryptedToken(text) {
+    return /^[a-f0-9]{32}:[a-f0-9]{32}:(?:[a-f0-9]{2})+$/i.test(String(text || ''));
+}
+
 function decryptTokenIfPossible(text) {
     if (!text) return text;
+    if (!looksLikeEncryptedToken(text)) return text;
     try {
         return decryptToken(text);
     } catch (error) {
-        return text;
+        const wrapped = new Error('Encrypted credential could not be decrypted; verify AES_SECRET_KEY');
+        wrapped.code = 'CREDENTIAL_DECRYPTION_FAILED';
+        wrapped.cause = error;
+        throw wrapped;
     }
+}
+
+function credentialFingerprint(platform, token, rateLimitGroup) {
+    const normalizedPlatform = String(platform || '').trim().toLowerCase();
+    const normalizedToken = String(token || '').trim();
+    const normalizedGroup = String(rateLimitGroup || '').trim().toLowerCase();
+    if (!normalizedPlatform || !normalizedToken) return null;
+    return crypto.createHash('sha256')
+        .update(`${normalizedPlatform}\0${normalizedGroup ? `group:${normalizedGroup}` : `token:${normalizedToken}`}`, 'utf8')
+        .digest('hex');
 }
 
 function timingSafeCompare(generatedHash, hmacHeader) {
@@ -169,6 +187,8 @@ module.exports = {
     encryptToken,
     decryptToken,
     decryptTokenIfPossible,
+    looksLikeEncryptedToken,
+    credentialFingerprint,
     timingSafeCompare,
     timingSafeStringCompare,
     hashUserData,

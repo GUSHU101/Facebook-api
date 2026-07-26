@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS shops (
     id SERIAL PRIMARY KEY,
     shop_domain VARCHAR(255) UNIQUE NOT NULL,
     app_secret TEXT NOT NULL,
+    admin_access_token TEXT,
     status VARCHAR(20) DEFAULT 'active',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -19,6 +20,8 @@ CREATE TABLE IF NOT EXISTS pixels (
     name VARCHAR(100) NOT NULL,
     pixel_id VARCHAR(64) NOT NULL,
     access_token TEXT NOT NULL,
+    credential_scope VARCHAR(64),
+    rate_limit_group VARCHAR(100),
     quality_access_token TEXT,
     test_event_code VARCHAR(100),
     rate_limit_until TIMESTAMPTZ,
@@ -51,6 +54,42 @@ CREATE TABLE IF NOT EXISTS event_store (
     request_payload JSONB NOT NULL,
     fb_response JSONB
 );
+
+-- Shopify must receive a prompt response. The verified request is committed
+-- here first; validation, deduplication and event creation are retryable work.
+CREATE TABLE IF NOT EXISTS shopify_webhook_inbox (
+    id BIGSERIAL PRIMARY KEY,
+    shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+    webhook_id VARCHAR(255) NOT NULL,
+    topic VARCHAR(100) NOT NULL,
+    triggered_at TIMESTAMPTZ,
+    payload JSONB NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    lease_expires_at TIMESTAMPTZ,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMPTZ,
+    UNIQUE (shop_id, webhook_id)
+);
+
+CREATE TABLE IF NOT EXISTS shopify_reconcile_state (
+    shop_id INTEGER PRIMARY KEY REFERENCES shops(id) ON DELETE CASCADE,
+    last_successful_at TIMESTAMPTZ,
+    scan_since TIMESTAMPTZ,
+    scan_cutoff TIMESTAMPTZ,
+    after_cursor TEXT,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE shopify_reconcile_state
+    ADD COLUMN IF NOT EXISTS scan_since TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS scan_cutoff TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS after_cursor TEXT,
+    ADD COLUMN IF NOT EXISTS last_error TEXT,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
 
 -- Durable aliases converge Shopify checkout/order/cart identifiers on one
 -- canonical event_id even after Redis restarts or cache eviction.
@@ -156,6 +195,7 @@ CREATE TABLE IF NOT EXISTS meta_quality_snapshots (
 
 ALTER TABLE shops
     ADD COLUMN IF NOT EXISTS app_secret TEXT,
+    ADD COLUMN IF NOT EXISTS admin_access_token TEXT,
     ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active',
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
@@ -166,6 +206,8 @@ ALTER TABLE shops
 ALTER TABLE pixels
     ADD COLUMN IF NOT EXISTS platform VARCHAR(50) DEFAULT 'facebook',
     ADD COLUMN IF NOT EXISTS quality_access_token TEXT,
+    ADD COLUMN IF NOT EXISTS credential_scope VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS rate_limit_group VARCHAR(100),
     ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100),
     ADD COLUMN IF NOT EXISTS rate_limit_until TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_rate_limit_at TIMESTAMPTZ,
@@ -240,6 +282,13 @@ ALTER TABLE event_store SET (
     autovacuum_analyze_scale_factor = 0.01,
     autovacuum_vacuum_threshold = 1000,
     autovacuum_analyze_threshold = 1000
+);
+
+ALTER TABLE shopify_webhook_inbox SET (
+    autovacuum_vacuum_scale_factor = 0.02,
+    autovacuum_analyze_scale_factor = 0.01,
+    autovacuum_vacuum_threshold = 500,
+    autovacuum_analyze_threshold = 500
 );
 
 ALTER TABLE event_deliveries SET (
