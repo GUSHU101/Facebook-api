@@ -85,8 +85,9 @@ Cloudflare Token 应只拥有目标 Zone 所需的 DNS 编辑权限。不要把 
 | `ADMIN_PASSWORD` | 自动生成 | 后台强密码；自定义值不能含空白、`#` 或引号 |
 | `AES_SECRET_KEY` | 自动生成 | 至少 32 字符且不能含空白、`#` 或引号，永久保留 |
 | `INGEST_TOKEN_SECRET` | 自动生成 | 独立的店铺采集 Token 密钥，永久保留 |
-| `CORS_ORIGIN` | `*` | 建议改成逗号分隔的店铺 HTTPS Origin |
+| `CORS_ORIGIN` | `*` | 建议保持 `*` 以兼容 Shopify 客户事件沙箱；仅采集接口启用 CORS且不使用 Cookie 凭据 |
 | `SHOPIFY_WEB_ORDER_SOURCES` | `web` | 可生成网站 Purchase 的 Shopify 来源白名单 |
+| `SHOPIFY_APP_SECRET` | 空 | 同一个自建应用跨多个店铺时可选的共享 Client Secret；每店独立应用时留空 |
 | `DB_POOL_MAX` | `20` | 每个 API/Worker 进程的连接池上限 |
 | `API_INSTANCES` | `1` | API 进程数 |
 | `WORKER_INSTANCES` | `1` | Worker 进程数 |
@@ -104,7 +105,7 @@ sudo env \
   REPO_URL=https://github.com/GUSHU101/Facebook-api.git \
   DOMAIN=capi.example.com \
   PUBLIC_PORT=8443 \
-  CORS_ORIGIN=https://shop-a.example.com,https://shop-b.example.com \
+  CORS_ORIGIN='*' \
   SHOPIFY_WEB_ORDER_SOURCES=web \
   DB_POOL_MAX=20 \
   API_INSTANCES=2 \
@@ -169,10 +170,10 @@ https://capi.example.com:8443/admin
 
 然后：
 
-1. 添加 Shopify 店铺及其 webhook secret；建议同时填写具备 `read_orders` 的 Admin API Token，启用已付款订单对账。
+1. 在每个 Shopify 店铺创建并安装自建未上架应用，至少授予 `read_orders`；把 Client Secret 和 Admin API access token 填入本项目店铺配置。
 2. 为店铺添加一个或多个 Meta/TikTok 像素路由。
 3. 同一个平台凭证可关联多个店铺；一个店铺也可关联多个凭证。
-4. 复制生成的 Shopify Custom Pixel 代码。
+4. 将生成的 Shopify Custom Pixel 代码粘贴到 `Settings → Customer events`；浏览器事件由这里采集，不依赖主题脚本或 OAuth 安装页。
 5. 为每个店铺配置必需的付款 webhook：
 
 ```text
@@ -182,6 +183,16 @@ https://capi.example.com:8443/admin
 ```
 
 浏览器 Purchase 在付款 webhook 验证前只处于 `AWAITING_PAYMENT`，不会提前发送。重复 webhook 使用稳定身份合并，不会重复创建 Purchase。
+
+同一个自建应用跨多个店铺时，可以在首次安装命令中传入 `SHOPIFY_APP_SECRET=...`；每店独立创建应用时不要设置，后台逐店保存各自 Secret。若配置 Shopify 隐私 Webhook，可使用以下地址：
+
+```text
+https://capi.example.com:8443/api/webhook/customers/data_request
+https://capi.example.com:8443/api/webhook/customers/redact
+https://capi.example.com:8443/api/webhook/shop/redact
+```
+
+数据访问请求会出现在后台“Shopify 隐私请求”，下载并安全交付报告后确认完成即可清除暂存数据；删除类请求自动处理。
 
 ## 8. 上线验收
 
@@ -194,6 +205,8 @@ sudo -u capi-saas env HOME=/var/lib/capi-saas npm --prefix /www/wwwroot/capi-saa
 ```
 
 平台侧逐店验证 PageView、ViewContent、AddToCart、InitiateCheckout、AddPaymentInfo 和付款后的唯一 Purchase。一个像素故障时，其他已成功路由不应重发。
+
+后台会显示数据库总量、事件账本和 Webhook 收件箱占用。生产环境还应为 PostgreSQL 数据目录配置磁盘告警；等待投递的 `PENDING` 不会被系统为腾空间而静默删除。
 
 ## 9. 手动备份、恢复和回滚
 

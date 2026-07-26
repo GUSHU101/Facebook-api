@@ -104,13 +104,15 @@ REQUIRE_INGEST_TOKEN=true
 
 # 只有这些 Shopify source_name 可生成网站 Purchase。
 SHOPIFY_WEB_ORDER_SOURCES=web
+# 同一个自建应用跨店共用时可填；每店独立应用时留空。
+SHOPIFY_APP_SECRET=
 SHOPIFY_API_VERSION=2026-07
 SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
 SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
 SHOPIFY_RECONCILE_MAX_ORDERS=1000
 
-# 建议填写实际店铺来源；多个来源用英文逗号分隔且不要带路径。
-CORS_ORIGIN=https://shop-a.example.com,https://shop-b.example.com
+# Shopify Customer Events 运行在沙箱中，建议采集接口保持 *；管理接口不启用 CORS。
+CORS_ORIGIN=*
 TRUST_PROXY_HOPS=1
 ```
 
@@ -119,8 +121,8 @@ TRUST_PROXY_HOPS=1
 - `AES_SECRET_KEY` 上线后必须永久保存。更换它会导致已保存的平台 Token 无法解密，`npm run doctor` 会直接报告失败而不是让密文被误当作令牌继续运行。
 - `INGEST_TOKEN_SECRET` 用于店铺采集 Token，应与 AES 密钥不同并永久备份；轮换时可把旧值暂存到 `INGEST_TOKEN_PREVIOUS_SECRET`，待所有 Shopify 像素更新后清空。
 - `SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值。只有确认某个 Headless/自定义销售渠道属于网站流量时，才加入对应 `source_name`。
-- 不建议把 `CORS_ORIGIN` 长期设为 `*`。
-- `PIXEL_RATE_LIMIT_PER_MINUTE=600` 是默认的店铺/IP 宽松保护；设为 `0` 前必须确认 CDN/WAF 已提供可靠的分布式限流。
+- Shopify 客户事件沙箱的请求 Origin 不应假定为店铺域名。`/api/pixel-event` 不使用 Cookie 身份，建议保持 `CORS_ORIGIN=*`；管理 API 没有启用 CORS，采集安全由店铺 Token、租户校验、限流和服务端路由承担。
+- `PIXEL_RATE_LIMIT_PER_MINUTE=600` 是默认的店铺/IP 宽松保护，多 API 实例通过 Redis 共用计数；Redis 故障时自动退回单进程保护。设为 `0` 前必须确认 CDN/WAF 已提供可靠限流。
 - 不要把 `.env` 上传到 GitHub、网盘或工单。
 
 ### 多实例容量
@@ -218,9 +220,11 @@ https://capi.example.com:8443/admin
 
 本地数据库始终按认证后的 `shop_id` 隔离事件、别名、重试和投递账本。多个店铺共用同一个外部 Pixel 时，平台侧数据会按你的配置聚合，但本系统不会把店铺事件路由串到未关联的像素。
 
-## 9. 配置 Shopify 付款 webhook
+## 9. 配置 Shopify 自建应用与付款 webhook
 
-每个店铺都必须配置：
+本项目不是上架应用。每个店铺在 Shopify 后台创建并安装自建应用，至少授予 `read_orders`，然后把该应用的 Client Secret 填入项目后台“Webhook Secret”，把 Admin API access token 填入“Admin API Token”。浏览器行为仍由第 8 节粘贴到 `Settings → Customer events` 的自定义像素采集。
+
+每个店铺的自建应用都必须配置：
 
 ```text
 主题：orders/paid
@@ -231,6 +235,16 @@ https://capi.example.com:8443/admin
 后台填写的 Shopify Webhook Secret 必须与签名 webhook 的 App Client Secret 一致。服务端验证 `X-Shopify-Hmac-Sha256`，使用 `X-Shopify-Webhook-Id` 防重复。
 
 浏览器 `checkout_completed` 只创建 `AWAITING_PAYMENT` 候选；只有 HMAC 验证成功的 `orders/paid` 才能解锁 Purchase。这样不会把未付款、延迟付款或失败付款误判为成功购买。
+
+如果同一个自建应用安装在多个店铺，可在 `.env` 设置同一个 `SHOPIFY_APP_SECRET`；若每个店铺分别创建应用，则保持该变量为空并在后台逐店保存各自 Secret。可选隐私 Webhook 地址如下：
+
+```text
+customers/data_request → https://capi.example.com:8443/api/webhook/customers/data_request
+customers/redact       → https://capi.example.com:8443/api/webhook/customers/redact
+shop/redact            → https://capi.example.com:8443/api/webhook/shop/redact
+```
+
+数据访问请求需要在管理后台下载报告、安全交付并确认完成；客户/店铺删除请求由持久化隐私收件箱自动处理。
 
 ## 10. 上线验收
 
@@ -243,6 +257,7 @@ https://capi.example.com:8443/admin
 - 一个店铺绑定多个像素时，每条路由都有独立成功/失败状态。
 - 多店铺共用像素时，管理后台的事件和投递诊断仍按店铺隔离。
 - `/readyz`、PM2 状态、Worker 日志和后台“投递完整性”均正常。
+- 后台数据库总量、事件账本、Webhook 收件箱占用符合磁盘容量预算；为 PostgreSQL 数据目录配置磁盘告警。
 
 ## 11. 安全升级、备份和回滚
 

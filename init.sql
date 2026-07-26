@@ -84,6 +84,29 @@ CREATE TABLE IF NOT EXISTS shopify_reconcile_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Shopify privacy deliveries have different retention and failure
+-- semantics from commerce webhooks. Keep them independent so shop erasure can
+-- delete the tenant row without deleting the compliance receipt itself.
+CREATE TABLE IF NOT EXISTS shopify_privacy_inbox (
+    id BIGSERIAL PRIMARY KEY,
+    shop_domain VARCHAR(255),
+    shop_domain_hash CHAR(64) NOT NULL,
+    webhook_id VARCHAR(255) NOT NULL,
+    topic VARCHAR(100) NOT NULL,
+    payload JSONB,
+    payload_digest CHAR(64) NOT NULL,
+    result JSONB,
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    lease_expires_at TIMESTAMPTZ,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    UNIQUE (shop_domain_hash, webhook_id)
+);
+
 ALTER TABLE shopify_reconcile_state
     ADD COLUMN IF NOT EXISTS scan_since TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS scan_cutoff TIMESTAMPTZ,
@@ -289,6 +312,13 @@ ALTER TABLE shopify_webhook_inbox SET (
     autovacuum_analyze_scale_factor = 0.01,
     autovacuum_vacuum_threshold = 500,
     autovacuum_analyze_threshold = 500
+);
+
+ALTER TABLE shopify_privacy_inbox SET (
+    autovacuum_vacuum_scale_factor = 0.02,
+    autovacuum_analyze_scale_factor = 0.01,
+    autovacuum_vacuum_threshold = 100,
+    autovacuum_analyze_threshold = 100
 );
 
 ALTER TABLE event_deliveries SET (

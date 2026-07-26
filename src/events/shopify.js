@@ -197,6 +197,7 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         client_id: clientId,
         checkout_token: checkoutToken,
         cart_token: order.cart_token,
+        _shopify_order_id: orderId,
         shopify_y: shopifyY,
         shopify_s: shopifyS,
         client_ip: firstPresent(order.browser_ip, order.client_details?.browser_ip),

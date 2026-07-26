@@ -23,6 +23,7 @@ const {
     credentialFingerprint,
     encryptToken,
     decryptTokenIfPossible,
+    hashUserData,
     timingSafeCompare,
     timingSafeStringCompare,
 } = require('./utils/crypto');
@@ -54,6 +55,19 @@ const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./
 const { parseJsonPreservingLargeIntegers } = require('./utils/json');
 
 const app = express();
+let shuttingDown = false;
+const scheduledTasks = [];
+
+function scheduleCron(expression, handler) {
+    if (!cron.validate(expression)) throw new Error(`Invalid cron expression: ${expression}`);
+    const task = cron.schedule(expression, () => {
+        if (shuttingDown) return undefined;
+        return handler();
+    });
+    scheduledTasks.push(task);
+    return task;
+}
+
 app.set('trust proxy', config.trustProxy);
 
 app.use(helmet({
@@ -107,15 +121,63 @@ const capiQueue = new Queue('capi-events', {
     },
 });
 
-const pixelLimiter = config.pixelRateLimitPerMinute > 0
-    ? rateLimit({
-        windowMs: 60_000,
-        max: config.pixelRateLimitPerMinute,
-        keyGenerator: req => `${normalizeShopDomain(shopDomainFromPixelBody(req.body)) || 'unknown'}:${firstForwardedIp(req)}`,
-        standardHeaders: true,
-        legacyHeaders: false,
-    })
-    : (req, res, next) => next();
+function pixelRateLimitIdentity(req) {
+    const shopDomain = normalizeShopDomain(shopDomainFromPixelBody(req.body));
+    const suppliedToken = String(
+        req.headers['x-capi-ingest-token']
+        || req.body?.ingest_token
+        || req.body?.events?.[0]?.ingest_token
+        || '',
+    ).trim();
+    const tenantKey = config.requireIngestToken && validShopIngestToken(shopDomain, suppliedToken)
+        ? shopDomain
+        : 'untrusted';
+    return `${tenantKey}:${firstForwardedIp(req)}`;
+}
+
+const localPixelLimiter = rateLimit({
+    windowMs: 60_000,
+    max: Math.max(1, config.pixelRateLimitPerMinute),
+    keyGenerator: req => crypto.createHash('sha256').update(pixelRateLimitIdentity(req)).digest('hex'),
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+const DISTRIBUTED_RATE_LIMIT_SCRIPT = `
+    local count = redis.call('INCRBY', KEYS[1], ARGV[2])
+    if count == tonumber(ARGV[2]) then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+    return {count, redis.call('TTL', KEYS[1])}
+`;
+
+async function pixelLimiter(req, res, next) {
+    if (config.pixelRateLimitPerMinute <= 0) return next();
+    // Do not let an unauthenticated caller evade limits or create unbounded
+    // Redis keys merely by rotating a forged shop_domain value.
+    const identity = pixelRateLimitIdentity(req);
+    const digest = crypto.createHash('sha256').update(identity).digest('hex');
+    const eventWeight = Math.max(1, pixelPayloadsFromBody(req.body).length);
+    try {
+        const [count, ttl] = await redis.eval(
+            DISTRIBUTED_RATE_LIMIT_SCRIPT,
+            1,
+            `rate:pixel:${digest}`,
+            60,
+            eventWeight,
+        );
+        const remaining = Math.max(0, config.pixelRateLimitPerMinute - Number(count));
+        res.set('RateLimit-Limit', String(config.pixelRateLimitPerMinute));
+        res.set('RateLimit-Remaining', String(remaining));
+        res.set('RateLimit-Reset', String(Math.max(1, Number(ttl) || 60)));
+        if (Number(count) > config.pixelRateLimitPerMinute) {
+            res.set('Retry-After', String(Math.max(1, Number(ttl) || 60)));
+            return res.status(429).json({ error: 'Too many pixel events', retryable: true });
+        }
+        return next();
+    } catch (error) {
+        // PostgreSQL ingestion remains available during a Redis incident, while
+        // the process-local limiter still caps abusive clients on this instance.
+        return localPixelLimiter(req, res, next);
+    }
+}
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -333,6 +395,7 @@ function durableAliasEntries(eventName, eventId, payload) {
         ['id', eventId],
         ['checkout', payload.checkout_token],
         ['order', payload.order_id],
+        ['shopify_order', payload._shopify_order_id],
         ['cart', payload.cart_token],
     ];
 
@@ -532,6 +595,58 @@ async function removeQueuedSendJobsForShop(shopId = null) {
         }
     }
     return removed;
+}
+
+async function clearShopRuntimeData(shopId, shopDomain) {
+    const operations = [
+        deleteRuntimeQueueKeysForShop(shopId),
+        redis.del(`lock:batch_packing:${shopId}`),
+        redis.del(`lock:watchdog:${shopId}`),
+        deleteKeysByPattern(`attr:${shopId}:*`),
+        deleteKeysByPattern(`dedup:${shopId}:*`),
+        deleteKeysByPattern(`dedup-alias:${shopId}:*`),
+        removeQueuedSendJobsForShop(shopId),
+    ];
+    if (shopDomain) operations.push(deleteKeysByPattern(`shopify:webhook:${shopDomain}:*`));
+    const results = await Promise.allSettled(operations);
+    const failures = results.filter(result => result.status === 'rejected');
+    if (failures.length > 0) {
+        console.warn(`[Privacy] ${failures.length} runtime cache cleanup operations failed for shop ${shopId}; database deletion remains authoritative`);
+    }
+}
+
+async function deleteShopDataById(shopId) {
+    const client = await pool.connect();
+    let shopDomain;
+    let deleted = false;
+    try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`shop-delete:${shopId}`]);
+        const shopResult = await client.query(
+            'SELECT shop_domain FROM shops WHERE id = $1 FOR UPDATE',
+            [shopId],
+        );
+        shopDomain = shopResult.rows[0]?.shop_domain;
+        if (shopDomain) {
+            await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shopId]);
+            const result = await client.query('DELETE FROM shops WHERE id = $1', [shopId]);
+            deleted = result.rowCount > 0;
+            await client.query(
+                `DELETE FROM pixels pixel
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM shop_pixel_routes route WHERE route.pixel_id = pixel.id
+                 )`,
+            );
+        }
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+    if (deleted) await clearShopRuntimeData(shopId, shopDomain);
+    return { deleted, shopDomain };
 }
 
 function scoreFromValue(value) {
@@ -878,18 +993,8 @@ function buildPlatformData(payload) {
 }
 
 function buildCustomData(payload) {
-    if (Array.isArray(payload.contents) && payload.contents.length > 200) {
-        const error = new Error('contents must contain 200 items or fewer');
-        error.statusCode = 422;
-        throw error;
-    }
-    if (Array.isArray(payload.content_ids) && payload.content_ids.length > 200) {
-        const error = new Error('content_ids must contain 200 items or fewer');
-        error.statusCode = 422;
-        throw error;
-    }
     const contents = Array.isArray(payload.contents)
-        ? payload.contents
+        ? payload.contents.slice(0, 200)
             .filter(Boolean)
             .map(item => compactObject({
                 id: firstPresent(item.id, item.content_id) ? String(firstPresent(item.id, item.content_id)) : undefined,
@@ -909,7 +1014,7 @@ function buildCustomData(payload) {
     const contentIds = contents?.length
         ? contents.map(item => String(item.id))
         : (Array.isArray(payload.content_ids)
-            ? payload.content_ids.filter(Boolean).map(String)
+            ? payload.content_ids.slice(0, 200).filter(Boolean).map(String)
             : undefined);
     const numItems = Number.isFinite(Number(payload.num_items))
         ? Number(payload.num_items)
@@ -1186,6 +1291,21 @@ async function cleanupExpiredOperationalData() {
          WHERE target.id = expired.id`,
         config.eventRetentionDays,
     );
+    const privacyInbox = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT id
+             FROM shopify_privacy_inbox
+             WHERE status IN ('SUCCESS', 'FAILED_PERMANENT')
+               AND COALESCE(completed_at, processed_at, created_at) < NOW() - ($1::int * INTERVAL '1 day')
+             ORDER BY COALESCE(completed_at, processed_at, created_at), id
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM shopify_privacy_inbox target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.shopifyPrivacyRetentionDays,
+    );
     const deadLetters = await deleteRetentionBatches(
         `WITH expired AS (
              SELECT id
@@ -1214,7 +1334,7 @@ async function cleanupExpiredOperationalData() {
          WHERE target.id = expired.id`,
         config.qualityRetentionDays,
     );
-    return { eventStore, aliases, webhookInbox, deadLetters, qualitySnapshots };
+    return { eventStore, aliases, webhookInbox, privacyInbox, deadLetters, qualitySnapshots };
 }
 
 async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
@@ -1515,6 +1635,8 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         _quality: {
             missing_match_signals: missingMatchSignals(userData),
             missing_event_parameters: missingCommerceSignals(eventName, customData),
+            commerce_items_truncated: (Array.isArray(enrichedPayload.contents) && enrichedPayload.contents.length > 200)
+                || (Array.isArray(enrichedPayload.content_ids) && enrichedPayload.content_ids.length > 200),
         },
         _platform_data: buildPlatformData(enrichedPayload),
         _requires_payment_confirmation: requiresPaymentConfirmation,
@@ -1758,7 +1880,7 @@ async function claimShopifyWebhookInboxRow() {
 
 let drainingShopifyInbox = false;
 async function drainShopifyWebhookInbox(limit = config.shopifyWebhookInboxBatchSize) {
-    if (drainingShopifyInbox || fs.existsSync(config.maintenanceFile)) return 0;
+    if (shuttingDown || drainingShopifyInbox || fs.existsSync(config.maintenanceFile)) return 0;
     drainingShopifyInbox = true;
     let processed = 0;
     try {
@@ -1871,7 +1993,8 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
     const url = `https://${shop.shop_domain}/admin/api/${config.shopifyApiVersion}/graphql.json`;
     let after = state.rows[0].after_cursor || null;
     let received = 0;
-    do {
+    let cursorRestarted = false;
+    while (true) {
         const first = Math.min(100, config.shopifyReconcileMaxOrders - received);
         if (first <= 0) break;
         const response = await axios.post(url, {
@@ -1892,7 +2015,24 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
             },
         });
         if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
-            throw new Error(`Shopify GraphQL: ${response.data.errors.map(item => item.message).join('; ')}`);
+            const errorMessage = response.data.errors.map(item => item.message).join('; ');
+            // Shopify cursors can become invalid after retention or index
+            // changes. Restart the same frozen window once instead of leaving
+            // this shop permanently stuck on a bad durable cursor.
+            if (after && !cursorRestarted && /cursor|after/i.test(errorMessage)) {
+                cursorRestarted = true;
+                after = null;
+                await db.query(
+                    `UPDATE shopify_reconcile_state
+                     SET after_cursor = NULL,
+                         last_error = $2,
+                         updated_at = NOW()
+                     WHERE shop_id = $1`,
+                    [shop.id, `Recovered invalid cursor: ${errorMessage}`.slice(0, 4000)],
+                );
+                continue;
+            }
+            throw new Error(`Shopify GraphQL: ${errorMessage}`);
         }
         const cost = response.data?.extensions?.cost;
         const available = Number(cost?.throttleStatus?.currentlyAvailable);
@@ -1936,7 +2076,8 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
                 [shop.id, since, scanCutoff, after],
             );
         }
-    } while (after && received < config.shopifyReconcileMaxOrders);
+        if (!after || received >= config.shopifyReconcileMaxOrders) break;
+    }
 
     if (!after) await db.query(
         `INSERT INTO shopify_reconcile_state (shop_id, last_successful_at, last_error, updated_at)
@@ -1954,7 +2095,7 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
 }
 
 async function reconcilePaidOrders() {
-    if (fs.existsSync(config.maintenanceFile)) return 0;
+    if (shuttingDown || fs.existsSync(config.maintenanceFile)) return 0;
     const { rows: shops } = await pool.query(
         `SELECT id, shop_domain, admin_access_token
          FROM shops
@@ -1997,6 +2138,353 @@ async function reconcilePaidOrders() {
     return total;
 }
 
+const SHOPIFY_PRIVACY_TOPICS = new Set([
+    'customers/data_request',
+    'customers/redact',
+    'shop/redact',
+]);
+
+function privacyOrderIds(payload = {}) {
+    const values = [
+        ...(Array.isArray(payload.orders_requested) ? payload.orders_requested : []),
+        ...(Array.isArray(payload.orders_to_redact) ? payload.orders_to_redact : []),
+    ];
+    return [...new Set(values.map(normalizeShopifyId).filter(Boolean).map(String))].slice(0, 10000);
+}
+
+function privacyCustomer(payload = {}) {
+    const customer = payload.customer && typeof payload.customer === 'object' ? payload.customer : {};
+    return {
+        id: normalizeShopifyId(customer.id),
+        email: String(customer.email || '').trim().toLowerCase() || undefined,
+        phone: String(customer.phone || '').trim() || undefined,
+    };
+}
+
+async function shopifyWebhookSecrets(shopDomain) {
+    const secrets = [];
+    if (config.shopifyAppSecret) secrets.push(config.shopifyAppSecret);
+    const { rows } = await pool.query(
+        'SELECT id, app_secret FROM shops WHERE shop_domain = $1 LIMIT 1',
+        [shopDomain],
+    );
+    if (rows[0]?.app_secret) {
+        try {
+            const storedSecret = decryptTokenIfPossible(rows[0].app_secret);
+            if (storedSecret && !secrets.includes(storedSecret)) secrets.push(storedSecret);
+        } catch (error) {
+            if (!config.shopifyAppSecret) throw error;
+            console.error(`[ShopifyWebhook] stored secret for ${shopDomain} could not be decrypted; using configured app secret`);
+        }
+    }
+    return { shopId: rows[0]?.id, secrets };
+}
+
+function validShopifyWebhookHmac(rawBody, suppliedHmac, secrets) {
+    return secrets.some(secret => timingSafeCompare(
+        crypto.createHmac('sha256', secret).update(rawBody).digest('base64'),
+        suppliedHmac,
+    ));
+}
+
+function privacyMatchIdentity(shopDomain, payload) {
+    const customer = privacyCustomer(payload);
+    return {
+        customer,
+        orderIds: privacyOrderIds(payload),
+        externalIdHash: customer.id ? tenantScopedExternalId(shopDomain, customer.id) : '',
+        emailHash: customer.email ? hashUserData(customer.email, 'email') : '',
+        phoneHash: customer.phone ? hashUserData(customer.phone, 'phone') : '',
+    };
+}
+
+const PRIVACY_MATCH_SQL = `
+    event.shop_id = $1
+    AND (
+        (COALESCE(event.request_payload->'user_data'->'external_id', '[]'::jsonb) ? $2)
+        OR (COALESCE(event.request_payload->'user_data'->'em', '[]'::jsonb) ? $3)
+        OR (COALESCE(event.request_payload->'user_data'->'ph', '[]'::jsonb) ? $4)
+        OR EXISTS (
+            SELECT 1
+            FROM event_id_aliases alias
+            WHERE alias.shop_id = event.shop_id
+              AND alias.event_name = event.event_name
+              AND alias.canonical_event_id = event.event_id
+              AND alias.alias_type IN ('order', 'shopify_order')
+              AND alias.alias_value = ANY($5::text[])
+        )
+    )`;
+
+async function buildPrivacyDataReport(shop, payload) {
+    const identity = privacyMatchIdentity(shop.shop_domain, payload);
+    const { rows } = await pool.query(
+        `SELECT event.id, event.event_name, event.event_id, event.status,
+                event.timestamp, event.emq_estimate,
+                event.request_payload->'custom_data'->>'order_id' AS order_id
+         FROM event_store event
+         WHERE ${PRIVACY_MATCH_SQL}
+         ORDER BY event.id
+         LIMIT 10001`,
+        [shop.id, identity.externalIdHash, identity.emailHash, identity.phoneHash, identity.orderIds],
+    );
+    const truncated = rows.length > 10000;
+    return {
+        generated_at: new Date().toISOString(),
+        shop_domain: shop.shop_domain,
+        customer_id: identity.customer.id,
+        orders_requested: identity.orderIds,
+        stored_event_count: Math.min(rows.length, 10000),
+        truncated,
+        events: rows.slice(0, 10000),
+        note: 'Customer matching values are stored as one-way hashes; this report contains only retained event metadata.',
+    };
+}
+
+async function redactCustomerData(shop, payload) {
+    const identity = privacyMatchIdentity(shop.shop_domain, payload);
+    const client = await pool.connect();
+    let deletedEvents = [];
+    let deletedInboxRows = 0;
+    let deletedDeadLetters = 0;
+    let deletedAliases = 0;
+    try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`privacy-customer:${shop.id}`]);
+        const matched = await client.query(
+            `SELECT event.id, event.event_name, event.event_id
+             FROM event_store event
+             WHERE ${PRIVACY_MATCH_SQL}
+             FOR UPDATE OF event`,
+            [shop.id, identity.externalIdHash, identity.emailHash, identity.phoneHash, identity.orderIds],
+        );
+        deletedEvents = matched.rows;
+        if (deletedEvents.length > 0) {
+            await client.query(
+                'DELETE FROM event_store WHERE id = ANY($1::bigint[])',
+                [deletedEvents.map(event => event.id)],
+            );
+            const aliases = await client.query(
+                `DELETE FROM event_id_aliases alias
+                 USING UNNEST($2::text[], $3::text[]) deleted(event_name, event_id)
+                 WHERE alias.shop_id = $1
+                   AND alias.event_name = deleted.event_name
+                   AND alias.canonical_event_id = deleted.event_id`,
+                [
+                    shop.id,
+                    deletedEvents.map(event => event.event_name),
+                    deletedEvents.map(event => event.event_id),
+                ],
+            );
+            deletedAliases += aliases.rowCount;
+        }
+        if (identity.orderIds.length > 0) {
+            const aliases = await client.query(
+                `DELETE FROM event_id_aliases
+                 WHERE shop_id = $1
+                   AND alias_type IN ('order', 'shopify_order')
+                   AND alias_value = ANY($2::text[])`,
+                [shop.id, identity.orderIds],
+            );
+            deletedAliases += aliases.rowCount;
+        }
+        const inbox = await client.query(
+            `DELETE FROM shopify_webhook_inbox
+             WHERE shop_id = $1
+               AND (
+                   ($2 <> '' AND (
+                       COALESCE(payload->'customer'->>'id', '') = $2
+                       OR COALESCE(payload->>'customer_id', '') = $2
+                   ))
+                   OR ($3 <> '' AND (
+                       LOWER(COALESCE(payload->>'email', payload->>'contact_email', '')) = $3
+                       OR LOWER(COALESCE(payload->'customer'->>'email', '')) = $3
+                   ))
+                   OR (CARDINALITY($4::text[]) > 0 AND COALESCE(payload->>'id', '') = ANY($4::text[]))
+               )`,
+            [shop.id, identity.customer.id || '', identity.customer.email || '', identity.orderIds],
+        );
+        deletedInboxRows = inbox.rowCount;
+        // Dead letters can contain malformed raw payloads with customer data,
+        // so conservative shop-scoped removal is safer than unreliable JSON matching.
+        const deadLetters = await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shop.id]);
+        deletedDeadLetters = deadLetters.rowCount;
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+    await deleteKeysByPattern(`attr:${shop.id}:*`).catch(() => {});
+    await deleteKeysByPattern(`dedup:${shop.id}:*`).catch(() => {});
+    await deleteKeysByPattern(`dedup-alias:${shop.id}:*`).catch(() => {});
+    return {
+        deleted_events: deletedEvents.length,
+        deleted_aliases: deletedAliases,
+        deleted_webhook_rows: deletedInboxRows,
+        deleted_dead_letters: deletedDeadLetters,
+    };
+}
+
+async function processShopifyPrivacyRow(row) {
+    const payload = row.payload || {};
+    const { rows } = await pool.query(
+        'SELECT id, shop_domain FROM shops WHERE shop_domain = $1 LIMIT 1',
+        [row.shop_domain],
+    );
+    const shop = rows[0];
+    if (row.topic === 'customers/data_request') {
+        return {
+            status: 'ACTION_REQUIRED',
+            result: shop
+                ? await buildPrivacyDataReport(shop, payload)
+                : {
+                    generated_at: new Date().toISOString(),
+                    shop_domain: row.shop_domain,
+                    stored_event_count: 0,
+                    events: [],
+                    note: 'No retained shop data was found.',
+                },
+        };
+    }
+    if (row.topic === 'customers/redact') {
+        const result = shop
+            ? await redactCustomerData(shop, payload)
+            : { deleted_events: 0, deleted_webhook_rows: 0, deleted_dead_letters: 0 };
+        return { status: 'SUCCESS', result };
+    }
+    if (row.topic === 'shop/redact') {
+        const result = shop ? await deleteShopDataById(shop.id) : { deleted: false };
+        return { status: 'SUCCESS', result: { deleted_shop: result.deleted === true } };
+    }
+    const error = new Error(`Unsupported privacy topic: ${row.topic}`);
+    error.statusCode = 422;
+    throw error;
+}
+
+async function claimShopifyPrivacyRow() {
+    const { rows } = await pool.query(
+        `WITH candidate AS (
+             SELECT id
+             FROM shopify_privacy_inbox
+             WHERE next_attempt_at <= NOW()
+               AND (
+                   status IN ('PENDING', 'RETRYABLE_FAILED')
+                   OR (status = 'PROCESSING' AND lease_expires_at < NOW())
+               )
+             ORDER BY next_attempt_at, id
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+         )
+         UPDATE shopify_privacy_inbox inbox
+         SET status = 'PROCESSING',
+             attempt_count = attempt_count + 1,
+             lease_expires_at = NOW() + ($1::int * INTERVAL '1 second'),
+             error_message = NULL
+         FROM candidate
+         WHERE inbox.id = candidate.id
+         RETURNING inbox.*`,
+        [config.shopifyPrivacyLeaseSeconds],
+    );
+    return rows[0] || null;
+}
+
+let drainingShopifyPrivacy = false;
+async function drainShopifyPrivacyInbox(limit = config.shopifyPrivacyBatchSize) {
+    if (shuttingDown || drainingShopifyPrivacy || fs.existsSync(config.maintenanceFile)) return 0;
+    drainingShopifyPrivacy = true;
+    let processed = 0;
+    try {
+        while (processed < limit) {
+            const row = await claimShopifyPrivacyRow();
+            if (!row) break;
+            try {
+                const outcome = await processShopifyPrivacyRow(row);
+                const scrubPayload = outcome.status === 'SUCCESS';
+                await pool.query(
+                    `UPDATE shopify_privacy_inbox
+                     SET status = $3,
+                         payload = CASE WHEN $4::boolean THEN NULL ELSE payload END,
+                         shop_domain = CASE WHEN $4::boolean THEN NULL ELSE shop_domain END,
+                         result = $5::jsonb,
+                         processed_at = NOW(),
+                         completed_at = CASE WHEN $3 = 'SUCCESS' THEN NOW() ELSE NULL END,
+                         lease_expires_at = NULL,
+                         error_message = NULL
+                     WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $2`,
+                    [row.id, row.attempt_count, outcome.status, scrubPayload, JSON.stringify(outcome.result || {})],
+                );
+            } catch (error) {
+                const permanent = Number(row.attempt_count) >= config.shopifyPrivacyMaxAttempts;
+                const delaySeconds = Math.min(3600, 2 ** Math.min(12, Number(row.attempt_count)));
+                await pool.query(
+                    `UPDATE shopify_privacy_inbox
+                     SET status = $3,
+                         next_attempt_at = NOW() + ($4::int * INTERVAL '1 second'),
+                         lease_expires_at = NULL,
+                         processed_at = CASE WHEN $3 = 'FAILED_PERMANENT' THEN NOW() ELSE NULL END,
+                         error_message = $5
+                     WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $2`,
+                    [
+                        row.id,
+                        row.attempt_count,
+                        permanent ? 'FAILED_PERMANENT' : 'RETRYABLE_FAILED',
+                        delaySeconds,
+                        String(error.message).slice(0, 4000),
+                    ],
+                );
+                console.error(`[ShopifyPrivacy] request ${row.id} ${permanent ? 'failed permanently' : 'deferred'}:`, error.message);
+            }
+            processed += 1;
+        }
+    } finally {
+        drainingShopifyPrivacy = false;
+    }
+    return processed;
+}
+
+function shopifyPrivacyHandler(expectedTopic) {
+    return asyncHandler(async (req, res) => {
+        const shopDomain = requireMyshopifyDomain(req.headers['x-shopify-shop-domain']);
+        const suppliedHmac = String(req.headers['x-shopify-hmac-sha256'] || '').trim();
+        const topic = String(req.headers['x-shopify-topic'] || '').trim().toLowerCase();
+        if (topic !== expectedTopic || !SHOPIFY_PRIVACY_TOPICS.has(topic)) {
+            return res.status(400).send('Unexpected webhook topic');
+        }
+        const { secrets } = await shopifyWebhookSecrets(shopDomain);
+        if (!suppliedHmac || secrets.length === 0
+            || !validShopifyWebhookHmac(req.rawBody, suppliedHmac, secrets)) {
+            return res.status(401).send('HMAC Failed');
+        }
+        let payload;
+        try {
+            payload = parseJsonPreservingLargeIntegers(req.rawBody.toString('utf8'));
+        } catch (error) {
+            return res.status(400).send('Invalid JSON payload');
+        }
+        const payloadDigest = crypto.createHash('sha256').update(req.rawBody).digest('hex');
+        const suppliedWebhookId = String(req.headers['x-shopify-webhook-id'] || '').trim();
+        const webhookId = (suppliedWebhookId || payloadDigest).slice(0, 255);
+        const shopDomainHash = crypto.createHash('sha256').update(shopDomain).digest('hex');
+        const insert = await pool.query(
+            `INSERT INTO shopify_privacy_inbox
+                (shop_domain, shop_domain_hash, webhook_id, topic, payload, payload_digest)
+             VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+             ON CONFLICT (shop_domain_hash, webhook_id) DO NOTHING
+             RETURNING id`,
+            [shopDomain, shopDomainHash, webhookId, topic, JSON.stringify(payload || {}), payloadDigest],
+        );
+        res.status(200).json({ success: true, accepted: true, duplicate: insert.rowCount === 0 });
+        setImmediate(() => void drainShopifyPrivacyInbox().catch(error => {
+            console.error('[ShopifyPrivacy] immediate drain failed:', error.message);
+        }));
+    });
+}
+
+app.post('/api/webhook/customers/data_request', shopifyPrivacyHandler('customers/data_request'));
+app.post('/api/webhook/customers/redact', shopifyPrivacyHandler('customers/redact'));
+app.post('/api/webhook/shop/redact', shopifyPrivacyHandler('shop/redact'));
+
 async function handleShopifyPurchaseWebhook(req, res) {
     const shopDomain = normalizeShopDomain(req.headers['x-shopify-shop-domain']);
     const hmacHeader = req.headers['x-shopify-hmac-sha256'];
@@ -2011,9 +2499,11 @@ async function handleShopifyPurchaseWebhook(req, res) {
     );
     if (rows.length === 0) return res.status(401).send('Unauthorized');
 
-    const appSecret = decryptTokenIfPossible(rows[0].app_secret);
-    const generatedHash = crypto.createHmac('sha256', appSecret).update(req.rawBody).digest('base64');
-    if (!timingSafeCompare(generatedHash, hmacHeader)) return res.status(401).send('HMAC Failed');
+    const secrets = [config.shopifyAppSecret, decryptTokenIfPossible(rows[0].app_secret)]
+        .filter(Boolean);
+    if (!validShopifyWebhookHmac(req.rawBody, hmacHeader, [...new Set(secrets)])) {
+        return res.status(401).send('HMAC Failed');
+    }
 
     let precisePayload;
     try {
@@ -2065,7 +2555,7 @@ app.get('/readyz', asyncHandler(async (req, res) => {
     });
 }));
 
-cron.schedule(config.shopifyWebhookInboxCron, async () => {
+scheduleCron(config.shopifyWebhookInboxCron, async () => {
     try {
         await drainShopifyWebhookInbox();
     } catch (error) {
@@ -2073,7 +2563,16 @@ cron.schedule(config.shopifyWebhookInboxCron, async () => {
     }
 });
 
-cron.schedule(config.shopifyReconcileCron, async () => {
+scheduleCron(config.shopifyPrivacyCron, async () => {
+    try {
+        const processed = await drainShopifyPrivacyInbox();
+        if (processed > 0) console.warn(`[ShopifyPrivacy] processed ${processed} compliance requests`);
+    } catch (error) {
+        console.error('[ShopifyPrivacy] scheduled drain failed:', error);
+    }
+});
+
+scheduleCron(config.shopifyReconcileCron, async () => {
     try {
         const reconciled = await reconcilePaidOrders();
         if (reconciled > 0) console.warn(`[ShopifyReconcile] queued ${reconciled} paid orders`);
@@ -2082,7 +2581,7 @@ cron.schedule(config.shopifyReconcileCron, async () => {
     }
 });
 
-cron.schedule(config.batchCron, async () => {
+scheduleCron(config.batchCron, async () => {
     if (!config.legacyRedisDrainEnabled) return;
     try {
         const { rows: shops } = await pool.query("SELECT id FROM shops WHERE status = 'active'");
@@ -2162,7 +2661,7 @@ cron.schedule(config.batchCron, async () => {
     }
 });
 
-cron.schedule(config.watchdogCron, async () => {
+scheduleCron(config.watchdogCron, async () => {
     if (!config.legacyRedisDrainEnabled) return;
     try {
         const { rows: shops } = await pool.query('SELECT id FROM shops');
@@ -2196,7 +2695,7 @@ cron.schedule(config.watchdogCron, async () => {
     }
 });
 
-cron.schedule(config.watchdogCron, async () => {
+scheduleCron(config.watchdogCron, async () => {
     try {
         const reconciled = await reconcileEventAggregateStatuses();
         if (reconciled > 0) {
@@ -2207,7 +2706,7 @@ cron.schedule(config.watchdogCron, async () => {
     }
 });
 
-cron.schedule(config.watchdogCron, async () => {
+scheduleCron(config.watchdogCron, async () => {
     const lockKey = 'lock:stale_pending_rescue';
     const lockToken = crypto.randomUUID();
     let stopLockHeartbeat;
@@ -2226,7 +2725,7 @@ cron.schedule(config.watchdogCron, async () => {
     }
 });
 
-cron.schedule(config.metaQualityCron, async () => {
+scheduleCron(config.metaQualityCron, async () => {
     const lockKey = 'lock:meta_quality_refresh';
     const lockToken = crypto.randomUUID();
     let stopLockHeartbeat;
@@ -2248,7 +2747,7 @@ cron.schedule(config.metaQualityCron, async () => {
     }
 });
 
-cron.schedule(config.cleanupCron, async () => {
+scheduleCron(config.cleanupCron, async () => {
     const lockKey = 'lock:operational_data_cleanup';
     const lockToken = crypto.randomUUID();
     let stopLockHeartbeat;
@@ -2322,43 +2821,8 @@ app.post('/api/admin/shops', asyncHandler(async (req, res) => {
 
 app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
     const shopId = readPositiveId(req.params.id, 'shop_id');
-
-    const client = await pool.connect();
-    let rowCount = 0;
-    let shopDomain;
-    try {
-        await client.query('BEGIN');
-        const shopResult = await client.query('SELECT shop_domain FROM shops WHERE id = $1 FOR UPDATE', [shopId]);
-        shopDomain = shopResult.rows[0]?.shop_domain;
-        await client.query('DELETE FROM dead_letters WHERE shop_id = $1', [shopId]);
-        const result = await client.query('DELETE FROM shops WHERE id = $1', [shopId]);
-        rowCount = result.rowCount;
-        await client.query(
-            `DELETE FROM pixels p
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM shop_pixel_routes r WHERE r.pixel_id = p.id
-             )`,
-        );
-        await client.query('COMMIT');
-    } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-    } finally {
-        client.release();
-    }
-
-    if (rowCount === 0) return res.status(404).json({ error: 'Shop not found' });
-
-    await Promise.all([
-        deleteRuntimeQueueKeysForShop(shopId),
-        redis.del(`lock:batch_packing:${shopId}`),
-        redis.del(`lock:watchdog:${shopId}`),
-        deleteKeysByPattern(`attr:${shopId}:*`),
-        deleteKeysByPattern(`dedup:${shopId}:*`),
-        deleteKeysByPattern(`dedup-alias:${shopId}:*`),
-        shopDomain ? deleteKeysByPattern(`shopify:webhook:${shopDomain}:*`) : Promise.resolve(),
-    ]);
-
+    const { deleted } = await deleteShopDataById(shopId);
+    if (!deleted) return res.status(404).json({ error: 'Shop not found' });
     res.json({ success: true });
 }));
 
@@ -2663,6 +3127,105 @@ app.delete('/api/admin/logs', asyncHandler(async (req, res) => {
     });
 }));
 
+app.get('/api/admin/privacy', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    const params = shopId ? [shopId] : [];
+    const { rows } = await pool.query(
+        `SELECT inbox.id,
+                inbox.shop_domain,
+                inbox.topic,
+                inbox.status,
+                inbox.attempt_count,
+                inbox.error_message,
+                inbox.created_at,
+                inbox.processed_at,
+                inbox.completed_at,
+                CASE
+                    WHEN inbox.status = 'ACTION_REQUIRED'
+                    THEN COALESCE((inbox.result->>'stored_event_count')::int, 0)
+                    ELSE NULL
+                END AS stored_event_count
+         FROM shopify_privacy_inbox inbox
+         LEFT JOIN shops shop ON shop.shop_domain = inbox.shop_domain
+         ${shopId ? 'WHERE shop.id = $1' : ''}
+         ORDER BY
+             CASE inbox.status
+                 WHEN 'ACTION_REQUIRED' THEN 0
+                 WHEN 'FAILED_PERMANENT' THEN 1
+                 WHEN 'RETRYABLE_FAILED' THEN 2
+                 WHEN 'PROCESSING' THEN 3
+                 WHEN 'PENDING' THEN 4
+                 ELSE 5
+             END,
+             inbox.id DESC
+         LIMIT 100`,
+        params,
+    );
+    res.set('Cache-Control', 'private, no-store');
+    res.json(rows);
+}));
+
+app.get('/api/admin/privacy/:id/report', asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid privacy request ID' });
+    const { rows } = await pool.query(
+        `SELECT id, topic, status, created_at, processed_at, result
+         FROM shopify_privacy_inbox
+         WHERE id = $1`,
+        [id],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Privacy request not found' });
+    if (rows[0].status !== 'ACTION_REQUIRED') {
+        return res.status(409).json({ error: 'This privacy request has no pending customer data report' });
+    }
+    res.set('Cache-Control', 'private, no-store');
+    return res.json(rows[0]);
+}));
+
+app.post('/api/admin/privacy/:id/complete', asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid privacy request ID' });
+    if (req.body?.confirm !== 'COMPLETE_DATA_REQUEST') {
+        return res.status(400).json({ error: 'confirm must equal COMPLETE_DATA_REQUEST' });
+    }
+    const { rowCount } = await pool.query(
+        `UPDATE shopify_privacy_inbox
+         SET status = 'SUCCESS',
+             payload = NULL,
+             result = NULL,
+             shop_domain = NULL,
+             completed_at = NOW(),
+             processed_at = COALESCE(processed_at, NOW()),
+             lease_expires_at = NULL,
+             error_message = NULL
+         WHERE id = $1 AND status = 'ACTION_REQUIRED'`,
+        [id],
+    );
+    if (rowCount === 0) return res.status(409).json({ error: 'Privacy request is not awaiting completion' });
+    return res.json({ success: true, id, scrubbed: true });
+}));
+
+app.post('/api/admin/privacy/:id/retry', asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid privacy request ID' });
+    const { rowCount } = await pool.query(
+        `UPDATE shopify_privacy_inbox
+         SET status = 'PENDING',
+             attempt_count = 0,
+             next_attempt_at = NOW(),
+             lease_expires_at = NULL,
+             processed_at = NULL,
+             error_message = NULL
+         WHERE id = $1 AND status = 'FAILED_PERMANENT'`,
+        [id],
+    );
+    if (rowCount === 0) return res.status(409).json({ error: 'Privacy request is not permanently failed' });
+    setImmediate(() => void drainShopifyPrivacyInbox().catch(error => {
+        console.error('[ShopifyPrivacy] manual retry drain failed:', error.message);
+    }));
+    return res.json({ success: true, id, queued: true });
+}));
+
 app.get('/api/admin/summary', asyncHandler(async (req, res) => {
     const shopId = readOptionalShopId(req);
     const params = shopId ? [shopId] : [];
@@ -2679,6 +3242,8 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         pixelsResult,
         integrityResult,
         backlogResult,
+        privacyResult,
+        storageResult,
         queueCounts,
     ] = await Promise.all([
         pool.query(`
@@ -2876,6 +3441,36 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             ORDER BY oldest_pending_seconds DESC, e.shop_id ASC
             LIMIT 100
         `, params),
+        pool.query(
+            `SELECT
+                 COUNT(*) FILTER (WHERE inbox.status = 'ACTION_REQUIRED')::int AS action_required,
+                 COUNT(*) FILTER (WHERE inbox.status = 'FAILED_PERMANENT')::int AS permanent_failed,
+                 COUNT(*) FILTER (
+                     WHERE inbox.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')
+                 )::int AS outstanding,
+                 COALESCE(EXTRACT(EPOCH FROM (
+                     NOW() - MIN(inbox.created_at) FILTER (
+                         WHERE inbox.status IN ('ACTION_REQUIRED', 'FAILED_PERMANENT')
+                     )
+                 ))::bigint, 0) AS oldest_attention_seconds
+             FROM shopify_privacy_inbox inbox
+             LEFT JOIN shops shop ON shop.shop_domain = inbox.shop_domain
+             ${shopId ? 'WHERE shop.id = $1' : ''}`,
+            params,
+        ),
+        pool.query(
+            `SELECT
+                 pg_database_size(current_database())::bigint AS database_bytes,
+                 (
+                     pg_total_relation_size('event_store'::regclass)
+                     + pg_total_relation_size('event_deliveries'::regclass)
+                     + pg_total_relation_size('event_id_aliases'::regclass)
+                 )::bigint AS event_ledger_bytes,
+                 (
+                     pg_total_relation_size('shopify_webhook_inbox'::regclass)
+                     + pg_total_relation_size('shopify_privacy_inbox'::regclass)
+                 )::bigint AS webhook_inbox_bytes`,
+        ),
         optionalRedis(
             () => capiQueue.getJobCounts('waiting', 'active', 'delayed', 'failed', 'completed'),
             { waiting: 0, active: 0, delayed: 0, failed: 0, completed: 0 },
@@ -2927,6 +3522,8 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         pixels_by_platform: pixelsResult.rows,
         dead_letters: dlqResult.rows[0]?.count || 0,
         delivery_health: integrityResult.rows[0] || {},
+        privacy_health: privacyResult.rows[0] || {},
+        storage_health: storageResult.rows[0] || {},
         queue: queueCounts,
         db_backlog_by_shop: backlogResult.rows,
         // Kept for response compatibility. The legacy Redis-list transport is
@@ -3021,7 +3618,7 @@ app.use((err, req, res, next) => {
     if (err.code === '42501') {
         console.error(err);
         return res.status(500).json({
-            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, shop_pixel_routes, event_store, shopify_webhook_inbox, event_deliveries, dead_letters, and their sequences.',
+            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, shop_pixel_routes, event_store, shopify_webhook_inbox, shopify_privacy_inbox, shopify_reconcile_state, event_id_aliases, event_deliveries, dead_letters, meta_quality_snapshots, and their sequences.',
             code: err.code,
         });
     }
@@ -3037,11 +3634,11 @@ server.headersTimeout = config.httpHeadersTimeoutMs;
 server.keepAliveTimeout = config.httpKeepAliveTimeoutMs;
 server.maxRequestsPerSocket = 1000;
 
-let shuttingDown = false;
 async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`Received ${signal}, shutting down API server`);
+    for (const task of scheduledTasks) task.stop();
     const forceTimer = setTimeout(() => {
         console.error('API shutdown deadline exceeded; closing remaining sockets');
         server.closeAllConnections?.();

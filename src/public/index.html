@@ -250,7 +250,7 @@
                     </div>
                     <div class="status-chip"><span class="live-dot"></span>PostgreSQL 为持久化真源</div>
                 </div>
-                <div class="grid md:grid-cols-4 gap-3">
+                <div class="grid md:grid-cols-4 xl:grid-cols-7 gap-3">
                     <div class="metric-card surface p-4">
                         <div class="metric-label">24 小时事件</div>
                         <div class="metric-value">{{ summary.last24h?.total_events || 0 }}</div>
@@ -266,6 +266,18 @@
                     <div class="metric-card surface p-4">
                         <div class="metric-label">队列等待</div>
                         <div class="metric-value">{{ summary.queue?.waiting || 0 }}</div>
+                    </div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">数据库总量</div>
+                        <div class="metric-value text-2xl">{{ formatBytes(summary.storage_health?.database_bytes) }}</div>
+                    </div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">事件账本</div>
+                        <div class="metric-value text-2xl">{{ formatBytes(summary.storage_health?.event_ledger_bytes) }}</div>
+                    </div>
+                    <div class="metric-card surface p-4">
+                        <div class="metric-label">Webhook 收件箱</div>
+                        <div class="metric-value text-2xl">{{ formatBytes(summary.storage_health?.webhook_inbox_bytes) }}</div>
                     </div>
                 </div>
                 <div class="surface p-4 text-sm">
@@ -336,6 +348,18 @@
                             <div class="text-xs text-slate-500">Webhook 永久失败</div>
                             <div class="text-xl font-semibold" :class="Number(summary.delivery_health?.webhook_inbox_permanent_failed || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.delivery_health?.webhook_inbox_permanent_failed || 0 }}</div>
                         </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">隐私请求待交付</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.privacy_health?.action_required || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.privacy_health?.action_required || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">隐私处理失败</div>
+                            <div class="text-xl font-semibold" :class="Number(summary.privacy_health?.permanent_failed || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.privacy_health?.permanent_failed || 0 }}</div>
+                        </div>
+                        <div class="border rounded-md p-3 bg-slate-50">
+                            <div class="text-xs text-slate-500">最老合规待办</div>
+                            <div class="text-xl font-semibold">{{ formatDuration(summary.privacy_health?.oldest_attention_seconds) }}</div>
+                        </div>
                     </div>
                 </div>
                 <div class="surface p-5 text-sm">
@@ -405,6 +429,35 @@
                     <button v-if="logs.length" @click="clearLogs" class="secondary-btn px-4 py-2 text-red-700">清除事件日志</button>
                 </div>
 
+                <div v-if="privacyRequests.length" class="surface p-5 text-sm">
+                    <div class="surface-header">
+                        <div>
+                            <div class="surface-title">Shopify 隐私请求</div>
+                            <div class="surface-copy">客户数据请求需要先下载报告并安全交付，确认完成后系统会立即清除报告与原始请求。</div>
+                        </div>
+                    </div>
+                    <div class="table-shell"><div class="table-scroll">
+                        <table class="data-table text-xs">
+                            <thead class="text-left"><tr><th>时间</th><th>店铺</th><th>主题</th><th>状态</th><th>匹配事件</th><th>错误</th><th>操作</th></tr></thead>
+                            <tbody>
+                                <tr v-for="item in privacyRequests" :key="item.id">
+                                    <td>{{ formatTime(item.created_at) }}</td>
+                                    <td class="font-mono">{{ item.shop_domain || '已清除' }}</td>
+                                    <td class="font-mono">{{ item.topic }}</td>
+                                    <td class="font-semibold" :class="statusClass(item.status)">{{ item.status }}</td>
+                                    <td>{{ item.stored_event_count ?? '—' }}</td>
+                                    <td class="font-mono text-red-700">{{ item.error_message || '—' }}</td>
+                                    <td class="space-x-2 whitespace-nowrap">
+                                        <button v-if="item.status === 'ACTION_REQUIRED'" @click="downloadPrivacyReport(item)" class="text-action text-blue-600 font-medium">下载报告</button>
+                                        <button v-if="item.status === 'ACTION_REQUIRED'" @click="completePrivacyRequest(item)" class="text-action text-emerald-700 font-medium">确认已交付</button>
+                                        <button v-if="item.status === 'FAILED_PERMANENT'" @click="retryPrivacyRequest(item)" class="text-action text-amber-700 font-medium">重试</button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div></div>
+                </div>
+
                 <div v-if="dlq.length" class="table-shell border-red-200 bg-red-50"><div class="table-scroll">
                     <table class="data-table text-xs">
                         <thead class="bg-red-100 text-left"><tr><th>店铺</th><th>失败时间</th><th>失败原因</th></tr></thead>
@@ -455,6 +508,7 @@
                     pixels: [],
                     logs: [],
                     dlq: [],
+                    privacyRequests: [],
                     summary: {},
                     notice: null,
                     busy: {},
@@ -1454,20 +1508,62 @@ analytics.subscribe('search_submitted', function (event) {
                     if (total < 86400) return `${(total / 3600).toFixed(1)}h`;
                     return `${(total / 86400).toFixed(1)}d`;
                 },
+                formatBytes(bytes) {
+                    const value = Math.max(0, Number(bytes || 0));
+                    if (value < 1024) return `${Math.round(value)} B`;
+                    const units = ['KB', 'MB', 'GB', 'TB'];
+                    let amount = value / 1024;
+                    let index = 0;
+                    while (amount >= 1024 && index < units.length - 1) {
+                        amount /= 1024;
+                        index += 1;
+                    }
+                    return `${amount >= 10 ? amount.toFixed(1) : amount.toFixed(2)} ${units[index]}`;
+                },
                 async fetchAll() {
-                    await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchDlq(), this.fetchSummary()]);
+                    await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchDlq(), this.fetchPrivacy(), this.fetchSummary()]);
                 },
                 shopScopedPath(path) {
                     return this.selectedShopId ? `${path}?shop_id=${encodeURIComponent(this.selectedShopId)}` : path;
                 },
                 async fetchOperationalData() {
-                    await Promise.all([this.fetchLogs(), this.fetchDlq(), this.fetchSummary()]);
+                    await Promise.all([this.fetchLogs(), this.fetchDlq(), this.fetchPrivacy(), this.fetchSummary()]);
                 },
                 async fetchShops() { this.shops = await this.api('/api/admin/shops'); },
                 async fetchPixels() { this.pixels = await this.api('/api/admin/pixels'); },
                 async fetchLogs() { this.logs = await this.api(this.shopScopedPath('/api/admin/logs')); },
                 async fetchDlq() { this.dlq = await this.api(this.shopScopedPath('/api/admin/dlq')); },
+                async fetchPrivacy() { this.privacyRequests = await this.api(this.shopScopedPath('/api/admin/privacy')); },
                 async fetchSummary() { this.summary = await this.api(this.shopScopedPath('/api/admin/summary')); },
+                async downloadPrivacyReport(item) {
+                    await this.runAction(`privacyReport:${item.id}`, async () => {
+                        const report = await this.api(`/api/admin/privacy/${item.id}/report`);
+                        const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.download = `shopify-data-request-${item.id}.json`;
+                        link.click();
+                        URL.revokeObjectURL(url);
+                    }, '客户数据报告已下载；请通过安全渠道交付后再确认完成。');
+                },
+                async completePrivacyRequest(item) {
+                    if (!confirm(`确认请求 #${item.id} 的报告已经安全交付给店铺/客户？确认后报告和原始请求将不可恢复地清除。`)) return;
+                    await this.runAction(`privacyComplete:${item.id}`, async () => {
+                        await this.api(`/api/admin/privacy/${item.id}/complete`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ confirm: 'COMPLETE_DATA_REQUEST' }),
+                        });
+                        await Promise.all([this.fetchPrivacy(), this.fetchSummary()]);
+                    }, '隐私请求已完成，暂存报告和原始请求已清除。');
+                },
+                async retryPrivacyRequest(item) {
+                    await this.runAction(`privacyRetry:${item.id}`, async () => {
+                        await this.api(`/api/admin/privacy/${item.id}/retry`, { method: 'POST' });
+                        await Promise.all([this.fetchPrivacy(), this.fetchSummary()]);
+                    }, '隐私请求已重新进入持久化处理队列。');
+                },
                 async replayDlq() {
                     if (!confirm('确认重放当前列表中的全部失败事件？成功路由不会重复发送。')) return;
                     await this.runAction('replayDlq', async () => {
