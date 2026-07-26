@@ -1,4 +1,9 @@
-const { compactObject, firstPresent, normalizeShopifyId } = require('./common');
+const {
+    compactObject,
+    firstPresent,
+    normalizeShopifyId,
+    tenantScopedIdentifier,
+} = require('./common');
 
 function toAbsoluteShopUrl(shopDomain, value) {
     const shopRoot = `https://${shopDomain}`;
@@ -29,7 +34,13 @@ function buildFbcFromUrl(sourceUrl, timestampMs = Date.now()) {
         const parsed = new URL(sourceUrl);
         const fbclid = parsed.searchParams.get('fbclid');
         if (!fbclid) return undefined;
-        return `fb.1.${timestampMs}.${fbclid}`;
+        let creationTime = Number(timestampMs);
+        if (Number.isFinite(creationTime) && creationTime > 0 && creationTime < 10_000_000_000) {
+            creationTime *= 1000;
+        }
+        creationTime = Math.trunc(creationTime);
+        if (!/^\d{13}$/.test(String(creationTime))) creationTime = Date.now();
+        return `fb.1.${creationTime}.${fbclid}`;
     } catch (error) {
         return undefined;
     }
@@ -45,6 +56,20 @@ function paidOrderIgnoreReason(order = {}, allowedSources = ['web']) {
     if (!sourceName) return 'missing_order_source';
     const allowed = new Set(allowedSources.map(source => String(source).trim().toLowerCase()).filter(Boolean));
     return allowed.has(sourceName) ? undefined : `non_web_order_source:${sourceName}`;
+}
+
+function shopifyCustomerSegmentation(customer = {}) {
+    if (customer.isFirstOrder === true || customer.is_first_order === true) {
+        return 'new_customer_to_business';
+    }
+    if (customer.isFirstOrder === false || customer.is_first_order === false) {
+        return 'existing_customer_to_business';
+    }
+    const orderCount = Number(firstPresent(customer.orders_count, customer.ordersCount));
+    if (Number.isInteger(orderCount) && orderCount > 0) {
+        return orderCount === 1 ? 'new_customer_to_business' : 'existing_customer_to_business';
+    }
+    return undefined;
 }
 
 function allocatedDiscount(item) {
@@ -103,10 +128,15 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         readOrderAttribute(order, ['_fbp', 'fbp', 'facebook_browser_id']),
         order.client_details?.fbp,
     );
+    const orderCreatedAtMs = Date.parse(String(firstPresent(order.created_at, order.processed_at, '') || ''));
+    const fbcCreatedAtMs = options.nowMs !== undefined && options.nowMs !== null
+        && Number.isFinite(Number(options.nowMs))
+        ? Number(options.nowMs)
+        : (Number.isFinite(orderCreatedAtMs) ? orderCreatedAtMs : Date.now());
     const fbc = firstPresent(
         readOrderAttribute(order, ['_fbc', 'fbc', 'facebook_click_id']),
         order.client_details?.fbc,
-        buildFbcFromUrl(sourceUrl, options.nowMs),
+        buildFbcFromUrl(sourceUrl, fbcCreatedAtMs),
     );
     const ttp = firstPresent(
         readOrderAttribute(order, ['_ttp', 'ttp', 'tiktok_cookie_id']),
@@ -127,12 +157,15 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const clientId = firstPresent(readOrderAttribute(order, ['client_id', 'shopify_client_id']), shopifyY);
     const orderId = normalizeShopifyId(order.id);
     const orderName = firstPresent(order.name, order.order_number, orderId);
-    const stableEventId = firstPresent(
-        readOrderAttribute(order, ['event_id', 'capi_event_id']),
+    const stableEventId = tenantScopedIdentifier(shopDomain, firstPresent(
         checkoutToken,
         orderId,
         orderName,
-    );
+        // Note attributes can be storefront-controlled. They are useful only
+        // as a last-resort compatibility fallback, never ahead of immutable
+        // Shopify checkout/order identifiers.
+        readOrderAttribute(order, ['event_id', 'capi_event_id']),
+    ));
 
     return {
         event_name: 'Purchase',
@@ -174,6 +207,7 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         content_type: 'product',
         num_items: contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
         order_id: orderName,
+        customer_segmentation: shopifyCustomerSegmentation(customer),
         source_url: sourceUrl,
         // For orders/paid, the webhook trigger time is the closest available
         // timestamp to the actual payment transition. Checkout creation time
@@ -190,5 +224,6 @@ module.exports = {
     normalizeContentId,
     paidOrderIgnoreReason,
     readOrderAttribute,
+    shopifyCustomerSegmentation,
     toAbsoluteShopUrl,
 };

@@ -1,18 +1,23 @@
-# CAPI SaaS Data Hub
+# CAPI SaaS 数据中枢
 
-The admin console uses pinned, locally served Tailwind CSS and Vue browser
-assets instead of runtime CDNs. After changing admin HTML/CSS or upgrading Vue,
-run `npm install` and `npm run build:admin`, then commit the regenerated
-`src/public/admin.css` and `src/public/vue.global.prod.js`. Production installs
-do not need these build dependencies because both compiled assets are included
-in the repository.
+这是一个部署在私有 VPS 上的 Shopify Customer Events 数据中枢，用于将店铺事件可靠地发送到 Meta Conversions API 和 TikTok Events API。
 
+管理后台使用仓库内固定版本的 Tailwind CSS 和 Vue 浏览器资源，不依赖运行时 CDN。修改后台 HTML/CSS 或升级 Vue 后，请运行：
 
-Private VPS service for Shopify Customer Events, Meta Conversions API, and TikTok Events API tracking.
+```bash
+npm install
+npm run build:admin
+```
 
-Baota/aaPanel is optional. For a clean Ubuntu VPS, use the one-command deployment guide: [DEPLOY_UBUNTU_ONECLICK.md](DEPLOY_UBUNTU_ONECLICK.md). For Baota-based operations, use [DEPLOY_BAOTA_UBUNTU.md](DEPLOY_BAOTA_UBUNTU.md). Before uploading to GitHub, see [GITHUB_RELEASE_CHECKLIST.md](GITHUB_RELEASE_CHECKLIST.md).
+然后提交重新生成的 `src/public/admin.css` 和 `src/public/vue.global.prod.js`。生产服务器不需要安装这些开发依赖，因为编译后的资源已经包含在仓库中。
 
-One-command install after uploading the project to GitHub:
+宝塔/aaPanel 不是必需依赖：
+
+- 纯 Ubuntu VPS：[Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md)
+- 宝塔 Node 项目部署：[宝塔部署指南](DEPLOY_BAOTA_UBUNTU.md)
+- 发布前检查：[GitHub 发布检查清单](GITHUB_RELEASE_CHECKLIST.md)
+
+Ubuntu 一键安装示例：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/install_ubuntu.sh -o /tmp/capi-install.sh \
@@ -27,99 +32,111 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
     bash /tmp/capi-install.sh
 ```
 
-The installer auto-installs missing Ubuntu dependencies, generates secrets when passwords are not provided, applies DNS-01 SSL with acme.sh when `AUTO_SSL=1`, enables non-443 HTTPS, and can redirect HTTP to `https://domain:8443`. If you already have DNS-validated SSL files, pass `CERT_FULLCHAIN=/path/fullchain.pem CERT_KEY=/path/privkey.pem` instead.
+安装器会自动安装缺失的 Ubuntu 依赖，并在未提供密码时生成强随机密钥。设置 `AUTO_SSL=1` 后，它会通过 acme.sh DNS-01 签发证书、启用非 443 HTTPS，并可将 HTTP 重定向到 `https://域名:8443`。如果已经有 DNS 验证签发的证书，可传入 `CERT_FULLCHAIN=/path/fullchain.pem CERT_KEY=/path/privkey.pem`。
 
-## What it tracks
+## 采集的事件
 
-The generated Shopify custom pixel subscribes to Shopify Customer Events and sends those events to this hub with stable `event_id` values. The hub then delivers events server-side to Meta CAPI and TikTok Events API through the configured Pixel routes.
+生成的 Shopify 自定义像素订阅 Shopify Customer Events，使用稳定的 `event_id` 将事件发送到本数据中枢。服务端再按照保存的平台路由投递到 Meta CAPI 和 TikTok Events API。
 
-The custom pixel intentionally does not inject the Meta or TikTok browser SDK. Shopify Customer Events run in sandboxed environments where DOM access and script injection are unavailable or unreliable, so browser SDK events should not be treated as the primary tracking path.
-The generated code can include configured Meta/TikTok Pixel IDs as route hints for diagnostics, but the server still chooses delivery destinations from the saved Pixel Routes, not from client-supplied IDs.
+自定义像素不会注入 Meta 或 TikTok 浏览器 SDK。Shopify Customer Events 运行在沙箱环境中，DOM 访问和脚本注入不可用或不可靠，因此浏览器 SDK 不应作为主要采集链路。
 
-Meta standard events:
+生成代码可以携带已配置的 Meta/TikTok Pixel ID 作为诊断提示，但真正的投递目标始终由服务端保存的像素路由决定，客户端传入的 ID 无权选择投递目标。
 
-- `page_viewed` -> `PageView`
-- `product_viewed` -> `ViewContent`
-- `product_added_to_cart` -> `AddToCart`
-- `checkout_started` -> `InitiateCheckout`
-- `payment_info_submitted` -> `AddPaymentInfo`
-- `checkout_completed` -> durable `Purchase` candidate; delivery unlocks only after verified `orders/paid`
-- `search_submitted` -> `Search`
+### Meta 标准事件
 
-Meta custom events:
+- `page_viewed` → `PageView`
+- `product_viewed` → `ViewContent`
+- `product_added_to_cart` → `AddToCart`
+- `checkout_started` → `InitiateCheckout`
+- `payment_info_submitted` → `AddPaymentInfo`
+- `checkout_completed` → 持久化的 `Purchase` 候选；只有验证通过的 `orders/paid` 到达后才允许投递
+- `search_submitted` → `Search`
 
-- `cart_viewed` -> `CartView`
-- `collection_viewed` -> `CollectionView`
-- `product_removed_from_cart` -> `RemoveFromCart`
-- `checkout_contact_info_submitted` -> `CheckoutContactInfoSubmitted`
-- `checkout_address_info_submitted` -> `CheckoutAddressInfoSubmitted`
-- `checkout_shipping_info_submitted` -> `CheckoutShippingInfoSubmitted`
-- `alert_displayed` -> `ShopifyAlertDisplayed`
-- `ui_extension_errored` -> `ShopifyUiExtensionErrored`
+### Meta 自定义事件
 
-TikTok event mapping:
+- `cart_viewed` → `CartView`
+- `collection_viewed` → `CollectionView`
+- `product_removed_from_cart` → `RemoveFromCart`
+- `checkout_contact_info_submitted` → `CheckoutContactInfoSubmitted`
+- `checkout_address_info_submitted` → `CheckoutAddressInfoSubmitted`
+- `checkout_shipping_info_submitted` → `CheckoutShippingInfoSubmitted`
+- `alert_displayed` → `ShopifyAlertDisplayed`
+- `ui_extension_errored` → `ShopifyUiExtensionErrored`
 
-- `PageView` -> `PageView`
-- `ViewContent` -> `ViewContent`
-- `AddToCart` -> `AddToCart`
-- `InitiateCheckout` -> `InitiateCheckout`
-- `AddPaymentInfo` -> `AddPaymentInfo`
-- `Purchase` -> `Purchase` (TikTok's current standard name)
-- `Search` -> `Search`
-- Custom Shopify events keep their generated custom event name.
+### TikTok 事件映射
 
-## Accuracy notes
+- `PageView` → `PageView`
+- `ViewContent` → `ViewContent`
+- `AddToCart` → `AddToCart`
+- `InitiateCheckout` → `InitiateCheckout`
+- `AddPaymentInfo` → `AddPaymentInfo`
+- `Purchase` → `Purchase`（TikTok 当前标准事件名）
+- `Search` → `Search`
+- Shopify 自定义事件保留生成的自定义事件名
 
-- Meta server-side deduplication depends on stable `event_name` and `event_id` values across Shopify Customer Events and order webhooks.
-- TikTok server-side delivery preserves the same `event_id` and uses TikTok's current `Purchase` standard event name.
-- `Purchase` uses a durable alias registry: PostgreSQL transaction locks unify checkout/order/cart identifiers even after Redis restarts. Browser and webhook payloads then merge on the exact `(shop_id, event_name, event_id)` key before delivery; no write-only Redis dedupe shadow can diverge from that authority.
-- `shop_pixel_routes` provides true many-to-many routing: one credential can serve multiple shops and one shop can use multiple pixels. Shared credentials intentionally aggregate those shops in the same external Meta Dataset/TikTok Pixel, while local event, attribution, dedupe, retry, and delivery rows remain separated by authenticated `shop_id`. Client-supplied route hints never select a destination.
-- `event_deliveries` is the durable per-event/per-route ledger. A unique `(event_store_id, route_id)` key, leases, attempt counters, retry timestamps, and terminal success records prevent one shop or failed pixel from overwriting another route. A PostgreSQL trigger rejects any cross-shop event/route pairing even if a future application bug attempts one.
-- Removing a shop from a shared credential marks that route inactive instead of deleting it, preserving historical per-route delivery evidence. Re-adding the shop activates the same route again.
-- Events that arrive before any Pixel is configured stay durably `PENDING`; adding or reactivating a route wakes the shop backlog instead of silently failing it.
-- Ingestion writes the normalized event to PostgreSQL before returning `202`. Redis/BullMQ accelerates dispatch but is no longer the only copy; if Redis is unavailable after the durable write, the watchdog dispatches the PostgreSQL outbox after recovery.
-- Partial platform failures preserve delivery history. When replaying or retrying a partially failed event, routes already marked `SUCCESS` are never claimed again; only pending or retryable route rows are sent.
-- Manual DLQ replay resets only permanently failed active routes. Successful routes remain immutable and inactive routes stay disabled.
-- Shared credentials use a renewable distributed delivery lease plus per-attempt fencing. A stale worker cannot overwrite a newer attempt, and multiple shops cannot intentionally send concurrent batches through the same credential.
-- Meta response headers (`Retry-After`, `X-Business-Use-Case-Usage`, `X-App-Usage`, `X-Ad-Account-Usage`) feed a persistent credential cooldown. High usage slows future dispatch before another 429; an actual 429 pauses every shop sharing that credential.
-- The authenticated pixel ingestion limiter is disabled by default (`PIXEL_RATE_LIMIT_PER_MINUTE=0`) so legitimate traffic spikes are buffered instead of answered with `429 Too Many Requests`. Put abuse controls at the WAF/CDN layer; enabling this setting intentionally re-enables 429 responses.
-- Browser `checkout_completed` persists a durable `AWAITING_PAYMENT` Purchase candidate containing attribution and checkout data. It is not delivered to ad platforms until an HMAC-verified `orders/paid` webhook for the same checkout/order/cart alias confirms payment. This avoids counting unpaid, deferred, failed, or payment-on-delivery checkouts as paid purchases.
-- Shopify test orders are excluded, and paid orders use a positive website-source allowlist. `SHOPIFY_WEB_ORDER_SOURCES=web` is the safe default; explicitly add a verified headless/custom sales-channel source only when that channel belongs to the tracked storefront. Missing, POS, mobile-app, draft-order, and unknown sources are acknowledged without creating a website Purchase. Paid-order payloads with no stable order identity or invalid value/currency are rejected so Shopify retries instead of silently creating an unusable conversion.
-- Confirmed Purchase events retain the short settle window (`PURCHASE_SETTLE_MS`, default 8000ms) so browser and webhook data arriving close together can finish merging before platform delivery.
-- Stale database events still marked `PENDING` are automatically re-queued after `DELIVERY_RESCUE_MINUTES` when an active route is due, recovering from queue metadata loss, old-version residue, or interrupted deployments without spinning on platform cooldowns.
-- Queue jobs carry only `shopId`; workers re-read a bounded PostgreSQL batch with both `shop_id` and `PENDING` predicates. A corrupt or stale queue payload cannot pull another shop's event IDs into the current job.
-- `WORKER_EVENT_BATCH_SIZE` bounds how long a busy shop or shared credential can occupy a worker. Successful batches enqueue continuations until the database backlog is empty, while the rescue cursor rotates across shops so a large store cannot starve smaller stores.
-- Only Purchase uses the advisory-lock alias registry. Other events use the `(shop_id, event_name, event_id)` unique index directly, avoiding unnecessary locks and alias-table growth.
-- Hourly bounded cleanup removes only old terminal events and expired diagnostics. `PENDING` and `AWAITING_PAYMENT` rows are never removed. Scale indexes are built online with `CREATE INDEX CONCURRENTLY`.
-- `/readyz` returns HTTP 200 with `status=degraded` when PostgreSQL is healthy but Redis is temporarily unavailable. Durable ingestion continues and dispatch resumes after Redis recovery.
-- A PostgreSQL-ledger reconciliation pass repairs the narrow crash window where every per-route delivery is terminal but the parent event summary was not updated. It uses a transaction advisory lock and bounded `SKIP LOCKED` batches, so multiple API instances cannot race or scan an unlimited backlog.
-- Duplicate paid webhooks can unlock only an `AWAITING_PAYMENT` Purchase. They cannot resurrect `SUCCESS`, `FAILED`, or `PARTIAL_FAILED` events and cannot cause already successful routes to be resent.
-- Redis cache/producer/lock commands fail promptly during a partition, while a dedicated BullMQ Worker connection continues reconnecting. This prevents HTTP requests from accumulating behind an unbounded Redis offline queue.
-- The generated Shopify pixel serializes local-storage writes and retains in-flight batches until acknowledgment. A page close can cause a safe stable-ID retry, but cannot overwrite the unconfirmed batch with a newer event.
-- `LEGACY_REDIS_DRAIN_ENABLED=false` avoids scanning every shop for obsolete Redis-list queues. Enable it only temporarily when upgrading a deployment that still contains pre-PostgreSQL-outbox list entries.
-- The Shopify pixel uses the Web Pixels `browser.cookie` API to preserve real `_fbp`, `_fbc`, and click IDs without DOM access. It creates `_fbc` only from an actual `fbclid`. Meta `_fbp` and TikTok `_ttp` are forwarded only when their real cookies already exist; the gateway never fabricates either browser identifier.
-- Shopify `checkout_completed` is emitted once per checkout, usually on the thank-you page; upsell flows can emit it earlier, and Shopify documents that it can be missed if the relevant page does not load. The required `orders/paid` webhook is therefore both the payment authority and the server-side fallback.
-- Shopify may return protected customer data as `null` when the app lacks approved protected scopes. The generated pixel tolerates missing email, phone, name and address data.
-- Highest matching quality comes from combining `_fbp`, `_fbc`, browser user agent, server IP, Shopify `clientId`, email, phone, name and address when available.
-- No implementation can guarantee 100% capture because browser blocking, consent, platform privacy rules and checkout surface limitations can suppress events or identifiers. This project maximizes official coverage and adds order webhook fallback for Purchase.
+## 准确性与可靠性说明
 
-## Setup
+- Meta 服务端去重依赖 Shopify Customer Events 和订单 webhook 之间保持一致的 `event_name` 与 `event_id`。
+- 新生成的 `shopify-pixel-v10` 会给所有事件 ID 加入店铺域名命名空间，服务端发送的 `order_id` 也按店铺隔离。多个店铺共用同一个 Meta Dataset 时，即使 Shopify 局部 ID 或订单号相同，也不会在 Dataset 侧互相去重或混淆。旧 Purchase 仍通过原始 checkout/order/cart 别名与新版 ID 汇合，升级不会切断已有付款候选。
+- TikTok 服务端投递保留相同的 `event_id`，并使用当前标准事件名 `Purchase`。
+- `Purchase` 使用持久化别名注册表：PostgreSQL 事务锁统一 checkout、order、cart 标识，即使 Redis 重启也不会丢失关联。浏览器和 webhook 数据在投递前会合并到准确的 `(shop_id, event_name, event_id)`；不存在可能与数据库权威状态分叉的只写 Redis 去重副本。
+- 重复事件在行锁事务内合并：邮箱、电话、姓名、地址和 `external_id` 哈希数组取并集并重新计算 EMQ；付款确认数据优先于未确认浏览器副本，晚到的重复请求不能降低已确认金额、订单号或付款时间。
+- Meta 客户字段按官方规则规范化后才进行 SHA-256：邮箱只做首尾清理与小写化并拒绝内部空白，电话仅保留数字并去掉前导零，姓名保留 UTF-8 字母（例如 `é` 和中文），城市/州移除标点与变音符号，美国邮编只取前 5 位，国家只接受 ISO 两位代码。无效哈希、IP、`fbp`、`fbc` 会在外发前剔除，不会把格式正确但永远无法匹配的数据提交给 Meta。
+- 浏览器采集接口以反向代理确认后的请求 IP 和请求头 User-Agent 为准，JSON 不能伪造并污染稍后合并的付款事件；Shopify webhook 自身的服务器 IP/UA 不会被误当成顾客信号。可用的来源页会作为 `referrer_url` 一并发送。
+- `contents` 是商品快照的权威来源，`content_ids` 会从同一快照重新生成。已付款订单覆盖旧购物车时不会把已移除商品并入 Purchase；`num_items` 仅发送给 `InitiateCheckout`，`search_string` 仅发送给 `Search`。
+- `shop_pixel_routes` 提供真正的多对多路由：一个凭证可服务多个店铺，一个店铺也可使用多个像素。共用凭证的店铺会按配置聚合到同一个外部 Meta Dataset/TikTok Pixel，但本地事件、归因、去重、重试和投递记录始终按认证后的 `shop_id` 隔离。客户端路由提示永远不能选择投递目标。
+- `event_deliveries` 是每个事件、每条路由的持久投递账本。唯一键 `(event_store_id, route_id)`、租约、尝试次数、重试时间和终态成功记录，可防止某个店铺或失败像素覆盖其他路由。即使未来应用代码出现缺陷，PostgreSQL 触发器也会拒绝跨店事件与路由组合。
+- 从共享凭证移除店铺时只会停用对应路由，不会删除历史投递证据；重新添加时会重新激活原路由。
+- 没有配置像素前收到的事件会持久保留为 `PENDING`；新增或重新激活路由后会唤醒该店铺的积压事件，而不是静默丢弃。
+- 接口会先把标准化事件写入 PostgreSQL，再返回 `202`。Redis/BullMQ 只用于加速调度，不再是事件的唯一副本；如果持久写入后 Redis 不可用，Redis 恢复后看门狗会继续派发 PostgreSQL 出箱事件。
+- 平台部分失败时会保留逐路由历史。重放或重试部分失败事件时，标记为 `SUCCESS` 的路由永远不会再次领取，只发送待处理或可重试路由。
+- 手动重放死信先使用同一套事务合并规则吸收载荷，只重置当前启用且永久失败的路由；成功路由保持不可变，停用路由保持停用，未确认付款的 Purchase 也不能通过重放绕过付款门禁。
+- 共享凭证使用可续期的分布式投递租约和逐次尝试隔离。过期 Worker 不能覆盖较新的尝试，共用凭证的多个店铺也不会并发冲击同一个平台凭证。
+- Meta 响应头 `Retry-After`、`X-Business-Use-Case-Usage`、`X-App-Usage`、`X-Ad-Account-Usage` 会形成持久化的凭证冷却。使用率过高时会提前减缓后续发送，收到 429 后会暂停所有共用该凭证的店铺。
+- 认证后的像素采集限流默认关闭（`PIXEL_RATE_LIMIT_PER_MINUTE=0`），合法流量高峰会进入缓冲，不会直接返回 `429 Too Many Requests`。滥用防护应放在 WAF/CDN；启用正数限制表示明确接受采集接口返回 429。
+- 浏览器 `checkout_completed` 会持久保存包含归因与结账数据的 `AWAITING_PAYMENT` Purchase 候选。在相同 checkout/order/cart 别名的 HMAC 验证 `orders/paid` 确认付款前，不会向广告平台发送，避免把未付款、延期付款、付款失败或货到付款订单计为已付款购买。
+- Shopify 测试订单会被排除，已付款订单使用网站来源正向白名单。`SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值；只有确认某个 Headless/自定义销售渠道属于被跟踪网站时，才应加入对应来源。来源缺失、POS、移动 App、草稿订单和未知来源不会创建网站 Purchase。缺少稳定订单标识或金额/币种无效的付款数据会被拒绝，让 Shopify 进行重试，而不是静默创建不可用转化。
+- 已确认 Purchase 保留短暂合并窗口（`PURCHASE_SETTLE_MS`，默认 8000 毫秒），让时间接近的浏览器数据与 webhook 数据在平台投递前完成合并。
+- 仍为 `PENDING` 的过期数据库事件，会在活跃路由到期可发送时按照 `DELIVERY_RESCUE_MINUTES` 自动重新入队，可从队列元数据丢失、旧版本残留或部署中断中恢复，同时避免在平台冷却期间空转。
+- Worker 在竞争共享凭证前会先确认该路由确有到期事件；已成功、永久失败、仍在租约内或尚未到重试时间的路由不会制造锁竞争和空任务。
+- 队列任务只携带 `shopId`；Worker 会使用 `shop_id` 和 `PENDING` 条件重新读取有界 PostgreSQL 批次。损坏或过期的队列负载无法把其他店铺事件拉入当前任务。
+- `WORKER_EVENT_BATCH_SIZE` 限制繁忙店铺或共享凭证单次占用 Worker 的时间。成功批次会持续创建后续任务直至数据库积压清空，救援游标会轮换店铺，避免大店铺饿死小店铺。
+- 只有 Purchase 使用咨询锁别名注册表；其他事件直接使用 `(shop_id, event_name, event_id)` 唯一索引，避免不必要的锁和别名表增长。
+- 每小时的有界清理只删除旧终态事件、超过 `EVENT_RETENTION_DAYS` 仍未付款的候选以及过期诊断数据，永远不会删除等待投递的 `PENDING`。这样既保留付款确认窗口，也不会让永久未付款候选无限占用数据库。规模化索引通过 `CREATE INDEX CONCURRENTLY` 在线创建。
+- PostgreSQL 健康但 Redis 暂时不可用时，`/readyz` 返回 HTTP 200 和 `status=degraded`。持久采集继续工作，Redis 恢复后恢复投递。
+- PostgreSQL 账本协调任务会修复“所有逐路由投递已终结、但父事件汇总尚未更新”这一狭窄崩溃窗口。它使用事务咨询锁和有界 `SKIP LOCKED` 批次，多 API 实例不会竞争或无限扫描积压。
+- 重复付款 webhook 只能解锁 `AWAITING_PAYMENT` Purchase，不能复活 `SUCCESS`、`FAILED` 或 `PARTIAL_FAILED`，也不能重发已成功路由。
+- Redis 缓存、生产者和锁命令在网络分区时快速失败，独立 BullMQ Worker 连接继续重连，防止 HTTP 请求堆积在无限 Redis 离线队列后面。
+- 生成的 Shopify 像素会串行化本地存储写入，并在收到确认前保留发送中的批次。页面关闭最多造成使用相同稳定 ID 的安全重试，不会用新事件覆盖尚未确认的旧事件。
+- 离线队列遇到同一事件的后续完整副本时，会保留最早事件时间并合入更新的客户/商品字段；达到浏览器存储上限时优先保留 Purchase、AddPaymentInfo、InitiateCheckout 和 AddToCart，并优先淘汰较旧 PageView，避免流量峰值先挤掉高价值转化。
+- 同秒调度任务如果碰到 BullMQ 中仍保留的已完成任务 ID，会自动创建唯一后续任务，避免新入库事件等待下一轮救援扫描。
+- `LEGACY_REDIS_DRAIN_ENABLED=false` 可避免为过时的 Redis 列表队列扫描所有店铺。只有升级仍含旧版 Redis 列表数据的部署时才临时启用。
+- Shopify 像素通过 Web Pixels `browser.cookie` API 保存真实 `_fbp`、`_fbc` 和点击 ID，不依赖 DOM。只有存在真实 `fbclid` 时才创建 `_fbc`；Meta `_fbp` 和 TikTok `_ttp` 只有在真实 Cookie 已存在时才转发，网关不会伪造浏览器标识。
+- 归因缓存按店铺和键类型隔离：浏览器/会话键只保存浏览器与点击信号，客户哈希和 checkout/cart 身份只允许进入交易键；顾客 `external_id` 不会被当作跨设备浏览器键，缓存新旧顺序由服务端时间决定。
+- Shopify `checkout_completed` 通常在感谢页对每次结账触发一次；加购后优惠流程可能更早触发，如果相关页面没有加载也可能缺失。因此必需的 `orders/paid` webhook 同时承担付款权威来源和服务端兜底职责。
+- App 未获得受保护客户数据权限时，Shopify 可能把客户字段返回为 `null`。生成像素能容忍缺失的邮箱、电话、姓名和地址。
+- 在权限允许时，组合 `_fbp`、`_fbc`、浏览器 User-Agent、服务端 IP、Shopify `clientId`、邮箱、电话、姓名和地址，可获得更好的事件匹配质量。显式哈希字段必须是有效的 64 位 SHA-256；无国际前缀的本地电话号码只有在 US/CA 且能可靠补齐国家码时才使用，其他无法确定国家码的号码会被省略而不是制造错误匹配。
+- Shopify 明确提供首次订单状态时，会发送 Meta 官方 `customer_segmentation`，区分新客户与老客户；未知状态不会猜测。
+- 如果相同 Meta Dataset 同时由 Shopify Facebook & Instagram、GTM、主题脚本或另一套 CAPI 发送相同事件，必须让浏览器 `eventID` 与本项目的 `event_id`、事件名称完全一致。Meta 官方说明 CAPI→CAPI 重复不会依靠 `fbp`/`external_id` 去重；无法统一 ID 时应停用重复事件源。
+- 浏览器拦截、用户同意、平台隐私规则和结账界面限制都可能抑制事件或标识，因此任何实现都无法诚实保证 100% 采集。本项目尽量覆盖官方事件，并使用订单 webhook 为 Purchase 提供服务端兜底。
 
-1. Install dependencies:
+## 安装与配置
+
+1. 安装依赖：
 
    ```bash
    npm install
    ```
 
-2. Create or update PostgreSQL tables:
+2. 创建或更新 PostgreSQL 数据表：
 
    ```bash
    npm run migrate
    ```
 
-   `npm run migrate` applies the unified schema and then builds scale indexes online. It is safe to run on both a fresh database and an existing database; it does not delete business data.
+   `npm run migrate` 会应用统一数据库结构并在线创建规模化索引。它可安全用于新数据库和已有数据库，不会删除业务数据。
 
-3. Configure `.env`:
+3. 配置 `.env`：
 
    ```env
    PORT=3000
@@ -135,7 +152,7 @@ TikTok event mapping:
    DELIVERY_RETRY_BASE_SECONDS=5
    DELIVERY_RETRY_MAX_SECONDS=900
    DELIVERY_RETRY_AFTER_MAX_SECONDS=86400
-   # 0 keeps transient failures retryable until event-age validation expires them.
+   # 0 表示在事件年龄验证到期前持续重试暂时性失败。
    DELIVERY_MAX_ATTEMPTS=0
    DELIVERY_RESCUE_MINUTES=1
    AGGREGATE_RECONCILE_BATCH_SIZE=5000
@@ -143,7 +160,7 @@ TikTok event mapping:
    CREDENTIAL_BUSY_DELAY_SECONDS=2
    FACEBOOK_ISOLATION_MAX_REQUESTS=16
    PIXEL_RATE_LIMIT_PER_MINUTE=0
-   # Use * only if every storefront may submit events; otherwise list exact origins.
+   # 只有所有店铺来源都允许提交事件时才使用 *，否则填写准确 Origin。
    CORS_ORIGIN=https://shop.example.com,https://www.shop.example.com
    TRUST_PROXY_HOPS=1
    DB_POOL_MAX=20
@@ -166,138 +183,121 @@ TikTok event mapping:
    AES_SECRET_KEY=replace-with-a-long-random-secret
    ADMIN_USERNAME=admin
    ADMIN_PASSWORD=replace-with-a-strong-password
-    ```
+   ```
 
-   `AES_SECRET_KEY` must contain at least 32 characters. `CORS_ORIGIN` accepts
-   `*` or a comma-separated list of exact HTTP(S) origins (no paths or trailing
-   slash). CORS is intentionally enabled only on `/api/pixel-event`; admin APIs
-   stay same-origin. Set `TRUST_PROXY_HOPS=0` when Node is reached directly.
+   `AES_SECRET_KEY` 至少需要 32 个字符。`CORS_ORIGIN` 接受 `*` 或以英文逗号分隔的准确 HTTP(S) Origin，不能包含路径或末尾斜杠。CORS 只对 `/api/pixel-event` 开放，管理接口保持同源。Node 直接接收请求、前面没有反向代理时应设置 `TRUST_PROXY_HOPS=0`。
 
-4. Start API and worker:
+4. 运行自检并启动 API 与 Worker：
 
    ```bash
    npm run doctor
-   ```
-
-   ```bash
    npm start
    npm run worker
    ```
 
-5. Open the admin panel. If you avoid public port `443`, use a custom HTTPS port such as `https://capi.example.com:8443/admin`.
-6. Add Shopify shops, then add one or more platform routes. The route form supports selecting several shops for the same credential:
-   - Facebook / Meta: Pixel or Dataset ID plus System User Access Token.
-   - TikTok: Pixel Code plus Events API Access Token.
-7. Paste the generated code into Shopify Customer events as a custom pixel. Make sure the generated API URL includes the same custom HTTPS port, for example `https://capi.example.com:8443`.
+5. 打开管理后台。避免使用公网 `443` 时，可使用 `https://capi.example.com:8443/admin`。
+6. 添加 Shopify 店铺，再添加一条或多条平台路由。路由表单支持让同一个凭证同时关联多个店铺：
+   - Facebook / Meta：Pixel 或 Dataset ID，以及 System User Access Token。
+   - TikTok：Pixel Code，以及 Events API Access Token。
+7. 把生成代码作为自定义像素粘贴到 Shopify Customer events，确认其中的 API 地址包含相同的公网 HTTPS 端口，例如 `https://capi.example.com:8443`。
 
-## Verification
+## 验证
 
-- Use the Meta test event code in the Pixel route while testing.
-- Confirm Meta server events arrive with the expected `event_id`, URL, user agent, `_fbp` / `_fbc` when available, and customer match fields when Shopify exposes them.
-- Confirm TikTok server events arrive with the expected `event_id`, `_ttp` / `ttclid` when available, value, currency, and contents.
-- Confirm purchase values, currency, content IDs and order ID are populated for `Purchase`.
+- 测试期间可在像素路由中填写 Meta Test Event Code；正式投放前必须清空，因为 Meta 测试事件仍会进入测量流程。
+- 确认 Meta 服务端事件包含预期 `event_id`、页面 URL、User-Agent、可用时的 `_fbp`/`_fbc`，以及 Shopify 允许访问的客户匹配字段。
+- 确认 TikTok 服务端事件包含预期 `event_id`、可用时的 `_ttp`/`ttclid`、金额、币种和商品内容。
+- 确认 `Purchase` 的金额、币种、商品 ID 和订单 ID 正确。
 
-Local code checks:
+本地代码检查：
 
 ```bash
 npm run check
 npm test
-npm audit --audit-level=moderate
+npm audit --omit=dev --audit-level=moderate
 ```
 
-The unit tests cover Shopify order-to-Purchase conversion, TikTok Events API payload mapping, event ID preservation for deduplication, private-field stripping, Meta transient-error classification, `Retry-After`, proactive usage-header cooldowns, stale-attempt fencing, runtime security configuration, and partial-delivery safeguards.
+单元测试覆盖 Shopify 订单到 Purchase 的转换、Meta 官方客户字段规范化、商品快照一致性、无效匹配信号过滤、事件参数预检、生成像素真实转义结果、TikTok Events API 数据映射、去重事件 ID 保留、付款优先合并、跨设备归因隔离、私有字段剥离、Meta 暂时性错误分类、`Retry-After`、使用率响应头主动冷却、过期尝试隔离、运行时安全配置、部分投递保护以及部署升级安全。CI 还会验证生产依赖安装、固定前端资源和 Ubuntu 部署脚本语法。
 
-For failure semantics, operational thresholds, official references, and the
-load/fault-injection checklist, see [RELIABILITY.md](RELIABILITY.md).
+故障语义、运行阈值、官方参考资料和负载/故障注入清单请查看 [可靠性说明](RELIABILITY.md)。
 
-### Upgrading an existing installation
+### 升级已有部署
 
-Stop the API and worker, back up PostgreSQL, pull the new code, and run:
+停止 API 和 Worker，备份 PostgreSQL，拉取新代码后执行：
 
 ```bash
+npm ci --omit=dev
+npm run check
+npm test
 npm run migrate
+npm run doctor
 ```
 
-The migration preserves existing shops, pixels, events, and tokens. Each legacy
-`pixels.shop_id` relationship is copied into `shop_pixel_routes`; the old owner
-column becomes nullable so deleting one shop cannot delete a credential still
-used by another shop. Start the API and worker only after the migration
-completes.
+迁移会保留已有店铺、像素、事件和 Token。旧版 `pixels.shop_id` 关系会复制到 `shop_pixel_routes`，旧所有者字段变为可空，因此删除某个店铺不会删除仍被其他店铺使用的凭证。迁移完成且自检通过后再启动 API 和 Worker。
 
-For horizontal scaling, increase `API_INSTANCES` and `WORKER_INSTANCES`
-gradually. Approximate maximum PostgreSQL connections are
-`(API_INSTANCES + WORKER_INSTANCES) * DB_POOL_MAX`; keep this below the
-database server's reserved capacity. Per-shop leases prevent duplicate drains,
-shared-credential leases serialize calls to the same external Pixel, and
-per-attempt fencing rejects stale results.
+水平扩容时逐步增加 `API_INSTANCES` 和 `WORKER_INSTANCES`。PostgreSQL 最大连接数近似为 `(API_INSTANCES + WORKER_INSTANCES) × DB_POOL_MAX`，必须低于数据库可用连接预算。逐店铺租约防止重复排空，共享凭证租约会串行调用同一个外部像素，逐次尝试隔离会拒绝过期结果。
 
-After upgrading, open the admin panel and copy the newly generated Shopify
-Customer Events code into every connected shop. The generated code contains a
-shop-scoped ingestion token; with `REQUIRE_INGEST_TOKEN=true` (the default),
-events that merely spoof another `shop_domain` are rejected before routing.
+升级后打开管理后台，把最新生成的 Shopify Customer Events 代码（当前 `shopify-pixel-v10`）复制到每个已连接店铺。v10 增加店铺级事件 ID 命名空间、离线重复事件富化合并和高价值事件存储优先级，并保留 v9 的 Unicode 姓名、电话、国家和邮编规范化修复；旧代码不会自动更新。生成代码包含店铺级采集 Token；默认 `REQUIRE_INGEST_TOKEN=true` 时，仅伪造其他 `shop_domain` 的事件会在路由前被拒绝。
 
-## Usage Tutorial
+## 使用教程
 
-1. Upload the project to GitHub and confirm CI passes.
-2. Run the one-command Ubuntu installer from [DEPLOY_UBUNTU_ONECLICK.md](DEPLOY_UBUNTU_ONECLICK.md).
-3. Open the admin panel at `https://your-domain:8443/admin`.
-4. Add your Shopify shop using the `myshopify.com` domain and webhook secret.
-5. Add a Facebook / Meta route:
-   - Platform: `Facebook / Meta`
-   - Pixel / Dataset ID
-   - System User Access Token
-   - Optional Meta Dataset Quality API token for official EMQ snapshots
-   - Optional Meta Test Event Code
-6. Optional: add TikTok route:
-   - Platform: `TikTok`
-   - TikTok Pixel Code
-   - Events API Access Token
-   - Optional test event code
-7. Go to "追踪代码", select or enter the shop domain, and confirm the API origin is your public HTTPS origin such as `https://your-domain:8443`.
-8. Copy the generated code into Shopify Admin -> Settings -> Customer events -> Add custom pixel.
-9. Configure the required Shopify `orders/paid` webhook to:
+1. 将项目上传到 GitHub，并确认 CI 通过。
+2. 按 [Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md) 或 [宝塔部署指南](DEPLOY_BAOTA_UBUNTU.md) 部署。
+3. 打开 `https://你的域名:8443/admin`。
+4. 使用 `myshopify.com` 域名和 webhook secret 添加 Shopify 店铺。
+5. 添加 Facebook / Meta 路由：
+   - 平台：`Facebook / Meta`
+   - 像素/数据集 ID
+   - 系统用户访问令牌
+   - 可选：具备 Dataset Quality API 权限的 Token，用于官方 EMQ 快照
+   - 可选：Meta Test Event Code
+6. 可选添加 TikTok 路由：
+   - 平台：`TikTok`
+   - TikTok 像素代码
+   - Events API 访问令牌
+   - 可选测试事件代码
+7. 进入“追踪代码”，选择或输入店铺域名，确认 API Origin 是 `https://你的域名:8443` 之类的公网 HTTPS 地址。
+8. 将生成代码复制到 Shopify 后台：`Settings → Customer events → Add custom pixel`。
+9. 配置必需的 Shopify `orders/paid` webhook：
 
    ```text
-    https://your-domain:8443/api/webhook/orders/paid
-    ```
+   https://你的域名:8443/api/webhook/orders/paid
+   ```
 
-   Purchase delivery intentionally remains `AWAITING_PAYMENT` until this
-   webhook arrives. Shopify retries failed webhook deliveries, while the
-   browser candidate preserves attribution and checkout identifiers for the
-   later merge.
+   在该 webhook 到达前，Purchase 会保持 `AWAITING_PAYMENT`。Shopify 会重试失败的 webhook 投递，浏览器候选会保存归因和 checkout 标识，供后续合并。
 
-10. Test in Meta Events Manager:
-    - Server events appear from the configured Pixel route.
-    - `event_id` is stable across checkout and webhook enrichment.
-    - `Purchase` includes value, currency, contents, content_ids, and order_id.
-    - EMQ improves as email, phone, fbp, fbc, IP, user-agent, and address become available.
-11. Watch the admin "日志与死信" page:
-    - Low EMQ usually means missing email/phone/fbp/fbc/address.
-    - Meta official dataset quality appears when a Dataset Quality API-capable token is configured; this cached official snapshot can lag behind live events.
-    - DLQ means token, permission, rate limit, or platform API issues need action.
-   
-    - shopify权限
-    - | 你列的权限 | 建议 | 原因 |
+10. 在 Meta Events Manager 中验证：
+    - 服务端事件来自正确的平台路由。
+    - checkout 与 webhook 丰富数据使用稳定一致的 `event_id`。
+    - `Purchase` 包含金额、币种、`contents`、`content_ids` 和 `order_id`。
+    - 随着邮箱、电话、fbp、fbc、IP、User-Agent 和地址可用，EMQ 相应改善。
+11. 查看后台“日志与死信”：
+    - EMQ 较低通常表示缺少邮箱、电话、fbp、fbc 或地址。
+    - 配置具备 Dataset Quality API 权限的 Token 后会显示 Meta 官方数据集质量；缓存快照可能晚于实时事件。
+    - 出现 DLQ 表示 Token、权限、限流或平台 API 问题需要处理。
+
+## Shopify 权限建议
+
+| 权限 | 建议 | 原因 |
 |---|---|---|
-| `read_orders` | 需要 | 读取订单金额、币种、商品、客户信息，用于 `Purchase` 和 webhook |
-| `write_orders` | 不需要 | 项目不创建/修改订单 |
-| `read_assigned_fulfillment_orders` | 不需要 | 项目不处理履约/发货 |
-| `write_assigned_fulfillment_orders` | 不需要 | 项目不创建/修改履约单 |
-| `read_checkouts` | 不需要 | 加购、发起结账由 Shopify Customer Events Pixel 捕获，不靠 Admin API 读取 |
-| `write_checkouts` | 不需要 | 项目不创建/修改 checkout |
+| `read_orders` | 需要 | 读取订单金额、币种、商品和客户信息，用于 `Purchase` 与 webhook |
+| `write_orders` | 不需要 | 项目不创建或修改订单 |
+| `read_assigned_fulfillment_orders` | 不需要 | 项目不处理履约或发货 |
+| `write_assigned_fulfillment_orders` | 不需要 | 项目不创建或修改履约单 |
+| `read_checkouts` | 不需要 | 加购和发起结账由 Shopify Customer Events Pixel 捕获，不依赖 Admin API |
+| `write_checkouts` | 不需要 | 项目不创建或修改 checkout |
 | `read_draft_orders` | 不需要 | 项目不读取草稿订单 |
-| `write_draft_orders` | 不需要 | 项目不创建/修改草稿订单 |
-| `read_customers` | 可选 | 若 Shopify 要求客户数据权限，可开启；有助于客户匹配数据完整性 |
-| `write_customers` | 不需要 | 项目不创建/修改客户 |
-| `read_products` | 不需要 | Pixel/webhook 已带商品 ID，项目不需要额外读商品 |
-| `write_products` | 不需要 | 项目不创建/修改商品 |
+| `write_draft_orders` | 不需要 | 项目不创建或修改草稿订单 |
+| `read_customers` | 可选 | Shopify 要求客户数据权限时可开启，有助于提高匹配数据完整性 |
+| `write_customers` | 不需要 | 项目不创建或修改客户 |
+| `read_products` | 不需要 | Pixel/webhook 已携带商品 ID，无需额外读取商品 |
+| `write_products` | 不需要 | 项目不创建或修改商品 |
 | `read_merchant_managed_fulfillment_orders` | 不需要 | 项目不处理商家履约订单 |
-| `write_merchant_managed_fulfillment_orders` | 不需要 | 项目不创建/修改履约订单 |
-| `read_price_rules` | 不需要 | 项目不读取 Shopify 价格规则；订单事件里已有实际成交金额 |
-| `write_price_rules` | 不需要 | 项目不创建/修改价格规则 |
-| `read_discounts` | 不需要 | 项目不读取折扣规则；订单 webhook 会包含最终成交信息 |
-| `write_discounts` | 不需要 | 项目不创建/修改折扣 |
-| `read_markets` | 不需要 | 项目不上 Shopify 查询市场/汇率配置 |
-| `read_locations` | 不需要 | 项目不根据库存地点或门店位置处理归因 |
+| `write_merchant_managed_fulfillment_orders` | 不需要 | 项目不创建或修改履约订单 |
+| `read_price_rules` | 不需要 | 项目不读取 Shopify 价格规则，订单事件已包含实际成交金额 |
+| `write_price_rules` | 不需要 | 项目不创建或修改价格规则 |
+| `read_discounts` | 不需要 | 项目不读取折扣规则，订单 webhook 包含最终成交信息 |
+| `write_discounts` | 不需要 | 项目不创建或修改折扣 |
+| `read_markets` | 不需要 | 项目不查询 Shopify 市场或汇率配置 |
+| `read_locations` | 不需要 | 项目不根据库存地点或门店位置进行归因 |
 | `read_online_store_navigation` | 不需要 | 项目不读取网站导航 |
 | `read_online_store_pages` | 不需要 | 项目不读取页面内容 |

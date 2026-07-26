@@ -96,6 +96,9 @@
                         <code class="bg-white border rounded-md px-3 py-2 text-xs break-all">Webhook · {{ apiDomain }}/api/webhook/orders/paid</code>
                     </div>
                 </div>
+                <div class="border border-amber-300 bg-amber-50 text-amber-900 rounded-md p-3 text-sm">
+                    同一 Meta Dataset 如果还由 Shopify Facebook &amp; Instagram、GTM、主题脚本或其他 CAPI 应用发送相同事件，只有两边的事件名称和 eventID 完全一致时 Meta 才能浏览器/服务端去重。无法统一 ID 时应停用重复事件源，否则可能重复计数。
+                </div>
                 <textarea readonly :value="generatedCode" aria-label="Shopify 跟踪代码" class="code-editor w-full h-[620px] p-5 font-mono text-xs leading-5"></textarea>
             </section>
 
@@ -193,6 +196,7 @@
                         <label class="block">
                             <span class="text-sm font-medium">测试事件代码（可选）</span>
                             <input v-model.trim="newPixel.test_event_code" placeholder="Meta Test Event Code" class="mt-1 w-full border rounded-md p-2 font-mono">
+                            <span class="mt-1 block text-xs text-amber-700">仅用于短期联调；正式投放前必须清空。Meta 测试事件仍会进入测量流程。</span>
                         </label>
                         <button @click="addPixel" :disabled="busy.addPixel" class="primary-btn px-5 py-2 md:col-span-2">{{ busy.addPixel ? '保存中…' : '保存 Pixel 路由' }}</button>
                     </div>
@@ -484,7 +488,7 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 const META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v8";
+const SOURCE_VERSION = "shopify-pixel-v10";
 const RECENT_EVENT_TTL_MS = 5000;
 const MAX_RECENT_EVENTS = 5000;
 const EVENT_QUEUE_FLUSH_MS = 1000;
@@ -575,6 +579,14 @@ function normalizeShopifyId(value) {
     return text.slice(marker.length).split('/').pop() || undefined;
 }
 
+function shopScopedIdentifier(value) {
+    var normalized = normalizeShopifyId(value);
+    if (!normalized) return undefined;
+    var prefix = String(SHOP_DOMAIN || '').trim().toLowerCase() + ':';
+    var text = String(normalized).trim();
+    return text.toLowerCase().indexOf(prefix) === 0 ? prefix + text.slice(prefix.length) : prefix + text;
+}
+
 function lineItemToContent(item) {
     item = item || {};
     var variant = item.variant || item.merchandise || {};
@@ -600,17 +612,47 @@ function compact(object) {
     return output;
 }
 
-function normalizeForHash(value, type) {
+function normalizeForHash(value, type, contextCountry) {
     if (value === undefined || value === null) return undefined;
     var normalized = String(value).trim().toLowerCase();
     if (!normalized) return undefined;
-    if (type === 'phone') {
-        normalized = normalized.replace(/[^0-9]/g, '');
-    } else if (type === 'name' || type === 'city' || type === 'state' || type === 'zip' || type === 'country') {
+    if (type === 'email') {
+        if (/\\s/.test(normalized)) return undefined;
+    } else if (type === 'phone') {
+        var rawPhone = String(value).trim();
+        var hasInternationalPrefix = /^\\+|^00/.test(rawPhone);
+        normalized = rawPhone.replace(/[^0-9]/g, '').replace(/^0+/, '');
+        var phoneCountry = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+        if (!hasInternationalPrefix) {
+            if (phoneCountry === 'us' || phoneCountry === 'usa' || phoneCountry === 'unitedstates'
+                || phoneCountry === 'unitedstatesofamerica' || phoneCountry === 'ca' || phoneCountry === 'canada') {
+                if (/^\\d{10}$/.test(normalized)) normalized = '1' + normalized;
+                else if (!/^1\\d{10}$/.test(normalized)) normalized = '';
+            } else {
+                normalized = '';
+            }
+        }
+    } else if (type === 'name') {
+        normalized = normalized.replace(/[^\\p{L}\\p{N}]/gu, '');
+    } else if (type === 'city' || type === 'state') {
         try {
             normalized = normalized.normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '');
         } catch (error) {}
-        normalized = normalized.replace(/\\s+/g, '');
+        normalized = normalized.replace(/[^\\p{L}\\p{N}]/gu, '');
+        if (type === 'state') {
+            var stateCountry = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+            if ((stateCountry === 'us' || stateCountry === 'usa' || stateCountry === 'unitedstates' || stateCountry === 'unitedstatesofamerica')
+                && !/^[a-z]{2}$/.test(normalized)) normalized = '';
+        }
+    } else if (type === 'zip') {
+        normalized = normalized.replace(/[^a-z0-9]/g, '');
+        var country = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+        if (country === 'us' || country === 'usa' || country === 'unitedstates' || country === 'unitedstatesofamerica') {
+            var usZip = normalized.match(/^\\d{5}/);
+            normalized = usZip ? usZip[0] : '';
+        }
+    } else if (type === 'country') {
+        normalized = /^[a-z]{2}$/.test(normalized) ? normalized : '';
     } else {
         normalized = normalized.replace(/\\s+/g, '');
     }
@@ -627,8 +669,8 @@ function toHex(buffer) {
     }).join('');
 }
 
-async function sha256Hex(value, type) {
-    var normalized = normalizeForHash(value, type);
+async function sha256Hex(value, type, contextCountry) {
+    var normalized = normalizeForHash(value, type, contextCountry);
     if (!normalized) return undefined;
     if (isSha256Hex(normalized)) return normalized;
     try {
@@ -818,21 +860,66 @@ function scheduleEventQueueFlush(delayMs) {
 
 function mergeQueuedEvents(events) {
     var merged = [];
-    var seen = new Set();
+    var indexes = new Map();
     events.forEach(function (event) {
         var key = [event.event_name, event.event_id].join(':');
-        if (seen.has(key)) return;
-        seen.add(key);
-        merged.push(event);
+        if (!indexes.has(key)) {
+            indexes.set(key, merged.length);
+            merged.push(event);
+            return;
+        }
+        var index = indexes.get(key);
+        var existing = merged[index];
+        var combined = Object.assign({}, existing, event);
+        var firstQueuedAt = [existing._client_first_queued_at, event._client_first_queued_at]
+            .map(Number).filter(Number.isFinite);
+        var retryCount = Math.max(Number(existing._client_retry_count || 0), Number(event._client_retry_count || 0));
+        var nextAttemptAt = [existing._client_next_attempt_at, event._client_next_attempt_at]
+            .map(Number).filter(function (value) { return Number.isFinite(value) && value > 0; });
+        var existingTime = Date.parse(String(existing.timestamp || ''));
+        var eventTime = Date.parse(String(event.timestamp || ''));
+        combined._client_first_queued_at = firstQueuedAt.length ? Math.min.apply(Math, firstQueuedAt) : Date.now();
+        combined._client_retry_count = retryCount || undefined;
+        combined._client_next_attempt_at = nextAttemptAt.length ? Math.min.apply(Math, nextAttemptAt) : undefined;
+        combined.timestamp = Number.isFinite(existingTime) && Number.isFinite(eventTime)
+            ? (existingTime <= eventTime ? existing.timestamp : event.timestamp)
+            : firstNonEmpty(existing.timestamp, event.timestamp);
+        merged[index] = compact(combined);
     });
     return merged;
+}
+
+function storedEventPriority(event) {
+    var priorities = {
+        Purchase: 100,
+        AddPaymentInfo: 90,
+        InitiateCheckout: 80,
+        AddToCart: 70,
+        CheckoutShippingInfoSubmitted: 60,
+        CheckoutAddressInfoSubmitted: 60,
+        CheckoutContactInfoSubmitted: 60,
+    };
+    return priorities[event && event.event_name] || 10;
+}
+
+function boundStoredEvents(events) {
+    var merged = mergeQueuedEvents(events);
+    if (merged.length <= MAX_STORED_EVENTS) return merged;
+    return merged.map(function (event, index) {
+        return { event: event, index: index, priority: storedEventPriority(event) };
+    }).sort(function (left, right) {
+        if (right.priority !== left.priority) return right.priority - left.priority;
+        return right.index - left.index;
+    }).slice(0, MAX_STORED_EVENTS).sort(function (left, right) {
+        return left.index - right.index;
+    }).map(function (item) { return item.event; });
 }
 
 function persistEventQueue() {
     // Keep unconfirmed in-flight requests in durable browser storage. If the
     // page closes after the server accepted them, stable event IDs make the
     // replay harmless; dropping them before acceptance would be irreversible.
-    var storable = mergeQueuedEvents(inFlightEvents.concat(eventQueue)).slice(0, MAX_STORED_EVENTS);
+    var storable = boundStoredEvents(inFlightEvents.concat(eventQueue));
     storageWriteChain = storageWriteChain.then(function () {
         if (!storable.length) return removeStorageValue(STORAGE_QUEUE_KEY);
         return setStorageValue(STORAGE_QUEUE_KEY, JSON.stringify(storable));
@@ -849,7 +936,7 @@ async function loadPersistedEventQueue() {
     try {
         var parsed = JSON.parse(stored);
         if (Array.isArray(parsed) && parsed.length) {
-            var merged = mergeQueuedEvents(parsed.concat(eventQueue)).slice(-MAX_STORED_EVENTS);
+            var merged = boundStoredEvents(parsed.concat(eventQueue));
             eventQueue.splice(0, eventQueue.length);
             Array.prototype.push.apply(eventQueue, merged);
         }
@@ -1054,7 +1141,9 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
     var shippingAddress = checkout.shippingAddress || {};
     var address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
     var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer || fallbackDocumentInfo.URL || fallbackDocumentInfo.referrer;
-    var eventId = String(eventIdFrom(forcedEventId) || event.id || await fallbackEventId(metaEventName, event, currentUrl));
+    var eventId = String(shopScopedIdentifier(
+        eventIdFrom(forcedEventId) || event.id || await fallbackEventId(metaEventName, event, currentUrl)
+    ));
     if (!shouldSendRecentEvent(metaEventName, eventId)) return;
 
     var fbp = await getFbp();
@@ -1076,14 +1165,19 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
     var rawState = address.provinceCode || address.province;
     var rawZip = address.zip;
     var rawCountry = address.countryCode || address.country;
+    var orderCustomer = checkout.order && checkout.order.customer || {};
+    var isFirstOrder = firstNonEmpty(orderCustomer.isFirstOrder, customer && customer.isFirstOrder);
+    var customerSegmentation = isFirstOrder === true
+        ? 'new_customer_to_business'
+        : (isFirstOrder === false ? 'existing_customer_to_business' : undefined);
     var hashedFields = await Promise.all([
         sha256Hex(rawEmail, 'email'),
-        sha256Hex(rawPhone, 'phone'),
+        sha256Hex(rawPhone, 'phone', rawCountry),
         sha256Hex(rawFirstName, 'name'),
         sha256Hex(rawLastName, 'name'),
         sha256Hex(rawCity, 'city'),
-        sha256Hex(rawState, 'state'),
-        sha256Hex(rawZip, 'zip'),
+        sha256Hex(rawState, 'state', rawCountry),
+        sha256Hex(rawZip, 'zip', rawCountry),
         sha256Hex(rawCountry, 'country'),
     ]);
     var traceId = randomId('trace');
@@ -1100,6 +1194,7 @@ async function sendGatewayEvent(metaEventName, event, customData, forcedEventId)
             event_name: metaEventName,
             event_id: eventId,
             action_source: 'website',
+            customer_segmentation: customerSegmentation,
             timestamp: event.timestamp,
             url: currentUrl,
             event_source_url: currentUrl,
