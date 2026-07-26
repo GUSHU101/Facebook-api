@@ -110,6 +110,7 @@ SHOPIFY_API_VERSION=2026-07
 SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
 SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
 SHOPIFY_RECONCILE_MAX_ORDERS=1000
+SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES=100
 
 # Shopify Customer Events 运行在沙箱中，建议采集接口保持 *；管理接口不启用 CORS。
 CORS_ORIGIN=*
@@ -172,7 +173,7 @@ curl -fsS http://127.0.0.1:3000/healthz
 curl -fsS http://127.0.0.1:3000/readyz
 ```
 
-`/readyz` 在 PostgreSQL 可写但 Redis 暂时异常时会返回 `status=degraded`；事件仍持久化到 PostgreSQL，Redis 恢复后自动继续派发。
+`/readyz` 只有在 PostgreSQL 与 Redis 均可用时才返回 HTTP 200。Redis 暂时异常时返回 HTTP 503 和 `status=degraded`，因此宝塔或负载均衡器应把 `/readyz` 用作就绪探针、把始终反映进程存活的 `/healthz` 用作存活探针；已经到达 API 的事件仍会优先持久化到 PostgreSQL，Redis 恢复后自动继续派发。
 
 ## 7. 配置宝塔 Nginx 和非 443 HTTPS
 

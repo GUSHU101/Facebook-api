@@ -243,7 +243,7 @@ sudo -u capi-saas env HOME=/var/lib/capi-saas npm --prefix /www/wwwroot/capi-saa
 ```
 
 - 后台无法访问：检查域名、证书、安全组、自定义 HTTPS 端口和 Nginx 错误日志。
-- `/readyz` 失败：优先检查 PostgreSQL；Redis 异常通常显示 `degraded`，不会阻止持久写入。
+- `/readyz` 失败：同时检查 PostgreSQL 与 Redis。Redis 异常时会返回 HTTP 503 和 `degraded`，表示持久写入能力仍可能存在、但即时队列派发尚未完全就绪；`/healthz` 用于单独确认进程存活。
 - 事件积压：检查 Worker、Redis noeviction、平台限流冷却、数据库连接和最旧到期事件。
 - Purchase 缺失：检查 `orders/paid` webhook、HMAC secret、付款状态和 `SHOPIFY_WEB_ORDER_SOURCES`。
 - 重复或串店疑虑：运行 `npm run doctor` 并查看后台投递完整性；数据库触发器会拒绝跨店事件/路由组合。

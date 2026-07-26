@@ -122,10 +122,24 @@ function classifyFacebookError(error) {
     const fbError = error?.response?.data?.error;
     const code = Number(fbError?.code);
     const status = Number(error?.response?.status);
-    const permanentCodes = new Set([102, 190, 463, 467, 2500]);
+    // These errors describe the credential, permission, object/dataset, or
+    // request itself. Splitting an event batch cannot repair them and only
+    // multiplies calls against the same constrained Meta credential.
+    const requestLevelPermanentCodes = new Set([10, 102, 190, 200, 463, 467, 803, 2500]);
     const retryableCodes = new Set([1, 2, 4, 17, 32, 613, 80004]);
     const rateControl = metaRateControlFromHeaders(error?.response?.headers);
     const message = fbError?.message || error?.message || 'Meta request failed';
+    const requestLevel = [401, 403].includes(status) || requestLevelPermanentCodes.has(code);
+    const blameFieldSpecs = fbError?.error_data?.blame_field_specs;
+    const hasIndexedEventBlame = Array.isArray(blameFieldSpecs)
+        && blameFieldSpecs.some(spec => {
+            const path = Array.isArray(spec) ? spec.map(String) : String(spec || '').split(/[.\[\]]+/);
+            return path[0] === 'data' && path.slice(1).some(part => /^\d+$/.test(part));
+        });
+    const eventIsolationSafe = status === 400
+        && code === 100
+        && !requestLevel
+        && hasIndexedEventBlame;
 
     if (error?.retryable === true) {
         return {
@@ -134,9 +148,20 @@ function classifyFacebookError(error) {
             message,
             retryAfterSeconds: error.retryAfterSeconds || rateControl.retryAfterSeconds,
             rateControl,
+            scope: 'transient',
+            eventIsolationSafe: false,
         };
     }
-    if (permanentCodes.has(code)) return { retryable: false, code, message, rateControl };
+    if (requestLevel) {
+        return {
+            retryable: false,
+            code: Number.isFinite(code) ? code : status,
+            message,
+            rateControl,
+            scope: 'request',
+            eventIsolationSafe: false,
+        };
+    }
     if (
         fbError?.is_transient === true
         || retryableCodes.has(code)
@@ -150,6 +175,8 @@ function classifyFacebookError(error) {
             message,
             retryAfterSeconds: rateControl.retryAfterSeconds,
             rateControl,
+            scope: 'transient',
+            eventIsolationSafe: false,
         };
     }
 
@@ -158,7 +185,18 @@ function classifyFacebookError(error) {
         code: Number.isFinite(code) ? code : (Number.isFinite(status) ? status : undefined),
         message,
         rateControl,
+        scope: eventIsolationSafe ? 'event' : 'request',
+        // Meta code 100 with HTTP 400 is eligible only when Meta identifies a
+        // concrete data[index] path. Generic code 100 responses and all other
+        // unknown permanent errors fail closed to prevent request fan-out.
+        eventIsolationSafe,
     };
+}
+
+function shouldIsolateFacebookError(classification) {
+    return classification?.retryable === false
+        && classification?.scope === 'event'
+        && classification?.eventIsolationSafe === true;
 }
 
 function classifyTikTokError(error) {
@@ -191,4 +229,5 @@ module.exports = {
     metaRateControlFromHeaders,
     parseRetryAfterSeconds,
     retryDelayWithJitterSeconds,
+    shouldIsolateFacebookError,
 };

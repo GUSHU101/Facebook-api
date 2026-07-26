@@ -146,6 +146,7 @@ module.exports = {
     shopifyReconcileCron: process.env.SHOPIFY_RECONCILE_CRON || '23 */15 * * * *',
     shopifyReconcileLookbackHours: readBoundedInt('SHOPIFY_RECONCILE_LOOKBACK_HOURS', 48, 24 * 30),
     shopifyReconcileMaxOrders: readBoundedInt('SHOPIFY_RECONCILE_MAX_ORDERS', 1000, 10000),
+    shopifyReconcileMaxLineItemPages: readBoundedInt('SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES', 100, 1000),
     fbApiVersion: readFacebookApiVersion(),
     corsOrigin: readCorsOrigin(),
     jsonLimit: readJsonLimit(),

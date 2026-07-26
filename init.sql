@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS pixels (
     last_usage_pct NUMERIC(5,2),
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     last_delivery_at TIMESTAMPTZ,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    archived_at TIMESTAMPTZ,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -37,7 +39,7 @@ CREATE TABLE IF NOT EXISTS pixels (
 CREATE TABLE IF NOT EXISTS shop_pixel_routes (
     id BIGSERIAL PRIMARY KEY,
     shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
-    pixel_id INTEGER NOT NULL REFERENCES pixels(id) ON DELETE CASCADE,
+    pixel_id INTEGER NOT NULL REFERENCES pixels(id) ON DELETE RESTRICT,
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (shop_id, pixel_id)
@@ -52,7 +54,8 @@ CREATE TABLE IF NOT EXISTS event_store (
     status VARCHAR(30) DEFAULT 'PENDING',
     emq_estimate NUMERIC(3,1),
     request_payload JSONB NOT NULL,
-    fb_response JSONB
+    fb_response JSONB,
+    delivery_route_snapshot BIGINT[]
 );
 
 -- Shopify must receive a prompt response. The verified request is committed
@@ -133,7 +136,7 @@ CREATE TABLE IF NOT EXISTS event_id_aliases (
 CREATE TABLE IF NOT EXISTS event_deliveries (
     id BIGSERIAL PRIMARY KEY,
     event_store_id BIGINT NOT NULL REFERENCES event_store(id) ON DELETE CASCADE,
-    route_id BIGINT NOT NULL REFERENCES shop_pixel_routes(id) ON DELETE CASCADE,
+    route_id BIGINT NOT NULL REFERENCES shop_pixel_routes(id) ON DELETE RESTRICT,
     status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -201,7 +204,7 @@ CREATE TABLE IF NOT EXISTS dead_letters (
 
 CREATE TABLE IF NOT EXISTS meta_quality_snapshots (
     id BIGSERIAL PRIMARY KEY,
-    pixel_route_id INTEGER REFERENCES pixels(id) ON DELETE CASCADE,
+    pixel_route_id INTEGER REFERENCES pixels(id) ON DELETE RESTRICT,
     shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE,
     dataset_id VARCHAR(64) NOT NULL,
     fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -237,6 +240,8 @@ ALTER TABLE pixels
     ADD COLUMN IF NOT EXISTS last_usage_pct NUMERIC(5,2),
     ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS last_delivery_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active',
+    ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
 ALTER TABLE pixels
@@ -274,6 +279,68 @@ WHERE platform IS NULL OR platform = '';
 ALTER TABLE pixels
     ALTER COLUMN platform SET DEFAULT 'facebook';
 
+UPDATE pixels
+SET status = 'active'
+WHERE status IS NULL OR status = '';
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.shop_pixel_routes'::regclass
+          AND conname = 'shop_pixel_routes_pixel_id_fkey'
+          AND pg_get_constraintdef(oid) NOT LIKE '%ON DELETE RESTRICT%'
+    ) THEN
+        ALTER TABLE shop_pixel_routes DROP CONSTRAINT shop_pixel_routes_pixel_id_fkey;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.shop_pixel_routes'::regclass
+          AND conname = 'shop_pixel_routes_pixel_id_fkey'
+    ) THEN
+        ALTER TABLE shop_pixel_routes
+            ADD CONSTRAINT shop_pixel_routes_pixel_id_fkey
+            FOREIGN KEY (pixel_id) REFERENCES pixels(id) ON DELETE RESTRICT;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.event_deliveries'::regclass
+          AND conname = 'event_deliveries_route_id_fkey'
+          AND pg_get_constraintdef(oid) NOT LIKE '%ON DELETE RESTRICT%'
+    ) THEN
+        ALTER TABLE event_deliveries DROP CONSTRAINT event_deliveries_route_id_fkey;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.event_deliveries'::regclass
+          AND conname = 'event_deliveries_route_id_fkey'
+    ) THEN
+        ALTER TABLE event_deliveries
+            ADD CONSTRAINT event_deliveries_route_id_fkey
+            FOREIGN KEY (route_id) REFERENCES shop_pixel_routes(id) ON DELETE RESTRICT;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.meta_quality_snapshots'::regclass
+          AND conname = 'meta_quality_snapshots_pixel_route_id_fkey'
+          AND pg_get_constraintdef(oid) NOT LIKE '%ON DELETE RESTRICT%'
+    ) THEN
+        ALTER TABLE meta_quality_snapshots DROP CONSTRAINT meta_quality_snapshots_pixel_route_id_fkey;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.meta_quality_snapshots'::regclass
+          AND conname = 'meta_quality_snapshots_pixel_route_id_fkey'
+    ) THEN
+        ALTER TABLE meta_quality_snapshots
+            ADD CONSTRAINT meta_quality_snapshots_pixel_route_id_fkey
+            FOREIGN KEY (pixel_route_id) REFERENCES pixels(id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;
+
 INSERT INTO shop_pixel_routes (shop_id, pixel_id)
 SELECT p.shop_id, p.id
 FROM pixels p
@@ -285,7 +352,26 @@ ALTER TABLE event_store
     ADD COLUMN IF NOT EXISTS status VARCHAR(30) DEFAULT 'PENDING',
     ADD COLUMN IF NOT EXISTS emq_estimate NUMERIC(3,1),
     ADD COLUMN IF NOT EXISTS request_payload JSONB,
-    ADD COLUMN IF NOT EXISTS fb_response JSONB;
+    ADD COLUMN IF NOT EXISTS fb_response JSONB,
+    ADD COLUMN IF NOT EXISTS delivery_route_snapshot BIGINT[];
+
+-- Freeze the exact route set that each already-started event must complete.
+-- Pending events without a ledger intentionally remain NULL so the worker can
+-- capture the first non-empty active route set atomically.
+UPDATE event_store event
+SET delivery_route_snapshot = ledger.route_ids
+FROM (
+    SELECT event_store_id, ARRAY_AGG(route_id ORDER BY route_id)::bigint[] AS route_ids
+    FROM event_deliveries
+    GROUP BY event_store_id
+) ledger
+WHERE event.id = ledger.event_store_id
+  AND event.delivery_route_snapshot IS NULL;
+
+UPDATE event_store
+SET delivery_route_snapshot = ARRAY[]::bigint[]
+WHERE delivery_route_snapshot IS NULL
+  AND status <> 'PENDING';
 
 ALTER TABLE event_store
     ALTER COLUMN status SET DEFAULT 'PENDING';
@@ -360,6 +446,9 @@ CREATE INDEX IF NOT EXISTS idx_shops_status
 
 CREATE INDEX IF NOT EXISTS idx_pixels_shop_id
     ON pixels(shop_id);
+
+CREATE INDEX IF NOT EXISTS idx_pixels_status
+    ON pixels(status, id);
 
 CREATE INDEX IF NOT EXISTS idx_pixels_rate_limit_until
     ON pixels(rate_limit_until)

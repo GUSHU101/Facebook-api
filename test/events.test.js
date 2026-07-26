@@ -36,6 +36,7 @@ const { mergePersistedEventPayload } = require('../src/events/merge');
 const { eventHasSuccessfulDelivery, shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
 const { aggregateDeliveryStatus, retryDelaySeconds } = require('../src/platforms/delivery-state');
 const {
+    isolateMetaBatch,
     normalizeMetaCookie,
     prepareMetaEvent,
     sanitizeMetaCustomData,
@@ -47,10 +48,12 @@ const {
     metaRateControlFromHeaders,
     parseRetryAfterSeconds,
     retryDelayWithJitterSeconds,
+    shouldIsolateFacebookError,
 } = require('../src/platforms/rate-control');
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
 const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
+const { consumeWeightedWindow } = require('../src/utils/weighted-rate-limit');
 const {
     boundedScalarValues,
     collectHashedUserData,
@@ -728,6 +731,95 @@ test('Meta transient errors are retryable even when the code is unfamiliar', () 
     assert.equal(classification.retryAfterSeconds, 45);
 });
 
+test('Meta request-level permission failures never amplify a 100-event batch', async () => {
+    for (const error of [
+        { response: { status: 403, data: { error: { code: 200, message: 'Permissions error' } } } },
+        { response: { status: 400, data: { error: { code: 10, message: 'Application does not have permission' } } } },
+        { response: { status: 400, data: { error: { code: 803, message: 'Object does not exist' } } } },
+        { response: { status: 400, data: { error: { code: 100, message: 'Invalid request parameter' } } } },
+    ]) {
+        let requests = 0;
+        const items = Array.from({ length: 100 }, (_, id) => ({ id }));
+        const result = await isolateMetaBatch(items, { remaining: 16 }, {
+            async send() {
+                requests += 1;
+                throw error;
+            },
+            classify: classifyFacebookError,
+            shouldIsolate: shouldIsolateFacebookError,
+            failure: (failedItems, classification) => ({
+                count: failedItems.length,
+                code: classification.code,
+            }),
+        });
+        assert.equal(requests, 1);
+        assert.equal(result.failures[0].count, 100);
+        assert.equal(result.deferredItems.length, 0);
+    }
+});
+
+test('Meta isolation budget preserves completed branches and defers only unresolved events', async () => {
+    const items = Array.from({ length: 8 }, (_, id) => ({ id }));
+    let requests = 0;
+    const result = await isolateMetaBatch(items, { remaining: 2 }, {
+        async send(batch) {
+            requests += 1;
+            if (batch.length === 8) {
+                throw { response: { status: 400, data: { error: {
+                    code: 100,
+                    message: 'Invalid event data',
+                    error_data: { blame_field_specs: [['data', '6', 'event_time']] },
+                } } } };
+            }
+            return { ids: batch.map(item => item.id) };
+        },
+        classify: classifyFacebookError,
+        shouldIsolate: shouldIsolateFacebookError,
+        failure: () => assert.fail('no branch should be marked permanent'),
+    });
+    assert.equal(requests, 2);
+    assert.deepEqual(result.successes[0].ids, [0, 1, 2, 3]);
+    assert.deepEqual(result.deferredItems.map(item => item.id), [4, 5, 6, 7]);
+    assert.equal(result.budgetExhausted, true);
+});
+
+test('Meta isolation stops sibling probes after a transient credential failure', async () => {
+    const items = Array.from({ length: 4 }, (_, id) => ({ id }));
+    let requests = 0;
+    const result = await isolateMetaBatch(items, { remaining: 10 }, {
+        async send(batch) {
+            requests += 1;
+            if (batch.length === 4) {
+                throw { response: { status: 400, data: { error: {
+                    code: 100,
+                    message: 'Invalid event data',
+                    error_data: { blame_field_specs: [['data', '1', 'custom_data']] },
+                } } } };
+            }
+            throw { response: { status: 429, data: { error: { code: 4, is_transient: true } } } };
+        },
+        classify: classifyFacebookError,
+        shouldIsolate: shouldIsolateFacebookError,
+        failure: () => assert.fail('transient failure must not become permanent'),
+    });
+    assert.equal(requests, 2);
+    assert.equal(result.retryError.response.status, 429);
+    assert.deepEqual(result.deferredItems.map(item => item.id), [0, 1, 2, 3]);
+});
+
+test('local Redis fallback rate limit counts events instead of HTTP requests', () => {
+    const windows = new Map();
+    const first = consumeWeightedWindow(windows, 'shop:ip', 50, 60, { nowMs: 1000 });
+    const second = consumeWeightedWindow(windows, 'shop:ip', 10, 60, { nowMs: 2000 });
+    const rejected = consumeWeightedWindow(windows, 'shop:ip', 1, 60, { nowMs: 3000 });
+    assert.equal(first.allowed, true);
+    assert.equal(first.remaining, 10);
+    assert.equal(second.allowed, true);
+    assert.equal(second.remaining, 0);
+    assert.equal(rejected.allowed, false);
+    assert.equal(rejected.count, 61);
+});
+
 test('Meta website events are validated before consuming platform quota', () => {
     const now = 1785000000;
     assert.deepEqual(validateMetaEvent({
@@ -817,6 +909,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(schema, /CREATE TABLE IF NOT EXISTS event_id_aliases/);
     assert.match(schema, /UNIQUE \(shop_id, event_name, alias_type, alias_value\)/);
     assert.match(schema, /UNIQUE \(event_store_id, route_id\)/);
+    assert.match(schema, /delivery_route_snapshot BIGINT\[\]/);
+    assert.match(schema, /REFERENCES shop_pixel_routes\(id\) ON DELETE RESTRICT/);
+    assert.match(schema, /REFERENCES pixels\(id\) ON DELETE RESTRICT/);
+    assert.match(schema, /status VARCHAR\(20\) NOT NULL DEFAULT 'active'/);
     assert.match(schema, /CREATE OR REPLACE FUNCTION enforce_event_delivery_tenant\(\)/);
     assert.match(schema, /JOIN shop_pixel_routes route ON route\.shop_id = event\.shop_id/);
     assert.match(schema, /CREATE TRIGGER trg_event_delivery_tenant/);
@@ -845,6 +941,8 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(workerSource, /lock:delivery-credential:\$\{credentialScope\}/);
     assert.match(workerSource, /credentialFingerprint\(\s*pixel\.platform,\s*decryptedCredential,\s*pixel\.rate_limit_group,?\s*\)/);
     assert.match(workerSource, /snapshot_delivery\.event_store_id = ANY\(\$2::bigint\[\]\)/);
+    assert.match(workerSource, /SET delivery_route_snapshot = active_routes\.route_ids/);
+    assert.match(workerSource, /CARDINALITY\(active_routes\.route_ids\) > 0/);
     assert.match(workerSource, /successful_event_store_ids/);
     assert.match(workerSource, /LEFT JOIN event_deliveries delivery[\s\S]*?delivery\.next_attempt_at <= NOW\(\)/);
     assert.match(workerSource, /const responseCode = Number\(response\.data\?\.code \?\? 0\)/);
@@ -855,6 +953,13 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /paymentConfirmed: true/);
     assert.match(serverSource, /INSERT INTO shopify_webhook_inbox/);
     assert.match(serverSource, /updated_at:<'?='?\$\{cutoff\}/);
+    assert.match(serverSource, /lineItems\(first: 250\)/);
+    assert.match(serverSource, /SHOPIFY_ORDER_LINE_ITEMS_QUERY/);
+    assert.match(serverSource, /while \(pageInfo\?\.hasNextPage\)/);
+    assert.match(serverSource, /email phone cartToken checkoutToken clientIp/);
+    assert.match(serverSource, /currentAppInstallation \{ accessScopes \{ handle \} \}/);
+    assert.match(serverSource, /customer @include\(if: \$includeCustomer\)/);
+    assert.match(serverSource, /node\.processedAt \|\| node\.createdAt \|\| scanCutoff/);
     assert.match(serverSource, /ON CONFLICT \(shop_id, event_name, event_id\) DO NOTHING/);
     assert.match(serverSource, /SELECT id, shop_id, event_name, event_id, request_payload,[\s\S]*?FOR UPDATE/);
     assert.match(serverSource, /existing\.status === 'SUCCESS'/);
@@ -866,6 +971,9 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /if \(eventName !== 'Purchase'\) return \[\]/);
     assert.match(serverSource, /scheduler:stale_pending_shop_cursor/);
     assert.match(serverSource, /reconcileEventAggregateStatuses/);
+    assert.match(serverSource, /SET status = 'archived'/);
+    assert.doesNotMatch(serverSource, /DELETE FROM pixels WHERE id = \$1/);
+    assert.match(serverSource, /error_code = 'ROUTE_ARCHIVED'/);
     assert.match(serverSource, /capi-saas-pro:aggregate-reconcile/);
     assert.match(serverSource, /FOR UPDATE OF event SKIP LOCKED/);
     assert.match(serverSource, /SET status = CASE WHEN \$2::boolean THEN 'PENDING' ELSE status END,[\s\S]*?request_payload = \$4::jsonb/);
@@ -886,6 +994,8 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /route\.status = 'active'[\s\S]*?delivery\.status = 'FAILED_PERMANENT'/);
     assert.match(serverSource, /startRedisLockHeartbeat/);
     assert.match(serverSource, /if \(!config\.legacyRedisDrainEnabled\) return/);
+    assert.match(serverSource, /res\.status\(redisState === 'ready' \? 200 : 503\)/);
+    assert.match(serverSource, /immediate_dispatch: redisState === 'ready'/);
     assert.match(serverSource, /if \(statusCode >= 500\) throw error/);
     assert.match(serverSource, /requireBoundedString\(trustedPayload\.event_id, 'event_id', 4096\)/);
     assert.match(serverSource, /err\.statusCode \|\| err\.status \|\| 500/);
