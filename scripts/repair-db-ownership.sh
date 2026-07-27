@@ -13,10 +13,30 @@ if [ "$(id -u)" -ne 0 ]; then
   fail "run this script as root (for example: sudo bash scripts/repair-db-ownership.sh)"
 fi
 
-command -v node >/dev/null 2>&1 || fail "node is required"
+if ! command -v node >/dev/null 2>&1; then
+  baota_node_bin="$(find /www/server/nodejs -mindepth 3 -maxdepth 3 -type f -path '*/bin/node' -printf '%h\n' 2>/dev/null \
+    | sort -V \
+    | tail -n 1)"
+  if [ -n "$baota_node_bin" ] && [ -x "${baota_node_bin}/node" ]; then
+    export PATH="${baota_node_bin}:${PATH}"
+    echo "Using Baota Node.js from ${baota_node_bin}"
+  fi
+fi
+command -v node >/dev/null 2>&1 || fail "node is required; select a Node.js runtime in Baota or add its bin directory to PATH"
 command -v runuser >/dev/null 2>&1 || fail "runuser is required"
 id postgres >/dev/null 2>&1 || fail "the postgres operating-system user does not exist"
 [ -f "${APP_DIR}/.env" ] || fail "${APP_DIR}/.env does not exist"
+
+if command -v psql >/dev/null 2>&1; then
+  PSQL_BIN="$(command -v psql)"
+else
+  PSQL_BIN="$(find /www/server /usr/lib/postgresql -type f -path '*/bin/psql' -executable -printf '%p\n' 2>/dev/null \
+    | sort -V \
+    | tail -n 1)"
+fi
+[ -n "$PSQL_BIN" ] && [ -x "$PSQL_BIN" ] \
+  || fail "psql is required; install the PostgreSQL client or select PostgreSQL in Baota"
+echo "Using PostgreSQL client from ${PSQL_BIN}"
 
 mapfile -t connection_parts < <(
   cd "$APP_DIR"
@@ -43,14 +63,14 @@ identifier_pattern='^[A-Za-z_][A-Za-z0-9_]*$'
 [[ "$DB_USER" =~ $identifier_pattern ]] || fail "unsafe PostgreSQL user name: ${DB_USER}"
 [[ "$DB_NAME" =~ $identifier_pattern ]] || fail "unsafe PostgreSQL database name: ${DB_NAME}"
 
-role_exists="$(runuser -u postgres -- psql -XAtqc "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" postgres)"
+role_exists="$(runuser -u postgres -- "$PSQL_BIN" -XAtqc "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" postgres)"
 [ "$role_exists" = "1" ] || fail "PostgreSQL role ${DB_USER} does not exist"
 
-database_exists="$(runuser -u postgres -- psql -XAtqc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" postgres)"
+database_exists="$(runuser -u postgres -- "$PSQL_BIN" -XAtqc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" postgres)"
 [ "$database_exists" = "1" ] || fail "PostgreSQL database ${DB_NAME} does not exist"
 
 echo "Repairing PostgreSQL ownership for database ${DB_NAME} and role ${DB_USER}"
-runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 postgres <<SQL
+runuser -u postgres -- "$PSQL_BIN" -X -v ON_ERROR_STOP=1 postgres <<SQL
 ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};
 GRANT CONNECT, TEMPORARY ON DATABASE ${DB_NAME} TO ${DB_USER};
 \connect ${DB_NAME}
@@ -99,7 +119,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE ${DB_USER} IN SCHEMA public
   GRANT ALL PRIVILEGES ON SEQUENCES TO ${DB_USER};
 SQL
 
-remaining_wrong_owners="$(runuser -u postgres -- psql -XAtqc "
+remaining_wrong_owners="$(runuser -u postgres -- "$PSQL_BIN" -XAtqc "
   SELECT
     (SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner <> '${DB_USER}')
     +
