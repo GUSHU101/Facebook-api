@@ -25,6 +25,8 @@ PM2: capi-api + capi-worker
 - Redis `maxmemory-policy` 必须为 `noeviction`。
 - 服务器时间和时区同步正常；事件时间统一由应用按 UTC 处理。
 
+- 项目目录进终端更新依赖：npm ci --omit=dev
+
 检查版本：
 
 ```bash
