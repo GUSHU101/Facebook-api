@@ -1862,6 +1862,10 @@ test('deployment workflow preserves production secrets and verifies runtime read
         path.join(__dirname, '..', 'scripts', 'repair-db-ownership.sh'),
         'utf8',
     );
+    const baotaConfigurator = fs.readFileSync(
+        path.join(__dirname, '..', 'deploy', 'configure_baota_nginx.sh'),
+        'utf8',
+    );
 
     assert.match(installer, /FORCE_ENV_REWRITE="\$\{FORCE_ENV_REWRITE:-0\}"/);
     assert.match(installer, /Preserving existing \.env and database credentials/);
@@ -1882,9 +1886,16 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(ci, /npm run build:admin/);
     assert.match(ci, /npm ci --omit=dev --ignore-scripts/);
     assert.match(ci, /scripts\/repair-db-ownership\.sh/);
+    assert.match(ci, /deploy\/configure_baota_nginx\.sh/);
     assert.match(restore, /--single-transaction/);
     assert.match(restore, /runtime remains stopped and maintenance mode stays enabled/);
     assert.match(ownershipRepair, /DATABASE_URL must include a user and database name/);
+    assert.match(ownershipRepair, /\/www\/server\/nodejs/);
+    assert.match(ownershipRepair, /\/usr\/lib\/postgresql/);
+    assert.match(ownershipRepair, /runuser -u postgres -- "\$PSQL_BIN"/);
     assert.match(ownershipRepair, /ALTER SCHEMA public OWNER TO/);
     assert.match(ownershipRepair, /remaining_wrong_owners/);
+    assert.match(baotaConfigurator, /INSTALL_WATCHER/);
+    assert.match(baotaConfigurator, /nginx validation failed; restored the previous vhost configuration/);
+    assert.match(baotaConfigurator, /PathChanged=\$\{VHOST_FILE\}/);
 });
