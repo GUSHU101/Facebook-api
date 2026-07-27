@@ -296,68 +296,16 @@ pm2 startOrReload ecosystem.config.js
 
 否则它会额外启动一个 `capi-api`，与宝塔 API 争用 3000 端口。
 
-## 8. 首次自动配置 8443 HTTPS
+## 8. 数据库权限修复
 
-先在宝塔创建站点并为当前域名成功签发 SSL 证书。确认文件存在：
+sudo -u postgres /www/server/pgsql/bin/psql -d postgres -c "ALTER DATABASE capi_saas OWNER TO capi_saas;"
 
-```bash
-ls -l /www/server/panel/vhost/cert/Facebook_api_main/fullchain.pem
-ls -l /www/server/panel/vhost/cert/Facebook_api_main/privkey.pem
-```
+sudo -u postgres /www/server/pgsql/bin/psql -v ON_ERROR_STOP=1 -d capi_saas -c "DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT schemaname, tablename FROM pg_tables WHERE schemaname='public' LOOP EXECUTE format('ALTER TABLE %I.%I OWNER TO capi_saas', r.schemaname, r.tablename); END LOOP; FOR r IN SELECT schemaname, sequencename FROM pg_sequences WHERE schemaname='public' LOOP EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO capi_saas', r.schemaname, r.sequencename); END LOOP; END \$\$; ALTER SCHEMA public OWNER TO capi_saas; GRANT USAGE, CREATE ON SCHEMA public TO capi_saas; GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO capi_saas; GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO capi_saas;"
 
-然后只执行一次：
+正确结果应该是：
+(0 rows)
 
-```bash
-cd /www/wwwroot/Facebook-api-main
-sudo env DOMAIN=pixel.atelierwrap.cc BT_SITE_NAME=Facebook_api_main PROJECT_DIR=/www/wwwroot/Facebook-api-main PUBLIC_PORT=8443 INTERNAL_PORT=3000 INSTALL_WATCHER=1 bash deploy/configure_baota_nginx.sh
-```
-
-这一次需要明确域名，因为 Nginx 必须知道证书对应的主机名。参数会保存到 systemd 服务，普通部署和重启不需要再次输入。
-
-脚本会：
-
-- 备份原 vhost 到 `/www/backup/capi-nginx-vhosts`。
-- 生成 `80 → https://域名:8443` 跳转。
-- 生成 `8443 SSL → 127.0.0.1:3000` 反向代理。
-- 禁止访问 `.env`、`.git`、日志、SQL、备份和 `node_modules`。
-- 执行 `nginx -t`，失败则自动恢复旧配置。
-- 只验证宝塔的 `/www/server/nginx/sbin/nginx`，不会误用 Ubuntu 的另一套 Nginx。
-- 成功后直接向宝塔 Nginx 主进程发送平滑重载信号，避免两套 Nginx 争抢 80/443 端口。
-- 安装 systemd 文件监视器；宝塔重写 vhost 后自动恢复 8443。
-
-检查监视器：
-
-```bash
-systemctl status capi-baota-nginx-facebook-api-main.path
-```
-
-检查 Nginx：
-
-```bash
-/www/server/nginx/sbin/nginx -t
-curl -I https://pixel.atelierwrap.cc:8443/healthz
-```
-
-云服务器安全组和本机防火墙必须开放 TCP 8443：
-
-```bash
-ufw allow 8443/tcp
-```
-
-不要开放公网 3000。
-
-### 更换域名
-
-1. 修改 DNS。
-2. 在宝塔为新域名重新签发证书。
-3. 使用新 `DOMAIN` 再执行一次上面的配置脚本。
-4. 更新 Shopify Webhook 地址。
-5. 从新域名后台重新复制各店铺 Customer Events 代码。
-
-如果宝塔站点标识仍为 `Facebook_api_main`，脚本会更新原监视器。如果重新创建站点并改变了标识，先停用旧监视器：
-
-```bash
-systemctl disable --now capi-baota-nginx-facebook-api-main.path
+然后在宝塔面板重启 Node 项目。
 ```
 
 ## 9. Shopify 自建应用配置
