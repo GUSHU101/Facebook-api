@@ -1,1922 +1,1189 @@
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const crypto = require('crypto');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
-const { spawnSync } = require('node:child_process');
+// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
+const CAPI_HUB_URL = "https://pixel.atelierwrap.cc:8443/api/pixel-event";
+const CAPI_PIXEL_CONFIG_URL = "https://pixel.atelierwrap.cc:8443/api/pixel-config";
+const SHOP_DOMAIN = "jr078r-zx.myshopify.com";
+const SHOP_INGEST_TOKEN = "853c679c1e298f3c59845d0c5e0eaa78eb638efc3c4c61a51b594fa43b11f703";
+var META_ROUTE_PIXEL_IDS = ["1017012367716175"];
+const TIKTOK_ROUTE_PIXEL_IDS = [];
+const SCHEMA_VERSION = "2.0";
+const SOURCE_VERSION = "shopify-pixel-v14";
+const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
+const META_STANDARD_BROWSER_EVENTS = new Set([
+    'PageView', 'ViewContent', 'Search', 'AddToCart',
+    'InitiateCheckout', 'AddPaymentInfo', 'Purchase',
+]);
+const META_PIXEL_MAX_LOAD_ATTEMPTS = 3;
+const META_PIXEL_RETRY_BACKOFF_MS = [1000, 5000, 30000];
+const META_PIXEL_MAX_QUEUE_SIZE = 500;
+const META_ROUTE_CONFIG_WAIT_MS = 500;
+const META_ROUTE_CONFIG_TTL_MS = 60 * 1000;
+const META_ROUTE_CONFIG_STORAGE_KEY = 'capi_meta_route_config_v1:' + SHOP_DOMAIN;
+const META_PIXEL_LOW_PRIORITY_EVENTS = new Set([
+    'PageView', 'Search', 'CartView', 'CollectionView',
+    'RemoveFromCart', 'CheckoutContactInfoSubmitted',
+    'CheckoutAddressInfoSubmitted', 'CheckoutShippingInfoSubmitted',
+]);
+const RECENT_EVENT_TTL_MS = 5000;
+const MAX_RECENT_EVENTS = 5000;
+const EVENT_QUEUE_FLUSH_MS = 1000;
+const FETCH_TIMEOUT_MS = 8000;
+const KEEPALIVE_LIMIT_BYTES = 60000;
+const MAX_BATCH_EVENTS = 20;
+const MAX_CLIENT_RETRIES = 32;
+const CLIENT_RETRY_MAX_AGE_MS = 6 * 24 * 60 * 60 * 1000;
+const RETRY_BACKOFF_MS = [1000, 3000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000, 7200000, 14400000, 21600000];
+const STORAGE_QUEUE_KEY = 'capi_gateway_event_queue_v3:' + SHOP_DOMAIN;
+const MAX_STORED_EVENTS = 1000;
+const recentEvents = new Map();
+const eventQueue = [];
+var inFlightEvents = [];
+var eventQueueTimer = null;
+var persistedQueueLoaded = false;
+var storageWriteChain = Promise.resolve();
+var flushPromise = null;
+const initializedMetaBrowserPixelIds = new Set();
+var metaBrowserSdkLoading = false;
+var metaBrowserSdkLoadAttempts = 0;
+var metaBrowserSdkRetryAt = 0;
+var metaRouteConfigPromise = null;
+var metaRouteConfigPending = false;
 
-process.env.DATABASE_URL ||= 'postgres://user:pass@127.0.0.1:5432/test';
-process.env.REDIS_URL ||= 'redis://127.0.0.1:6379';
-process.env.AES_SECRET_KEY ||= 'test-secret-key-with-at-least-32-chars';
-process.env.ADMIN_USERNAME ||= 'admin';
-process.env.ADMIN_PASSWORD ||= 'password';
-
-const {
-    buildCustomData,
-    missingCommerceSignals,
-    normalizeEventId,
-    stripPrivateFields,
-    tenantScopedExternalId,
-    tenantScopedIdentifier,
-} = require('../src/events/common');
-const {
-    buildShopifyOrderPurchasePayload,
-    discountedUnitPrice,
-    paidOrderIgnoreReason,
-    shopifyCustomerSegmentation,
-} = require('../src/events/shopify');
-const {
-    browserAttributionIdentity,
-    buildBrowserAttributionSnapshot,
-    buildCommerceAttributionSnapshot,
-    sanitizeStoredAttribution,
-    snapshotForAttributionKey,
-} = require('../src/events/attribution');
-const { mergePersistedEventPayload } = require('../src/events/merge');
-const { eventHasSuccessfulDelivery, shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
-const { aggregateDeliveryStatus, retryDelaySeconds } = require('../src/platforms/delivery-state');
-const {
-    isolateMetaBatch,
-    normalizeMetaCookie,
-    prepareMetaEvent,
-    sanitizeMetaCustomData,
-    sanitizeMetaUserData,
-    validateMetaEvent,
-} = require('../src/platforms/meta');
-const {
-    classifyFacebookError,
-    metaRateControlFromHeaders,
-    parseRetryAfterSeconds,
-    retryDelayWithJitterSeconds,
-    shouldIsolateFacebookError,
-} = require('../src/platforms/rate-control');
-const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
-const { missingMatchSignals } = require('../src/utils/emq');
-const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
-const { consumeWeightedWindow } = require('../src/utils/weighted-rate-limit');
-const {
-    boundedScalarValues,
-    collectHashedUserData,
-    credentialFingerprint,
-    decryptTokenIfPossible,
-    encryptToken,
-    normalizeForHash,
-    timingSafeStringCompare,
-} = require('../src/utils/crypto');
-
-function probeConfig(environment = {}) {
-    return spawnSync(
-        process.execPath,
-        ['-e', "process.stdout.write(JSON.stringify(require('./src/config')))"],
-        {
-            cwd: path.join(__dirname, '..'),
-            encoding: 'utf8',
-            env: {
-                ...process.env,
-                DATABASE_URL: 'postgres://user:pass@127.0.0.1:5432/test',
-                REDIS_URL: 'redis://127.0.0.1:6379',
-                AES_SECRET_KEY: 'test-secret-key-with-at-least-32-chars',
-                ADMIN_USERNAME: 'admin',
-                ADMIN_PASSWORD: 'password',
-                ...environment,
-            },
-        },
-    );
+function normalizedMetaPixelIds() {
+    return Array.from(new Set(META_ROUTE_PIXEL_IDS.map(function (value) {
+        return String(value || '').trim();
+    }).filter(function (value) {
+        return /^\d{5,32}$/.test(value);
+    })));
 }
 
-function sha256(value) {
-    return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
-}
+function trimMetaBrowserQueue() {
+    var fbq = typeof window !== 'undefined' && window.fbq;
+    var queue = fbq && fbq.queue;
+    if (!Array.isArray(queue) || fbq.callMethod || queue.length <= META_PIXEL_MAX_QUEUE_SIZE) return;
 
-function hashFor(value, type = 'default', context = {}) {
-    const normalized = normalizeForHash(value, type, context);
-    return normalized ? crypto.createHash('sha256').update(normalized).digest('hex') : undefined;
-}
-
-test('external IDs are stable within a shop and isolated across shops sharing a dataset', () => {
-    const shopA = tenantScopedExternalId('alpha.myshopify.com', 'gid://shopify/Customer/123');
-    const shopARepeat = tenantScopedExternalId('ALPHA.MYSHOPIFY.COM', '123');
-    const shopB = tenantScopedExternalId('beta.myshopify.com', '123');
-
-    assert.equal(shopA, shopARepeat);
-    assert.notEqual(shopA, shopB);
-    assert.match(shopA, /^[a-f0-9]{64}$/);
-    assert.equal(tenantScopedExternalId('', '123'), undefined);
-    assert.equal(tenantScopedIdentifier('alpha.myshopify.com', 'gid://shopify/Order/123'), 'alpha.myshopify.com:123');
-    assert.equal(tenantScopedIdentifier('ALPHA.MYSHOPIFY.COM', 'alpha.myshopify.com:123'), 'alpha.myshopify.com:123');
-    assert.equal(tenantScopedIdentifier('alpha.myshopify.com', 'ALPHA.MYSHOPIFY.COM:123'), 'alpha.myshopify.com:123');
-    assert.notEqual(
-        tenantScopedIdentifier('alpha.myshopify.com', 'same-event'),
-        tenantScopedIdentifier('beta.myshopify.com', 'same-event'),
-    );
-});
-
-test('attribution cache cannot leak customer or checkout identity across browser sessions', () => {
-    const payload = {
-        fbp: 'fb.1.real-browser',
-        fbc: 'fb.1.real-click',
-        client_id: 'browser-client-1',
-        shopify_s: 'session-1',
-        email: 'buyer@example.com',
-        phone: '+1 212 555 1212',
-        external_id: 'customer-777',
-        checkout_token: 'checkout-old',
-        cart_token: 'cart-old',
-        updated_at: 1234,
-    };
-
-    const browserSnapshot = buildBrowserAttributionSnapshot(payload);
-    assert.equal(browserSnapshot.fbp, 'fb.1.real-browser');
-    assert.equal(browserSnapshot.client_id, 'browser-client-1');
-    assert.equal(browserSnapshot.email_hash, undefined);
-    assert.equal(browserSnapshot.phone_hash, undefined);
-    assert.equal(browserSnapshot.external_id, undefined);
-    assert.equal(browserSnapshot.checkout_token, undefined);
-    assert.equal(browserSnapshot.cart_token, undefined);
-    assert.equal(browserAttributionIdentity({ external_id: 'customer-777' }), undefined);
-    assert.equal(browserAttributionIdentity(payload), 'browser-client-1');
-
-    const commerceSnapshot = buildCommerceAttributionSnapshot(payload);
-    assert.match(commerceSnapshot.email_hash[0], /^[a-f0-9]{64}$/);
-    assert.match(commerceSnapshot.phone_hash[0], /^[a-f0-9]{64}$/);
-    assert.equal(commerceSnapshot.external_id, 'customer-777');
-    assert.equal(commerceSnapshot.checkout_token, 'checkout-old');
-    assert.equal(commerceSnapshot.cart_token, 'cart-old');
-
-    // Old deployments may still have a full snapshot under a client/session
-    // key. Reads must strip those unsafe fields immediately, before TTL expiry.
-    const sanitizedLegacyClient = sanitizeStoredAttribution(commerceSnapshot, 'client');
-    assert.equal(sanitizedLegacyClient.email_hash, undefined);
-    assert.equal(sanitizedLegacyClient.external_id, undefined);
-    assert.equal(sanitizedLegacyClient.checkout_token, undefined);
-    assert.equal(sanitizedLegacyClient.cart_token, undefined);
-    const sessionSnapshot = snapshotForAttributionKey(payload, 'session');
-    const checkoutSnapshot = snapshotForAttributionKey(payload, 'checkout');
-    assert.equal(sessionSnapshot.fbp, browserSnapshot.fbp);
-    assert.equal(sessionSnapshot.external_id, undefined);
-    assert.ok(sessionSnapshot.updated_at >= Date.now() - 1000);
-    assert.equal(checkoutSnapshot.external_id, commerceSnapshot.external_id);
-    assert.ok(checkoutSnapshot.updated_at >= Date.now() - 1000);
-});
-
-test('attribution cache rejects fake pre-hashes and applies country-aware normalization', () => {
-    const snapshot = buildCommerceAttributionSnapshot({
-        email_hash: 'not-a-sha256-hash',
-        email: 'Buyer@Example.com',
-        state: 'California',
-        zip: '94035-1234',
-        country: 'US',
-    });
-    assert.deepEqual(snapshot.email_hash, [hashFor('Buyer@Example.com', 'email')]);
-    assert.equal(snapshot.state_hash, undefined);
-    assert.deepEqual(snapshot.zip_hash, [hashFor('94035-1234', 'zip', { country: 'US' })]);
-    assert.deepEqual(collectHashedUserData(['invalid'], ['buyer@example.com'], 'email'), [
-        hashFor('buyer@example.com', 'email'),
-    ]);
-    assert.deepEqual(boundedScalarValues([['a'], { malicious: true }, ['b', ['c']]]), ['a', 'b', 'c']);
-});
-
-test('confirmed Purchase data cannot be downgraded by a later browser duplicate', () => {
-    const confirmed = {
-        event_name: 'Purchase',
-        event_id: 'purchase-order-1001',
-        event_time: 200,
-        event_source_url: 'https://shop.example/checkouts/complete',
-        user_data: {
-            em: ['confirmed-email'],
-            ph: ['confirmed-phone'],
-            fbp: 'fb.1.confirmed-browser',
-        },
-        custom_data: {
-            value: 100,
-            currency: 'USD',
-            order_id: '1001',
-            content_ids: ['paid-item'],
-            contents: [{ id: 'paid-item', quantity: 1, item_price: 100 }],
-        },
-        _received_at: 2000,
-        _requires_payment_confirmation: true,
-        _payment_confirmed: true,
-    };
-    const browserDuplicate = {
-        event_name: 'Purchase',
-        event_id: 'purchase-order-1001',
-        event_time: 100,
-        event_source_url: 'https://shop.example/checkouts/complete?utm_source=facebook',
-        user_data: {
-            em: ['browser-email'],
-            fbp: 'fb.1.late-browser',
-        },
-        custom_data: {
-            value: 80,
-            currency: 'USD',
-            content_ids: ['removed-item'],
-            contents: [{ id: 'removed-item', quantity: 1, item_price: 80 }],
-        },
-        _received_at: 1000,
-        _requires_payment_confirmation: true,
-        _payment_confirmed: false,
-    };
-
-    const merged = mergePersistedEventPayload(confirmed, browserDuplicate);
-    assert.equal(merged.event_time, 200);
-    assert.equal(merged.custom_data.value, 100);
-    assert.equal(merged.custom_data.order_id, '1001');
-    assert.deepEqual(merged.custom_data.content_ids, ['paid-item']);
-    assert.deepEqual(merged.custom_data.contents, [{ id: 'paid-item', quantity: 1, item_price: 100 }]);
-    assert.equal(merged.user_data.fbp, 'fb.1.confirmed-browser');
-    assert.deepEqual(merged.user_data.em, ['browser-email', 'confirmed-email']);
-    assert.deepEqual(merged.user_data.ph, ['confirmed-phone']);
-    assert.equal(merged._payment_confirmed, true);
-    assert.equal(merged._received_at, 1000);
-});
-
-test('payment-confirmed duplicate upgrades an awaiting Purchase without losing browser identity', () => {
-    const browser = {
-        event_name: 'Purchase',
-        event_time: 100,
-        user_data: { em: ['browser-email'], fbp: 'fb.1.browser' },
-        custom_data: { value: 80, currency: 'USD' },
-        _payment_confirmed: false,
-    };
-    const paidWebhook = {
-        event_name: 'Purchase',
-        event_time: 200,
-        user_data: { em: ['paid-email'], ph: ['paid-phone'] },
-        custom_data: { value: 100, currency: 'USD', order_id: '1001' },
-        _payment_confirmed: true,
-    };
-
-    const merged = mergePersistedEventPayload(browser, paidWebhook);
-    assert.equal(merged.event_time, 200);
-    assert.equal(merged.custom_data.value, 100);
-    assert.equal(merged.custom_data.order_id, '1001');
-    assert.equal(merged.user_data.fbp, 'fb.1.browser');
-    assert.deepEqual(merged.user_data.em, ['browser-email', 'paid-email']);
-    assert.equal(merged._payment_confirmed, true);
-});
-
-test('buildShopifyOrderPurchasePayload extracts purchase identifiers and product contents', () => {
-    const payload = buildShopifyOrderPurchasePayload({
-        id: 987,
-        name: '#1001',
-        checkout_token: 'checkout-token-1',
-        email: 'Buyer@Example.com',
-        phone: '+12125551212',
-        current_total_price: '46.00',
-        currency: 'USD',
-        landing_site: '/products/socks?fbclid=fb-click-1&ttclid=tt-click-1',
-        created_at: '2026-06-23T08:00:00Z',
-        browser_ip: '203.0.113.10',
-        client_details: { user_agent: 'Mozilla/5.0', fbp: 'fb.1.browser' },
-        billing_address: {
-            first_name: 'Ada',
-            last_name: 'Lovelace',
-            city: 'London',
-            province_code: 'LND',
-            zip: 'E1 1AA',
-            country_code: 'GB',
-        },
-        note_attributes: [
-            { name: '_ttp', value: 'ttp-cookie' },
-            { name: '_shopify_y', value: 'shopify-y-cookie' },
-        ],
-        customer: { id: 12345, orders_count: 1 },
-        line_items: [
-            { variant_id: 111, quantity: 2, price: '8.00' },
-            { product_id: 222, quantity: 1, price: '30.00' },
-        ],
-    }, 'demo.myshopify.com', {
-        nowMs: 1234567890,
-        eventTimestamp: '2026-06-23T08:05:00Z',
-    });
-
-    assert.equal(payload.event_name, 'Purchase');
-    assert.equal(payload.action_source, 'website');
-    assert.equal(payload.event_id, 'demo.myshopify.com:checkout-token-1');
-    assert.equal(payload.source_url, 'https://demo.myshopify.com/products/socks?fbclid=fb-click-1&ttclid=tt-click-1');
-    assert.equal(payload.fbp, 'fb.1.browser');
-    assert.equal(payload.fbc, 'fb.1.1234567890000.fb-click-1');
-    assert.equal(normalizeMetaCookie(payload.fbc), payload.fbc);
-    assert.equal(payload.ttp, 'ttp-cookie');
-    assert.equal(payload.ttclid, 'tt-click-1');
-    assert.equal(payload.client_id, 'shopify-y-cookie');
-    assert.equal(payload.checkout_token, 'checkout-token-1');
-    assert.equal(payload._shopify_order_id, '987');
-    assert.equal(payload.shopify_y, 'shopify-y-cookie');
-    assert.equal(payload.external_id, '12345');
-    assert.deepEqual(payload.content_ids, ['111', '222']);
-    assert.deepEqual(payload.contents, [
-        { id: '111', quantity: 2, item_price: 8 },
-        { id: '222', quantity: 1, item_price: 30 },
-    ]);
-    assert.equal(payload.num_items, 3);
-    assert.equal(payload.order_id, '#1001');
-    assert.equal(payload.customer_segmentation, 'new_customer_to_business');
-    assert.equal(payload.timestamp, '2026-06-23T08:05:00Z');
-});
-
-test('Shopify customer segmentation uses explicit first-order state before order count', () => {
-    assert.equal(shopifyCustomerSegmentation({ isFirstOrder: true, orders_count: 5 }), 'new_customer_to_business');
-    assert.equal(shopifyCustomerSegmentation({ isFirstOrder: false, orders_count: 1 }), 'existing_customer_to_business');
-    assert.equal(shopifyCustomerSegmentation({ orders_count: 1 }), 'new_customer_to_business');
-    assert.equal(shopifyCustomerSegmentation({ orders_count: 2 }), 'existing_customer_to_business');
-    assert.equal(shopifyCustomerSegmentation({}), undefined);
-});
-
-test('buildShopifyOrderPurchasePayload normalizes Shopify GIDs for Purchase dedupe fallback', () => {
-    const payload = buildShopifyOrderPurchasePayload({
-        id: 'gid://shopify/Order/987',
-        email: 'buyer@example.com',
-        current_total_price: '46.00',
-        currency: 'USD',
-        line_items: [],
-    }, 'demo.myshopify.com');
-
-    assert.equal(payload.event_id, 'demo.myshopify.com:987');
-    assert.equal(payload.order_id, '987');
-    assert.equal(payload.external_id, '987');
-});
-
-test('authenticated Shopify identifiers outrank storefront-controlled event attributes', () => {
-    const payload = buildShopifyOrderPurchasePayload({
-        id: 987,
-        checkout_token: 'checkout-trusted',
-        name: '#1001',
-        note_attributes: [{ name: 'event_id', value: 'reused-by-many-orders' }],
-        created_at: '2026-06-23T08:00:00Z',
-        landing_site: '/?fbclid=actual-click',
-        current_total_price: '10.00',
-        currency: 'USD',
-        line_items: [],
-    }, 'demo.myshopify.com');
-    assert.equal(payload.event_id, 'demo.myshopify.com:checkout-trusted');
-    assert.equal(payload.fbc, `fb.1.${Date.parse('2026-06-23T08:00:00Z')}.actual-click`);
-});
-
-test('Shopify webhook source URL never leaks an external referrer or private status URL', () => {
-    const payload = buildShopifyOrderPurchasePayload({
-        id: 987,
-        current_total_price: '10.00',
-        currency: 'USD',
-        referring_site: 'https://search.example/landing',
-        order_status_url: 'https://demo.myshopify.com/orders/private/auth-token',
-    }, 'demo.myshopify.com');
-    assert.equal(payload.source_url, 'https://demo.myshopify.com');
-});
-
-test('Shopify paid-order rules exclude test and explicit non-web orders', () => {
-    assert.equal(paidOrderIgnoreReason({ test: true, source_name: 'web' }), 'test_order');
-    assert.equal(paidOrderIgnoreReason({ source_name: 'pos' }), 'non_web_order_source:pos');
-    assert.equal(paidOrderIgnoreReason({ source_name: 'mobile_app' }), 'non_web_order_source:mobile_app');
-    assert.equal(paidOrderIgnoreReason({ source_name: 'iphone' }), 'non_web_order_source:iphone');
-    assert.equal(paidOrderIgnoreReason({ source_name: 'android' }), 'non_web_order_source:android');
-    assert.equal(paidOrderIgnoreReason({ source_name: 'shopify_draft_order' }), 'non_web_order_source:shopify_draft_order');
-    assert.equal(paidOrderIgnoreReason({ source_name: 'web' }), undefined);
-    assert.equal(paidOrderIgnoreReason({}), 'missing_order_source');
-    assert.equal(paidOrderIgnoreReason({ source_name: '1234567' }), 'non_web_order_source:1234567');
-    assert.equal(paidOrderIgnoreReason({ source_name: '1234567' }, ['web', '1234567']), undefined);
-});
-
-test('Shopify order content unit price reflects allocated discounts', () => {
-    assert.equal(discountedUnitPrice({ price: '20.00', total_discount: '10.00' }, 2), 15);
-    assert.equal(discountedUnitPrice({ price: '20.00', discount_allocations: [{ amount: '6.00' }] }, 2), 17);
-    assert.equal(discountedUnitPrice({ price: '20.00', total_discount: '2.00', discount_allocations: [{ amount: '6.00' }] }, 2), 17);
-    assert.equal(discountedUnitPrice({ price: '20.00', discounted_price: '12.50', total_discount: '99.00' }, 2), 12.5);
-});
-
-test('Shopify Purchase payload never invents a random dedupe identity', () => {
-    const payload = buildShopifyOrderPurchasePayload({
-        current_total_price: '10.00',
-        currency: 'USD',
-        line_items: [],
-    }, 'demo.myshopify.com');
-    assert.equal(payload.event_id, undefined);
-});
-
-test('Shopify webhook JSON preserves 64-bit commerce identifiers exactly', () => {
-    const parsed = parseJsonPreservingLargeIntegers(
-        '{"id":9007199254740993,"line_items":[{"product_id":9223372036854775807,"quantity":2}]}',
-    );
-    assert.equal(parsed.id, '9007199254740993');
-    assert.equal(parsed.line_items[0].product_id, '9223372036854775807');
-    assert.equal(parsed.line_items[0].quantity, 2);
-    assert.throws(
-        () => parseJsonPreservingLargeIntegers('{"id":1,"id":2}'),
-        error => /Duplicate key/.test(String(error?.message)),
-    );
-});
-
-test('Shopify reconciliation marks recovered orders as system generated', () => {
-    const payload = buildShopifyOrderPurchasePayload({
-        _reconciled: true,
-        id: 'gid://shopify/Order/9007199254740993',
-        name: '#9001',
-        financial_status: 'paid',
-        source_name: 'web',
-        current_total_price: '25.00',
-        currency: 'USD',
-        processed_at: '2026-07-26T01:00:00Z',
-        current_subtotal_line_items_quantity: 257,
-        line_items: [],
-    }, 'demo.myshopify.com');
-    assert.equal(payload.action_source, 'system_generated');
-    assert.equal(payload.event_id, 'demo.myshopify.com:9007199254740993');
-    assert.equal(payload.num_items, 257);
-});
-
-test('buildTikTokPayload uses the current Purchase event name and preserves dedupe event_id', () => {
-    const event = {
-        request_payload: {
-            event_name: 'Purchase',
-            event_id: 'checkout-token-1',
-            event_time: 1782192000,
-            event_source_url: 'https://demo.myshopify.com/checkout',
-            user_data: {
-                em: [sha256('buyer@example.com')],
-                ph: [sha256('+12125551212')],
-                external_id: [sha256('12345')],
-                client_user_agent: 'Mozilla/5.0',
-                client_ip_address: '203.0.113.10',
-            },
-            custom_data: {
-                value: 46,
-                currency: 'USD',
-                order_id: '#1001',
-                content_type: 'product',
-                contents: [
-                    { id: '111', quantity: 2, item_price: 8 },
-                ],
-            },
-            _platform_data: {
-                tiktok: {
-                    ttp: 'ttp-cookie',
-                    ttclid: 'tt-click-1',
-                },
-            },
-        },
-    };
-
-    const payload = buildTikTokPayload({
-        pixel_id: 'TIKTOK_PIXEL',
-        test_event_code: 'TEST123',
-    }, event);
-
-    assert.equal(payload.pixel_code, 'TIKTOK_PIXEL');
-    assert.equal(payload.event, 'Purchase');
-    assert.equal(payload.event_id, 'checkout-token-1');
-    assert.equal(payload.context.ad.callback, 'tt-click-1');
-    assert.equal(payload.context.user.ttp, 'ttp-cookie');
-    assert.equal(payload.properties.value, 46);
-    assert.equal(payload.properties.currency, 'USD');
-    assert.equal(payload.properties.order_id, '#1001');
-    assert.deepEqual(payload.properties.content_ids, ['111']);
-    assert.equal(payload.properties.content_type, 'product');
-    assert.deepEqual(payload.properties.contents, [
-        {
-            content_id: '111',
-            quantity: 2,
-            price: 8,
-            content_type: 'product',
-        },
-    ]);
-    assert.equal(payload.test_event_code, 'TEST123');
-});
-
-test('private event fields are removed before Meta CAPI send', () => {
-    assert.deepEqual(stripPrivateFields({
-        event_name: 'Purchase',
-        event_id: 'evt-1',
-        _emq_estimate: '7.0',
-        _platform_data: { tiktok: {} },
-        _duplicate_candidate: true,
-        _quality: { missing_match_signals: ['fbc'] },
-        _received_at: 123,
-        _shopify_order_id: '987',
-    }), {
-        event_name: 'Purchase',
-        event_id: 'evt-1',
-    });
-});
-
-test('customer information normalization matches platform hashing expectations', () => {
-    assert.equal(normalizeForHash(' Buyer@Example.COM ', 'email'), 'buyer@example.com');
-    assert.equal(normalizeForHash('buyer @example.com', 'email'), undefined);
-    assert.equal(normalizeForHash('+1 (212) 555-1212', 'phone'), '12125551212');
-    assert.equal(normalizeForHash('0044 20 7946 0958', 'phone'), '442079460958');
-    assert.equal(normalizeForHash('(650) 555-1212', 'phone', { country: 'US' }), '16505551212');
-    assert.equal(normalizeForHash('(650) 555-1212', 'phone'), undefined);
-    assert.equal(normalizeForHash('020 7946 0958', 'phone', { country: 'GB' }), undefined);
-    assert.equal(normalizeForHash(' Valéry ', 'name'), 'valéry');
-    assert.equal(normalizeForHash('张 三', 'name'), '张三');
-    assert.equal(normalizeForHash(' São Paulo ', 'city'), 'saopaulo');
-    assert.equal(normalizeForHash('CA', 'state', { country: 'US' }), 'ca');
-    assert.equal(normalizeForHash('California', 'state', { country: 'US' }), undefined);
-    assert.equal(normalizeForHash(' E1 1AA ', 'zip'), 'e11aa');
-    assert.equal(normalizeForHash('94035-1234', 'zip', { country: 'US' }), '94035');
-    assert.equal(normalizeForHash('US', 'country'), 'us');
-    assert.equal(normalizeForHash('United States', 'country'), undefined);
-});
-
-test('Meta match fields are sanitized without fabricating browser identifiers', () => {
-    const hash = sha256('buyer@example.com');
-    assert.equal(normalizeMetaCookie('fb.1.1596403881668.1116446470'), 'fb.1.1596403881668.1116446470');
-    assert.equal(normalizeMetaCookie('fb.1.fake.cookie'), undefined);
-    assert.deepEqual(sanitizeMetaUserData({
-        em: [hash, hash, 'not-a-hash'],
-        client_ip_address: '203.0.113.10',
-        client_user_agent: ' Mozilla/5.0 ',
-        fbp: 'fb.1.fake.cookie',
-        fbc: 'fb.1.1554763741205.AbCdEfGhIjKlMnOp',
-    }), {
-        em: [hash],
-        client_ip_address: '203.0.113.10',
-        client_user_agent: 'Mozilla/5.0',
-        fbc: 'fb.1.1554763741205.AbCdEfGhIjKlMnOp',
-    });
-
-    const preparedPurchase = prepareMetaEvent({
-        event_name: 'Purchase',
-        user_data: { em: [hash] },
-        custom_data: { num_items: 2, search_string: 'shoes', value: 10, currency: 'USD' },
-    });
-    assert.equal(preparedPurchase.custom_data.num_items, undefined);
-    assert.equal(preparedPurchase.custom_data.search_string, undefined);
-    assert.equal(prepareMetaEvent({
-        event_name: 'InitiateCheckout',
-        user_data: { em: [hash] },
-        custom_data: { num_items: 2 },
-    }).custom_data.num_items, 2);
-    assert.deepEqual(sanitizeMetaCustomData({
-        content_ids: ['removed-item', 'paid-item'],
-        contents: [{ id: 'paid-item', quantity: 1, item_price: 10 }],
-    }, 'Purchase'), {
-        content_ids: ['paid-item'],
-        contents: [{ id: 'paid-item', quantity: 1, item_price: 10 }],
-    });
-});
-
-test('encrypted secret helper remains backward compatible with plaintext values', () => {
-    const encrypted = encryptToken('shopify-secret-1');
-    assert.equal(decryptTokenIfPossible(encrypted), 'shopify-secret-1');
-    assert.equal(decryptTokenIfPossible('legacy-plaintext-secret'), 'legacy-plaintext-secret');
-    assert.throws(
-        () => decryptTokenIfPossible(`${'00'.repeat(16)}:${'00'.repeat(16)}:00`),
-        /verify AES_SECRET_KEY/,
-    );
-});
-
-test('credential throttle scope is stable and platform isolated', () => {
-    assert.equal(
-        credentialFingerprint('facebook', 'shared-token'),
-        credentialFingerprint('facebook', 'shared-token'),
-    );
-    assert.notEqual(
-        credentialFingerprint('facebook', 'shared-token'),
-        credentialFingerprint('tiktok', 'shared-token'),
-    );
-    assert.equal(
-        credentialFingerprint('facebook', 'token-a', 'business-1'),
-        credentialFingerprint('facebook', 'token-b', 'BUSINESS-1'),
-    );
-});
-
-test('shop ingestion token comparison is exact and timing safe', () => {
-    assert.equal(timingSafeStringCompare('abc123', 'abc123'), true);
-    assert.equal(timingSafeStringCompare('abc123', 'abc124'), false);
-    assert.equal(timingSafeStringCompare('abc123', 'abc123='), false);
-});
-
-test('missing match signal diagnostics identify EMQ gaps', () => {
-    assert.deepEqual(missingMatchSignals({
-        em: ['hash'],
-        ph: ['hash'],
-        client_ip_address: '203.0.113.10',
-        client_user_agent: 'Mozilla/5.0',
-    }), [
-        'external_id',
-        'fbp',
-        'fbc',
-        'first_name',
-        'last_name',
-        'city',
-        'state',
-        'zip',
-        'country',
-    ]);
-});
-
-test('TikTok standard event mapping is stable', () => {
-    assert.equal(tiktokEventName('Purchase'), 'Purchase');
-    assert.equal(tiktokEventName('AddToCart'), 'AddToCart');
-    assert.equal(tiktokEventName('ShopifyAlertDisplayed'), 'ShopifyAlertDisplayed');
-});
-
-test('successful delivery keys prevent resending already successful pixels', () => {
-    const keys = successfulDeliveryKeys([
-        {
-            fb_response: {
-                deliveries: [
-                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
-                    { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED' },
-                    { platform: 'facebook', pixel_id: 'META2', status: 'SKIPPED_ALREADY_SUCCESS' },
-                ],
-            },
-        },
-    ]);
-
-    assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META1' }, keys), true);
-    assert.equal(shouldSkipPixel({ platform: 'tiktok', pixel_id: 'TT1' }, keys), false);
-    assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META2' }, keys), false);
-});
-
-test('successful delivery keys only skip a pixel when every event already succeeded', () => {
-    const keys = successfulDeliveryKeys([
-        {
-            request_payload: { event_id: 'evt-a' },
-            fb_response: {
-                deliveries: [
-                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS', event_ids: ['evt-a'] },
-                    { platform: 'tiktok', pixel_id: 'TT1', status: 'SUCCESS', event_ids: ['evt-a'] },
-                ],
-            },
-        },
-        {
-            request_payload: { event_id: 'evt-b' },
-            fb_response: {
-                deliveries: [
-                    { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS', event_ids: ['evt-b'] },
-                    { platform: 'tiktok', pixel_id: 'TT1', status: 'SUCCESS', event_ids: ['evt-a'] },
-                ],
-            },
-        },
-    ]);
-
-    assert.equal(shouldSkipPixel({ platform: 'facebook', pixel_id: 'META1' }, keys), true);
-    assert.equal(shouldSkipPixel({ platform: 'tiktok', pixel_id: 'TT1' }, keys), false);
-});
-
-test('eventHasSuccessfulDelivery checks success per event and pixel', () => {
-    const event = {
-        request_payload: { event_id: 'evt-a' },
-        fb_response: {
-            deliveries: [
-                { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS', event_ids: ['evt-a'] },
-                { platform: 'facebook', pixel_id: 'META2', status: 'SUCCESS', event_ids: ['evt-b'] },
-                { platform: 'tiktok', pixel_id: 'TT1', status: 'FAILED', event_ids: ['evt-a'] },
-            ],
-        },
-    };
-
-    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META1' }), true);
-    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META2' }), false);
-    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'tiktok', pixel_id: 'TT1' }), false);
-});
-
-test('legacy successful deliveries without event ids still count as successful', () => {
-    const event = {
-        request_payload: { event_id: 'evt-a' },
-        fb_response: {
-            deliveries: [
-                { platform: 'facebook', pixel_id: 'META1', status: 'SUCCESS' },
-            ],
-        },
-    };
-
-    assert.equal(eventHasSuccessfulDelivery(event, { platform: 'facebook', pixel_id: 'META1' }), true);
-});
-
-test('delivery status remains pending until every configured route is terminal', () => {
-    assert.equal(aggregateDeliveryStatus(['SUCCESS', 'PENDING']), 'PENDING');
-    assert.equal(aggregateDeliveryStatus(['SUCCESS', 'RETRYABLE_FAILED']), 'PENDING');
-    assert.equal(aggregateDeliveryStatus(['SUCCESS', 'SUCCESS']), 'SUCCESS');
-    assert.equal(aggregateDeliveryStatus(['SUCCESS', 'FAILED_PERMANENT']), 'PARTIAL_FAILED');
-    assert.equal(aggregateDeliveryStatus(['FAILED_PERMANENT', 'FAILED_PERMANENT']), 'FAILED');
-});
-
-test('route retry backoff is exponential and capped', () => {
-    assert.equal(retryDelaySeconds(1, 5, 900), 5);
-    assert.equal(retryDelaySeconds(4, 5, 900), 40);
-    assert.equal(retryDelaySeconds(20, 5, 900), 900);
-});
-
-test('platform retry control honors Retry-After and adds bounded jitter', () => {
-    assert.equal(parseRetryAfterSeconds('120', 0), 120);
-    assert.equal(parseRetryAfterSeconds('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120);
-    assert.equal(retryDelayWithJitterSeconds(4, 5, 900, 120, 86400, 0.5), 120);
-    assert.equal(retryDelayWithJitterSeconds(4, 5, 900, undefined, 86400, 0.5), 40);
-});
-
-test('Meta usage headers proactively open a credential cooldown', () => {
-    const control = metaRateControlFromHeaders({
-        'x-business-use-case-usage': JSON.stringify({
-            dataset: [{ call_count: 96, total_time: 40, estimated_time_to_regain_access: 22 }],
-        }),
-    });
-    assert.equal(control.maxUsagePercent, 96);
-    assert.equal(control.estimatedRecoverySeconds, 1320);
-    assert.equal(control.cooldownSeconds, 1320);
-});
-
-test('Meta transient errors are retryable even when the code is unfamiliar', () => {
-    const classification = classifyFacebookError({
-        message: 'temporary',
-        response: {
-            status: 400,
-            headers: { 'retry-after': '45' },
-            data: { error: { code: 999999, is_transient: true, message: 'try later' } },
-        },
-    });
-    assert.equal(classification.retryable, true);
-    assert.equal(classification.retryAfterSeconds, 45);
-});
-
-test('Meta request-level permission failures never amplify a 100-event batch', async () => {
-    for (const error of [
-        { response: { status: 403, data: { error: { code: 200, message: 'Permissions error' } } } },
-        { response: { status: 400, data: { error: { code: 10, message: 'Application does not have permission' } } } },
-        { response: { status: 400, data: { error: { code: 803, message: 'Object does not exist' } } } },
-        { response: { status: 400, data: { error: { code: 100, message: 'Invalid request parameter' } } } },
-    ]) {
-        let requests = 0;
-        const items = Array.from({ length: 100 }, (_, id) => ({ id }));
-        const result = await isolateMetaBatch(items, { remaining: 16 }, {
-            async send() {
-                requests += 1;
-                throw error;
-            },
-            classify: classifyFacebookError,
-            shouldIsolate: shouldIsolateFacebookError,
-            failure: (failedItems, classification) => ({
-                count: failedItems.length,
-                code: classification.code,
-            }),
+    function removeOldest(predicate) {
+        var index = queue.findIndex(function (call) {
+            return call && call[0] !== 'init' && predicate(call);
         });
-        assert.equal(requests, 1);
-        assert.equal(result.failures[0].count, 100);
-        assert.equal(result.deferredItems.length, 0);
+        if (index < 0) return false;
+        queue.splice(index, 1);
+        return true;
     }
-});
 
-test('Meta isolation budget preserves completed branches and defers only unresolved events', async () => {
-    const items = Array.from({ length: 8 }, (_, id) => ({ id }));
-    let requests = 0;
-    const result = await isolateMetaBatch(items, { remaining: 2 }, {
-        async send(batch) {
-            requests += 1;
-            if (batch.length === 8) {
-                throw { response: { status: 400, data: { error: {
-                    code: 100,
-                    message: 'Invalid event data',
-                    error_data: { blame_field_specs: [['data', '6', 'event_time']] },
-                } } } };
-            }
-            return { ids: batch.map(item => item.id) };
-        },
-        classify: classifyFacebookError,
-        shouldIsolate: shouldIsolateFacebookError,
-        failure: () => assert.fail('no branch should be marked permanent'),
-    });
-    assert.equal(requests, 2);
-    assert.deepEqual(result.successes[0].ids, [0, 1, 2, 3]);
-    assert.deepEqual(result.deferredItems.map(item => item.id), [4, 5, 6, 7]);
-    assert.equal(result.budgetExhausted, true);
-});
-
-test('Meta isolation stops sibling probes after a transient credential failure', async () => {
-    const items = Array.from({ length: 4 }, (_, id) => ({ id }));
-    let requests = 0;
-    const result = await isolateMetaBatch(items, { remaining: 10 }, {
-        async send(batch) {
-            requests += 1;
-            if (batch.length === 4) {
-                throw { response: { status: 400, data: { error: {
-                    code: 100,
-                    message: 'Invalid event data',
-                    error_data: { blame_field_specs: [['data', '1', 'custom_data']] },
-                } } } };
-            }
-            throw { response: { status: 429, data: { error: { code: 4, is_transient: true } } } };
-        },
-        classify: classifyFacebookError,
-        shouldIsolate: shouldIsolateFacebookError,
-        failure: () => assert.fail('transient failure must not become permanent'),
-    });
-    assert.equal(requests, 2);
-    assert.equal(result.retryError.response.status, 429);
-    assert.deepEqual(result.deferredItems.map(item => item.id), [0, 1, 2, 3]);
-});
-
-test('local Redis fallback rate limit counts events instead of HTTP requests', () => {
-    const windows = new Map();
-    const first = consumeWeightedWindow(windows, 'shop:ip', 50, 60, { nowMs: 1000 });
-    const second = consumeWeightedWindow(windows, 'shop:ip', 10, 60, { nowMs: 2000 });
-    const rejected = consumeWeightedWindow(windows, 'shop:ip', 1, 60, { nowMs: 3000 });
-    assert.equal(first.allowed, true);
-    assert.equal(first.remaining, 10);
-    assert.equal(second.allowed, true);
-    assert.equal(second.remaining, 0);
-    assert.equal(rejected.allowed, false);
-    assert.equal(rejected.count, 61);
-});
-
-test('Meta website events are validated before consuming platform quota', () => {
-    const now = 1785000000;
-    assert.deepEqual(validateMetaEvent({
-        event_name: 'Purchase',
-        event_id: 'checkout-1',
-        event_time: now,
-        action_source: 'website',
-        event_source_url: 'https://demo.myshopify.com/checkouts/1',
-        customer_segmentation: 'new_customer_to_business',
-        opt_out: false,
-        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
-        custom_data: { value: 46, currency: 'USD' },
-    }, now), []);
-    assert.deepEqual(validateMetaEvent({
-        event_name: 'PageView',
-        event_id: 'page-1',
-        event_time: now,
-        action_source: 'website',
-        event_source_url: 'https://demo.myshopify.com/',
-        customer_segmentation: 'guessed_customer',
-        opt_out: 'false',
-        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
-    }, now), [
-        'customer_segmentation must be a supported Meta segment',
-        'opt_out must be boolean',
-    ]);
-    assert.deepEqual(validateMetaEvent({
-        event_name: 'Purchase',
-        event_id: 'checkout-1',
-        event_time: now - (8 * 24 * 60 * 60),
-        action_source: 'website',
-        event_source_url: 'https://demo.myshopify.com/',
-        user_data: {},
-        custom_data: { value: -1, currency: 'usd' },
-    }, now), [
-        'user_data requires at least one valid matching signal',
-        'event_time is older than seven days',
-        'website events require client_user_agent',
-        'Purchase value must be a non-negative number',
-        'Purchase currency must be a three-letter uppercase code',
-    ]);
-    assert.deepEqual(validateMetaEvent({
-        event_name: 'Purchase',
-        event_id: 'checkout-2',
-        event_time: now,
-        action_source: 'website',
-        event_source_url: 'https://demo.myshopify.com/',
-        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
-        custom_data: {},
-    }, now), [
-        'Purchase value is required',
-        'Purchase currency is required',
-    ]);
-    assert.deepEqual(validateMetaEvent({
-        event_name: 'AddToCart',
-        event_id: 'cart-1',
-        event_time: now,
-        action_source: 'website',
-        event_source_url: 'https://demo.myshopify.com/products/1',
-        user_data: { client_ip_address: '203.0.113.10', client_user_agent: 'Mozilla/5.0' },
-        custom_data: { value: 10 },
-    }, now), ['AddToCart value and currency must be provided together']);
-});
-
-test('commerce quality diagnostics identify missing funnel parameters without dropping the event', () => {
-    assert.deepEqual(missingCommerceSignals('PageView', {}), []);
-    assert.deepEqual(missingCommerceSignals('AddToCart', {
-        value: 10,
-        currency: 'USD',
-        content_ids: ['111'],
-        contents: [{ id: '111', quantity: 1 }],
-    }), []);
-    assert.deepEqual(missingCommerceSignals('Purchase', { value: 0, currency: 'USD' }), [
-        'content_ids',
-        'contents',
-        'order_id',
-    ]);
-});
-
-test('schema defines multistore routing and per-route idempotency boundaries', () => {
-    const schema = fs.readFileSync(path.join(__dirname, '..', 'init.sql'), 'utf8');
-    const scaleIndexes = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'scale-indexes.sql'), 'utf8');
-    const workerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'worker.js'), 'utf8');
-    assert.match(schema, /CREATE TABLE IF NOT EXISTS shop_pixel_routes/);
-    assert.match(schema, /UNIQUE \(shop_id, pixel_id\)/);
-    assert.match(schema, /CREATE TABLE IF NOT EXISTS event_deliveries/);
-    assert.match(schema, /CREATE TABLE IF NOT EXISTS event_id_aliases/);
-    assert.match(schema, /UNIQUE \(shop_id, event_name, alias_type, alias_value\)/);
-    assert.match(schema, /UNIQUE \(event_store_id, route_id\)/);
-    assert.match(schema, /delivery_route_snapshot BIGINT\[\]/);
-    assert.match(schema, /REFERENCES shop_pixel_routes\(id\) ON DELETE RESTRICT/);
-    assert.match(schema, /REFERENCES pixels\(id\) ON DELETE RESTRICT/);
-    assert.match(schema, /status VARCHAR\(20\) NOT NULL DEFAULT 'active'/);
-    assert.match(schema, /CREATE OR REPLACE FUNCTION enforce_event_delivery_tenant\(\)/);
-    assert.match(schema, /JOIN shop_pixel_routes route ON route\.shop_id = event\.shop_id/);
-    assert.match(schema, /CREATE TRIGGER trg_event_delivery_tenant/);
-    assert.match(schema, /ON event_store\(shop_id, event_name, event_id\)/);
-    assert.doesNotMatch(schema, /DROP TABLE IF EXISTS schema_migrations/);
-    assert.match(schema, /indexdef NOT LIKE '%\(shop_id, event_name, event_id\)%'/);
-    assert.match(schema, /rate_limit_until TIMESTAMPTZ/);
-    assert.match(schema, /credential_scope VARCHAR\(64\)/);
-    assert.match(schema, /credential_version BIGINT NOT NULL DEFAULT 1/);
-    assert.match(schema, /shop_pixel_routes \([\s\S]*?test_event_code VARCHAR\(100\)/);
-    assert.match(schema, /SET test_event_code = pixel\.test_event_code/);
-    assert.match(schema, /UPDATE pixels[\s\S]*?SET test_event_code = NULL[\s\S]*?WHERE test_event_code IS NOT NULL/);
-    assert.match(schema, /ALTER TABLE event_store SET \([\s\S]*?autovacuum_vacuum_scale_factor = 0\.02/);
-    assert.match(scaleIndexes, /CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_store_pending_shop_time/);
-    assert.match(scaleIndexes, /WHERE status = 'PENDING'/);
-    assert.match(scaleIndexes, /idx_event_store_retention_all_terminal/);
-    assert.match(scaleIndexes, /CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_pixels_platform_external_id[\s\S]*?ON pixels\(platform, pixel_id\)/);
-    assert.match(scaleIndexes, /idx_pixels_credential_scope/);
-    assert.match(workerSource, /ed\.attempt_count = c\.attempt_count/);
-    assert.match(workerSource, /redis\.call\("pexpire"/);
-    assert.match(workerSource, /config\.deliveryMaxAttempts > 0/);
-    assert.match(workerSource, /WHERE shop_id = \$1\s+AND id = ANY\(\$2::bigint\[\]\)/);
-    assert.match(workerSource, /event\.status === 'PENDING' && Number\(event\.shop_id\) === normalizedShopId/);
-    assert.match(workerSource, /scheduleShopContinuation\(normalizedShopId\)/);
-    assert.match(workerSource, /config\.workerEventBatchSize/);
-    assert.match(workerSource, /hasClaimableRouteEvents\(pixel\.route_id, idsToUpdate\)/);
-    assert.match(workerSource, /status IN \('PENDING', 'RETRYABLE_FAILED'\)[\s\S]*?next_attempt_at <= NOW\(\)/);
-    assert.match(workerSource, /const token = `\$\{process\.pid\}:\$\{crypto\.randomUUID\(\)\}`/);
-    assert.match(workerSource, /lock:delivery-shop:\$\{normalizedShopId\}/);
-    assert.match(workerSource, /lock:delivery-credential:\$\{credentialScope\}/);
-    assert.match(workerSource, /credentialFingerprint\(\s*pixel\.platform,\s*decryptedCredential,\s*pixel\.rate_limit_group,?\s*\)/);
-    assert.match(workerSource, /credential_version = \$3/);
-    assert.match(workerSource, /LOCAL_CREDENTIAL_CHANGED/);
-    assert.match(workerSource, /p\.rate_limit_group,[\s\S]*?r\.test_event_code/);
-    assert.match(workerSource, /WHERE credential_scope = \$1/);
-    assert.match(workerSource, /snapshot_delivery\.event_store_id = ANY\(\$2::bigint\[\]\)/);
-    assert.match(workerSource, /SET delivery_route_snapshot = active_routes\.route_ids/);
-    assert.match(workerSource, /CARDINALITY\(active_routes\.route_ids\) > 0/);
-    assert.match(workerSource, /successful_event_store_ids/);
-    assert.match(workerSource, /LEFT JOIN event_deliveries delivery[\s\S]*?delivery\.next_attempt_at <= NOW\(\)/);
-    assert.match(workerSource, /const responseCode = Number\(response\.data\?\.code \?\? 0\)/);
-    assert.doesNotMatch(schema, /ON event_store\(shop_id, event_name, md5\(event_id\)\)/);
-    const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
-    assert.match(serverSource, /AWAITING_PAYMENT/);
-    assert.match(serverSource, /webhookTopic !== 'orders\/paid'/);
-    assert.match(serverSource, /paymentConfirmed: true/);
-    assert.match(serverSource, /INSERT INTO shopify_webhook_inbox/);
-    assert.match(serverSource, /updated_at:<'?='?\$\{cutoff\}/);
-    assert.match(serverSource, /lineItems\(first: 250\)/);
-    assert.match(serverSource, /SHOPIFY_ORDER_LINE_ITEMS_QUERY/);
-    assert.match(serverSource, /while \(pageInfo\?\.hasNextPage\)/);
-    assert.match(serverSource, /email phone cartToken checkoutToken clientIp/);
-    assert.match(serverSource, /currentAppInstallation \{ accessScopes \{ handle \} \}/);
-    assert.match(serverSource, /customer @include\(if: \$includeCustomer\)/);
-    assert.match(serverSource, /node\.processedAt \|\| node\.createdAt \|\| scanCutoff/);
-    assert.match(serverSource, /ON CONFLICT \(shop_id, event_name, event_id\) DO NOTHING/);
-    assert.match(serverSource, /SELECT id, shop_id, event_name, event_id, request_payload,[\s\S]*?FOR UPDATE/);
-    assert.match(serverSource, /existing\.status === 'SUCCESS'/);
-    assert.match(serverSource, /mergePersistedEventPayload\(existing\.request_payload, purePayload\)/);
-    assert.match(serverSource, /calculateEMQ\(mergedPayload\.user_data \|\| \{\}\)/);
-    assert.match(serverSource, /existing\.status === 'AWAITING_PAYMENT'[\s\S]*?purePayload\._payment_confirmed === true/);
-    assert.match(serverSource, /paidOrderIgnoreReason/);
-    assert.match(serverSource, /Missing stable order identity/);
-    assert.match(serverSource, /if \(eventName !== 'Purchase'\) return \[\]/);
-    assert.match(serverSource, /scheduler:stale_pending_shop_cursor/);
-    assert.match(serverSource, /reconcileEventAggregateStatuses/);
-    assert.match(serverSource, /SET status = 'archived'/);
-    assert.doesNotMatch(serverSource, /DELETE FROM pixels WHERE id = \$1/);
-    assert.match(serverSource, /error_code = 'ROUTE_ARCHIVED'/);
-    assert.match(serverSource, /capi-saas-pro:aggregate-reconcile/);
-    assert.match(serverSource, /FOR UPDATE OF event SKIP LOCKED/);
-    assert.match(serverSource, /SET status = CASE WHEN \$2::boolean THEN 'PENDING' ELSE status END,[\s\S]*?request_payload = \$4::jsonb/);
-    assert.match(serverSource, /GROUP BY e\.shop_id\s+ORDER BY e\.shop_id ASC/);
-    assert.match(serverSource, /jobId: `rescue-\$\{shopId\}-\$\{rescueMinute\}`/);
-    assert.match(serverSource, /const state = await job\.getState\(\)/);
-    assert.match(serverSource, /state === 'completed' \|\| state === 'failed'/);
-    assert.match(serverSource, /cleanupExpiredOperationalData/);
-    assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
-    assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
-    assert.match(serverSource, /tenant_id: shopDomain/);
-    assert.match(serverSource, /customer_segmentation: normalizeCustomerSegmentation/);
-    assert.match(serverSource, /WHERE platform = \$1 AND pixel_id = \$2/);
-    assert.match(serverSource, /credential_version = credential_version \+ CASE WHEN \$8::boolean THEN 1 ELSE 0 END/);
-    assert.match(serverSource, /RECOVERABLE_META_CREDENTIAL_CODES/);
-    assert.match(serverSource, /recovered_credential_failures: recoveredCredentialFailures/);
-    assert.match(serverSource, /delivery\.error_code = ANY\(\$2::text\[\]\)/);
-    assert.match(serverSource, /INSERT INTO shop_pixel_routes \(shop_id, pixel_id, test_event_code\)/);
-    assert.match(serverSource, /'test_event_code', r\.test_event_code/);
-    assert.match(serverSource, /lock:delivery-credential:\$\{pixel\.credential_scope \|\| pixel\.id\}/);
-    assert.match(serverSource, /UNNEST\(\$1::int\[\]\) AS requested\(shop_id\)/);
-    assert.match(serverSource, /SET status = 'inactive'[\s\S]*?WHERE pixel_id = \$1/);
-    assert.match(serverSource, /error_code = 'ROUTE_INACTIVE'/);
-    assert.match(serverSource, /route\.status = 'active'[\s\S]*?delivery\.status = 'FAILED_PERMANENT'/);
-    assert.match(serverSource, /startRedisLockHeartbeat/);
-    assert.match(serverSource, /if \(!config\.legacyRedisDrainEnabled\) return/);
-    assert.match(serverSource, /res\.status\(redisState === 'ready' \? 200 : 503\)/);
-    assert.match(serverSource, /immediate_dispatch: redisState === 'ready'/);
-    assert.match(serverSource, /if \(statusCode >= 500\) throw error/);
-    assert.match(serverSource, /requireBoundedString\(trustedPayload\.event_id, 'event_id', 4096\)/);
-    assert.match(serverSource, /err\.statusCode \|\| err\.status \|\| 500/);
-    assert.match(serverSource, /payloadWeight = Math\.ceil\(Number\(req\.rawBody\?\.length \|\| 0\) \/ 16_384\)/);
-    assert.match(serverSource, /buildCustomData\(enrichedPayload, config\.commerceItemLimit\)/);
-    const redisSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'utils', 'redis.js'), 'utf8');
-    assert.match(redisSource, /maxRetriesPerRequest: 1/);
-    assert.match(redisSource, /enableOfflineQueue: false/);
-    assert.match(redisSource, /createBullMqWorkerConnection/);
-    const migrateSource = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'migrate.js'), 'utf8');
-    assert.match(migrateSource, /pg_try_advisory_lock/);
-    assert.match(migrateSource, /indisvalid/);
-    assert.match(migrateSource, /indisunique/);
-    assert.match(migrateSource, /Duplicate external Pixel credentials must be consolidated/);
-    assert.match(migrateSource, /DROP INDEX CONCURRENTLY IF EXISTS/);
-    assert.match(migrateSource, /FROM pixels[\s\S]*?WHERE status = 'active'[\s\S]*?ORDER BY id/);
-    assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_webhook_inbox/);
-    assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_reconcile_state/);
-    assert.match(schema, /CREATE TABLE IF NOT EXISTS shopify_privacy_inbox/);
-    assert.match(schema, /UNIQUE \(shop_domain_hash, webhook_id\)/);
-    assert.match(scaleIndexes, /idx_shopify_privacy_inbox_due/);
-    assert.match(scaleIndexes, /idx_shopify_privacy_inbox_action/);
-    assert.match(scaleIndexes, /idx_shopify_webhook_inbox_retention/);
-    assert.match(scaleIndexes, /idx_shopify_privacy_inbox_retention/);
-    assert.match(serverSource, /INSERT INTO shopify_webhook_inbox/);
-    assert.match(serverSource, /financial_status:paid/);
-    assert.match(serverSource, /shopify_reconcile_state/);
-    assert.match(serverSource, /FOR UPDATE SKIP LOCKED/);
-    assert.match(serverSource, /res\.status\(200\)\.json\(\{ success: true, accepted: true, durable: true/);
-    assert.match(serverSource, /setImmediate\(\(\) => void drainShopifyWebhookInbox/);
-    assert.match(serverSource, /app\.post\('\/api\/webhook\/customers\/data_request'/);
-    assert.match(serverSource, /app\.post\('\/api\/webhook\/customers\/redact'/);
-    assert.match(serverSource, /app\.post\('\/api\/webhook\/shop\/redact'/);
-    assert.match(serverSource, /return res\.status\(401\)\.send\('HMAC Failed'\)/);
-    assert.match(serverSource, /\$2 <> '' AND/);
-    assert.match(serverSource, /payload = NULL,[\s\S]*?result = NULL,[\s\S]*?shop_domain = NULL/);
-    assert.match(serverSource, /DISTRIBUTED_RATE_LIMIT_SCRIPT/);
-    assert.match(serverSource, /rate:pixel:\$\{digest\}/);
-    assert.match(serverSource, /Recovered invalid cursor/);
-    assert.match(serverSource, /for \(const task of scheduledTasks\) task\.stop\(\)/);
-});
-
-test('runtime config rejects weak encryption keys and malformed CORS origins', () => {
-    const weakSecret = probeConfig({ AES_SECRET_KEY: 'too-short' });
-    assert.notEqual(weakSecret.status, 0);
-    assert.match(weakSecret.stderr, /AES_SECRET_KEY must be at least 32 characters/);
-
-    const malformedOrigin = probeConfig({ CORS_ORIGIN: 'https://shop.example.com/path' });
-    assert.notEqual(malformedOrigin.status, 0);
-    assert.match(malformedOrigin.stderr, /CORS_ORIGIN entries must be exact http\(s\) origins/);
-
-    const invalidJsonLimit = probeConfig({ JSON_LIMIT: 'unlimited' });
-    assert.notEqual(invalidJsonLimit.status, 0);
-    assert.match(invalidJsonLimit.stderr, /JSON_LIMIT must be a byte size/);
-
-    const excessiveJsonLimit = probeConfig({ JSON_LIMIT: '17mb' });
-    assert.notEqual(excessiveJsonLimit.status, 0);
-    assert.match(excessiveJsonLimit.stderr, /JSON_LIMIT must be between 1kb and 16mb/);
-
-    const excessiveCommerceItems = probeConfig({ COMMERCE_ITEM_LIMIT: '5001' });
-    assert.notEqual(excessiveCommerceItems.status, 0);
-    assert.match(excessiveCommerceItems.stderr, /COMMERCE_ITEM_LIMIT must not exceed 5000/);
-
-    const productionWithoutIngestSecret = probeConfig({
-        NODE_ENV: 'production',
-        ADMIN_PASSWORD: 'production-password-strong',
-        INGEST_TOKEN_SECRET: '',
-    });
-    assert.notEqual(productionWithoutIngestSecret.status, 0);
-    assert.match(productionWithoutIngestSecret.stderr, /INGEST_TOKEN_SECRET must be set separately/);
-
-    const productionSharedSecrets = probeConfig({
-        NODE_ENV: 'production',
-        ADMIN_PASSWORD: 'production-password-strong',
-        INGEST_TOKEN_SECRET: 'test-secret-key-with-at-least-32-chars',
-    });
-    assert.notEqual(productionSharedSecrets.status, 0);
-    assert.match(productionSharedSecrets.stderr, /INGEST_TOKEN_SECRET must differ from AES_SECRET_KEY/);
-
-    const productionWeakAdminPassword = probeConfig({
-        NODE_ENV: 'production',
-        ADMIN_PASSWORD: 'short',
-        INGEST_TOKEN_SECRET: 'separate-ingest-secret-with-32-characters',
-    });
-    assert.notEqual(productionWeakAdminPassword.status, 0);
-    assert.match(productionWeakAdminPassword.stderr, /ADMIN_PASSWORD must be at least 16 characters/);
-
-    const productionWithoutIngestEnforcement = probeConfig({
-        NODE_ENV: 'production',
-        ADMIN_PASSWORD: 'production-password-strong',
-        INGEST_TOKEN_SECRET: 'separate-ingest-secret-with-32-characters',
-        REQUIRE_INGEST_TOKEN: 'false',
-    });
-    assert.notEqual(productionWithoutIngestEnforcement.status, 0);
-    assert.match(productionWithoutIngestEnforcement.stderr, /REQUIRE_INGEST_TOKEN must remain enabled/);
-
-    const malformedApiVersion = probeConfig({ FB_API_VERSION: '../latest' });
-    assert.notEqual(malformedApiVersion.status, 0);
-    assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v25\.0/);
-
-    const malformedShopifyVersion = probeConfig({ SHOPIFY_API_VERSION: 'latest' });
-    assert.notEqual(malformedShopifyVersion.status, 0);
-    assert.match(malformedShopifyVersion.stderr, /SHOPIFY_API_VERSION must look like 2026-07/);
-
-    const valid = probeConfig({
-        CORS_ORIGIN: 'https://shop.example.com,http://localhost:3000',
-        TRUST_PROXY_HOPS: '0',
-    });
-    assert.equal(valid.status, 0, valid.stderr);
-    const parsed = JSON.parse(valid.stdout);
-    assert.deepEqual(parsed.corsOrigin, ['https://shop.example.com', 'http://localhost:3000']);
-    assert.equal(parsed.trustProxy, 0);
-
-    const excessiveWorkerBatch = probeConfig({ WORKER_EVENT_BATCH_SIZE: '1001' });
-    assert.notEqual(excessiveWorkerBatch.status, 0);
-    assert.match(excessiveWorkerBatch.stderr, /WORKER_EVENT_BATCH_SIZE must not exceed 1000/);
-
-    const unsafeHeaderDeadline = probeConfig({
-        HTTP_KEEP_ALIVE_TIMEOUT_MS: '15000',
-        HTTP_HEADERS_TIMEOUT_MS: '15000',
-    });
-    assert.notEqual(unsafeHeaderDeadline.status, 0);
-    assert.match(unsafeHeaderDeadline.stderr, /HTTP_HEADERS_TIMEOUT_MS must exceed HTTP_KEEP_ALIVE_TIMEOUT_MS/);
-
-    const unsafeShutdownDeadline = probeConfig({
-        HTTP_REQUEST_TIMEOUT_MS: '30000',
-        SHUTDOWN_TIMEOUT_MS: '30000',
-    });
-    assert.notEqual(unsafeShutdownDeadline.status, 0);
-    assert.match(unsafeShutdownDeadline.stderr, /SHUTDOWN_TIMEOUT_MS must exceed HTTP_REQUEST_TIMEOUT_MS/);
-});
-
-test('CORS and partial-delivery safeguards remain wired into the runtime', () => {
-    const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
-    const workerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'worker.js'), 'utf8');
-
-    assert.match(serverSource, /app\.use\(\['\/api\/pixel-event', '\/api\/pixel-config'\], cors\(/);
-    assert.ok(
-        serverSource.indexOf("app.use('/api/admin', adminLimiter, authMw")
-            < serverSource.indexOf('app.use(express.json'),
-        'admin authentication must run before JSON body parsing',
-    );
-    assert.match(serverSource, /Cache-Control', 'private, no-store'/);
-    assert.match(serverSource, /app\.post\('\/api\/pixel-config', asyncHandler/);
-    assert.match(serverSource, /pixel\.platform = 'facebook'/);
-    assert.match(serverSource, /PIXEL_CONFIG_CACHE_TTL_MS/);
-    assert.doesNotMatch(serverSource, /app\.use\(cors\(/);
-    assert.doesNotMatch(serverSource, /contentSecurityPolicy: false/);
-    assert.doesNotMatch(serverSource, /https:\/\/cdn\.tailwindcss\.com/);
-    assert.match(workerSource, /error\.partialDelivery =/);
-    assert.match(workerSource, /retryable_event_ids/);
-    assert.match(workerSource, /await applyPlatformResult\(/);
-    assert.match(serverSource, /SELECT DISTINCT ON \(m\.pixel_route_id, m\.shop_id\)/);
-});
-
-test('long event IDs retain a collision-resistant suffix before persistence', () => {
-    const sharedPrefix = 'checkout-'.padEnd(300, 'x');
-    const first = normalizeEventId(`${sharedPrefix}-first`);
-    const second = normalizeEventId(`${sharedPrefix}-second`);
-
-    assert.equal(first.length, 255);
-    assert.equal(second.length, 255);
-    assert.notEqual(first, second);
-    assert.equal(normalizeEventId('gid://shopify/Order/12345'), '12345');
-});
-
-test('commerce events retain multi-page order contents up to the configured safety boundary', () => {
-    const contents = Array.from({ length: 300 }, (_, index) => ({
-        id: `variant-${index + 1}`,
-        quantity: 1,
-        item_price: index + 0.5,
-    }));
-    const customData = buildCustomData({
-        shop_domain: 'demo.myshopify.com',
-        order_id: '#1001',
-        value: 999,
-        currency: 'usd',
-        contents,
-        content_ids: ['stale-product'],
-    }, 1000);
-
-    assert.equal(customData.contents.length, 300);
-    assert.equal(customData.content_ids.length, 300);
-    assert.equal(customData.content_ids.includes('stale-product'), false);
-    assert.equal(customData.order_id, 'demo.myshopify.com:#1001');
-    assert.equal(customData.currency, 'USD');
-    assert.equal(buildCustomData({ contents }, 250).contents.length, 250);
-});
-
-test('generated Shopify pixel sends Meta browser and CAPI events with identical dedupe IDs', async () => {
-    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
-    const match = html.match(/generatedCode\(\)\s*{\s*return `([\s\S]*?)`;\s*}\s*,\s*}\s*,\s*methods:/);
-    assert.ok(match, 'generatedCode template should exist');
-
-    const renderedTemplate = match[1]
-        .replaceAll('${this.apiDomain}', 'https://nestworks.com.au:8443')
-        .replaceAll('${this.currentShop}', 'demo.myshopify.com')
-        .replaceAll('${this.currentShopIngestToken}', 'test-ingest-token')
-        .replaceAll('${JSON.stringify(this.currentMetaPixelIds)}', '["1234567890","2222222222"]')
-        .replaceAll('${JSON.stringify(this.currentTikTokPixelIds)}', '["TT123"]');
-    // The browser evaluates this as a template literal before presenting the
-    // generated pixel. Cook escape sequences here so the VM executes exactly
-    // the code a merchant copies from the admin UI.
-    const generated = Function(`return \`${renderedTemplate}\`;`)();
-
-    assert.doesNotMatch(
-        generated,
-        /\n\s*[?:]/,
-        'generated Shopify pixel must not start a line with a ternary operator',
-    );
-
-    assert.equal(generated.includes('document.createElement'), true);
-    assert.equal(generated.includes('typeof document'), true);
-    assert.equal(generated.includes('connect.facebook.net/en_US/fbevents.js'), true);
-    assert.equal(generated.includes('analytics.tiktok.com'), false);
-    assert.equal(generated.includes('fbq'), true);
-    assert.equal(generated.includes('ttq'), false);
-    assert.equal(generated.includes('FB_PIXEL_ID'), false);
-    assert.equal(generated.includes('TIKTOK_PIXEL_ID'), false);
-    assert.equal(generated.includes('META_ROUTE_PIXEL_IDS'), true);
-    assert.equal(generated.includes('new URL'), false);
-    assert.equal(generated.includes("metaEventName + '_' + Date.now()"), false);
-    assert.equal(generated.includes('fallbackEventId'), true);
-    assert.equal(generated.includes('shopScopedIdentifier'), true);
-    assert.equal(generated.includes('AbortController'), true);
-    assert.equal(generated.includes('KEEPALIVE_LIMIT_BYTES'), true);
-    assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
-    assert.equal(generated.includes('requeueFailedEvents'), true);
-    assert.equal(generated.includes('sendDualChannelEvent'), true);
-    assert.equal(generated.includes('sendGatewayEvent'), false);
-    assert.equal(generated.includes('trackSingleCustom'), true);
-    assert.equal(generated.includes("var options = { eventID: String(eventId) }"), true);
-    assert.equal(generated.includes('META_PIXEL_MAX_LOAD_ATTEMPTS = 3'), true);
-    assert.equal(generated.includes('META_PIXEL_MAX_QUEUE_SIZE = 500'), true);
-    assert.equal(generated.includes('CAPI_PIXEL_CONFIG_URL'), true);
-    assert.equal(generated.includes('refreshMetaRouteConfig'), true);
-    assert.equal(generated.includes('_shopify_y'), false);
-    assert.equal(generated.includes('_shopify_s'), false);
-    assert.equal(generated.includes('browser.localStorage'), true);
-    assert.equal(generated.includes('MAX_CLIENT_RETRIES = 32'), true);
-    assert.equal(generated.includes('CLIENT_RETRY_MAX_AGE_MS'), true);
-    assert.equal(generated.includes('retryAfterMsFromResponse'), true);
-    assert.equal(generated.includes('isRetryableResponse'), true);
-    assert.equal(generated.includes('trackingAllowedByPrivacy'), false);
-    assert.equal(generated.includes('getInitContext'), true);
-    assert.equal(generated.includes('inFlightEvents'), true);
-    assert.equal(generated.includes('storageWriteChain'), true);
-    assert.equal(generated.includes('flushPromise'), true);
-
-    const callbacks = {};
-    const requests = [];
-    const configRequests = [];
-    const cookies = new Map();
-    const localStorage = new Map();
-    const metaScriptNodes = [];
-    const metaPixelWarnings = [];
-    let uuidCounter = 0;
-    const firstScript = {
-        parentNode: {
-            insertBefore: node => metaScriptNodes.push(node),
-        },
-    };
-    const sandbox = {
-        console: {
-            log: console.log,
-            error: console.error,
-            warn: message => metaPixelWarnings.push(String(message)),
-        },
-        URL,
-        Date,
-        Math,
-        TextEncoder,
-        crypto: {
-            randomUUID: () => `uuid-${++uuidCounter}`,
-            subtle: crypto.webcrypto.subtle,
-        },
-        setTimeout: () => 1,
-        clearTimeout: () => {},
-        window: {},
-        document: {
-            createElement: tagName => ({ tagName }),
-            getElementsByTagName: tagName => tagName === 'script' ? [firstScript] : [],
-        },
-        analytics: {
-            subscribe: (name, fn) => {
-                callbacks[name] = fn;
-            },
-        },
-        browser: {
-            cookie: {
-                get: async name => cookies.get(name),
-                set: async value => {
-                    const [pair] = String(value).split(';');
-                    const index = pair.indexOf('=');
-                    cookies.set(pair.slice(0, index), decodeURIComponent(pair.slice(index + 1)));
-                },
-            },
-            localStorage: {
-                getItem: async key => localStorage.get(key),
-                setItem: async (key, value) => {
-                    localStorage.set(key, String(value));
-                },
-                removeItem: async key => {
-                    localStorage.delete(key);
-                },
-            },
-        },
-        fetch: async (url, options) => {
-            if (String(url).endsWith('/api/pixel-config')) {
-                configRequests.push({ url, options, body: JSON.parse(options.body) });
-                return {
-                    ok: true,
-                    json: async () => ({
-                        shop_domain: 'demo.myshopify.com',
-                        pixel_ids: ['1234567890', '2222222222'],
-                    }),
-                };
-            }
-            requests.push({ url, options, body: JSON.parse(options.body) });
-            return { ok: true };
-        },
-    };
-
-    vm.runInNewContext(generated, sandbox);
-
-    const mergedOfflineDuplicate = sandbox.mergeQueuedEvents([
-        {
-            event_name: 'AddPaymentInfo',
-            event_id: 'demo.myshopify.com:checkout-1:AddPaymentInfo',
-            timestamp: '2026-06-24T00:00:00Z',
-            email_hash: hashFor('old@example.com', 'email'),
-            _client_first_queued_at: 100,
-            _client_retry_count: 2,
-        },
-        {
-            event_name: 'AddPaymentInfo',
-            event_id: 'demo.myshopify.com:checkout-1:AddPaymentInfo',
-            timestamp: '2026-06-24T00:01:00Z',
-            email_hash: hashFor('new@example.com', 'email'),
-            phone_hash: hashFor('+12125551212', 'phone'),
-            _client_first_queued_at: 200,
-            _client_retry_count: 1,
-        },
-    ]);
-    assert.equal(mergedOfflineDuplicate.length, 1);
-    assert.equal(mergedOfflineDuplicate[0].timestamp, '2026-06-24T00:00:00Z');
-    assert.equal(mergedOfflineDuplicate[0].email_hash, hashFor('new@example.com', 'email'));
-    assert.equal(mergedOfflineDuplicate[0].phone_hash, hashFor('+12125551212', 'phone'));
-    assert.equal(mergedOfflineDuplicate[0]._client_first_queued_at, 100);
-    assert.equal(mergedOfflineDuplicate[0]._client_retry_count, 2);
-
-    const storagePressure = Array.from({ length: 1001 }, (_, index) => ({
-        event_name: 'PageView',
-        event_id: `page-${index}`,
-    }));
-    storagePressure.push({ event_name: 'Purchase', event_id: 'critical-purchase' });
-    const boundedStorage = sandbox.boundStoredEvents(storagePressure);
-    assert.equal(boundedStorage.length, 1000);
-    assert.equal(boundedStorage.some(item => item.event_id === 'critical-purchase'), true);
-    assert.equal(boundedStorage.some(item => item.event_id === 'page-0'), false);
-
-    const event = {
-        id: 'shopify-event-1',
-        timestamp: '2026-06-24T00:00:00Z',
-        clientId: 'client-1',
-        context: {
-            document: {
-                location: { href: 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1' },
-                referrer: 'https://facebook.com/',
-            },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {
-            checkout: {
-                token: 'checkout-token-1',
-                totalPrice: { amount: '46.00', currencyCode: 'USD' },
-                order: {
-                    id: 'gid://shopify/Order/987',
-                    customer: { isFirstOrder: true },
-                },
-                billingAddress: {
-                    city: 'São Paulo',
-                    provinceCode: 'SP',
-                    zip: '94035-1234',
-                    countryCode: 'US',
-                },
-                lineItems: [
-                    {
-                        merchandise: {
-                            id: 'gid://shopify/ProductVariant/111',
-                            price: { amount: '46.00', currencyCode: 'USD' },
-                        },
-                        quantity: 1,
-                    },
-                ],
-            },
-            customer: {
-                email: 'Buyer@Example.com',
-                phone: '001 (212) 555-1212',
-                firstName: 'Valéry',
-                lastName: 'Lovelace',
-            },
-        },
-    };
-
-    await Promise.all([
-        callbacks.checkout_contact_info_submitted(event),
-        callbacks.checkout_contact_info_submitted(event),
-        callbacks.checkout_address_info_submitted(event),
-        callbacks.checkout_shipping_info_submitted(event),
-        callbacks.payment_info_submitted(event),
-        callbacks.checkout_completed(event),
-    ]);
-    await sandbox.flushEventQueue();
-
-    const sentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
-    const ids = Object.fromEntries(sentEvents.map(body => [body.event_name, body.event_id]));
-    assert.equal(requests.length, 1);
-    assert.equal(configRequests.length, 1);
-    assert.equal(configRequests[0].body.shop_domain, 'demo.myshopify.com');
-    assert.equal(configRequests[0].body.ingest_token, 'test-ingest-token');
-    assert.equal(requests[0].options.keepalive, true);
-    assert.equal(requests[0].body.shop_domain, 'demo.myshopify.com');
-    assert.equal(localStorage.has('capi_gateway_event_queue_v3:demo.myshopify.com'), false);
-    assert.equal(sentEvents.filter(body => body.event_name === 'CheckoutContactInfoSubmitted').length, 1);
-    assert.deepEqual(sentEvents[0].route_hints, {
-        facebook_pixel_ids: ['1234567890', '2222222222'],
-        tiktok_pixel_ids: ['TT123'],
-    });
-    assert.deepEqual(sentEvents[0].pixel_ids, ['1234567890', '2222222222']);
-    assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
-    assert.equal(sentEvents[0].pixel_id, undefined);
-    assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v14');
-    assert.equal(generated.includes('getOrCreateTtp'), false);
-    assert.equal(generated.includes('getOrCreateFbp'), false);
-    assert.equal(generated.includes("return getCookieValue('_fbp')"), true);
-    assert.equal(generated.includes("Math.floor(Math.random() * 10000000000)"), false);
-    assert.ok(String(sentEvents[0].trace_id).startsWith('trace_uuid-'));
-    assert.equal(sentEvents[0].action_source, 'website');
-    assert.equal(sentEvents[0].customer_segmentation, 'new_customer_to_business');
-    assert.equal(sentEvents[0].event_source_url, 'https://demo.myshopify.com/checkouts/cn?fbclid=fb1');
-    assert.equal(sentEvents[0].external_id, 'client-1');
-    assert.equal(sentEvents[0].client_id, 'client-1');
-    assert.equal(sentEvents[0].email, undefined);
-    assert.equal(sentEvents[0].phone, undefined);
-    assert.equal(sentEvents[0].email_hash, hashFor('Buyer@Example.com', 'email'));
-    assert.equal(sentEvents[0].phone_hash, hashFor('001 (212) 555-1212', 'phone'));
-    assert.equal(sentEvents[0].first_name_hash, hashFor('Valéry', 'name'));
-    assert.notEqual(sentEvents[0].first_name_hash, hashFor('Valery', 'name'));
-    assert.equal(sentEvents[0].city_hash, hashFor('São Paulo', 'city'));
-    assert.equal(sentEvents[0].state_hash, hashFor('SP', 'state', { country: 'US' }));
-    assert.equal(sentEvents[0].zip_hash, hashFor('94035-1234', 'zip', { country: 'US' }));
-    assert.equal(sentEvents[0].country_hash, hashFor('US', 'country'));
-    assert.deepEqual(ids, {
-        CheckoutContactInfoSubmitted: 'demo.myshopify.com:checkout-token-1:CheckoutContactInfoSubmitted',
-        CheckoutAddressInfoSubmitted: 'demo.myshopify.com:checkout-token-1:CheckoutAddressInfoSubmitted',
-        CheckoutShippingInfoSubmitted: 'demo.myshopify.com:checkout-token-1:CheckoutShippingInfoSubmitted',
-        AddPaymentInfo: 'demo.myshopify.com:checkout-token-1:AddPaymentInfo',
-        Purchase: 'demo.myshopify.com:checkout-token-1',
-    });
-    assert.equal(
-        sentEvents.find(body => body.event_name === 'Purchase').order_id,
-        'demo.myshopify.com:987',
-    );
-
-    assert.equal(metaScriptNodes.length, 1);
-    assert.equal(metaScriptNodes[0].src, 'https://connect.facebook.net/en_US/fbevents.js');
-    const metaQueue = Array.from(sandbox.window.fbq.queue, call => Array.from(call));
-    const metaInitCalls = metaQueue.filter(call => call[0] === 'init');
-    const metaTrackCalls = metaQueue.filter(call => call[0] === 'trackSingle' || call[0] === 'trackSingleCustom');
-    assert.deepEqual(metaInitCalls.map(call => call[1]).sort(), ['1234567890', '2222222222']);
-    assert.equal(metaTrackCalls.length, 10);
-    assert.deepEqual([...new Set(metaTrackCalls.map(call => call[1]))].sort(), ['1234567890', '2222222222']);
-    metaTrackCalls.forEach(call => {
-        assert.equal(call[4].eventID, ids[call[2]]);
-    });
-    const browserPurchase = metaTrackCalls.filter(call => call[2] === 'Purchase');
-    assert.equal(browserPurchase.length, 2);
-    assert.ok(browserPurchase.every(call => call[0] === 'trackSingle'));
-    assert.ok(browserPurchase.every(call => call[3].value === 46 && call[3].currency === 'USD'));
-    assert.ok(browserPurchase.every(call => call[3].order_id === 'demo.myshopify.com:987'));
-    const browserCheckoutContact = metaTrackCalls.filter(call => call[2] === 'CheckoutContactInfoSubmitted');
-    assert.ok(browserCheckoutContact.every(call => call[0] === 'trackSingleCustom'));
-
-    requests.length = 0;
-    const longLocalEventId = `checkout-${'x'.repeat(400)}-browser-capi`;
-    await callbacks.page_viewed({
-        id: longLocalEventId,
-        timestamp: '2026-06-24T00:00:20Z',
-        clientId: 'client-long-id',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/long-id' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {},
-    });
-    await sandbox.flushEventQueue();
-    const longCapiEvent = requests.flatMap(request => (
-        Array.isArray(request.body.events) ? request.body.events : [request.body]
-    )).find(body => body.client_id === 'client-long-id');
-    const expectedLongId = tenantScopedIdentifier('demo.myshopify.com', longLocalEventId);
-    const longBrowserCalls = Array.from(sandbox.window.fbq.queue, call => Array.from(call))
-        .filter(call => call[2] === 'PageView' && call[4]?.eventID === expectedLongId);
-    assert.equal(longCapiEvent.event_id, expectedLongId);
-    assert.equal(longCapiEvent.event_id.length, 255);
-    assert.equal(longBrowserCalls.length, 2);
-    const longOrderId = `order-${'y'.repeat(400)}-browser-capi`;
-    assert.equal(
-        await sandbox.shopScopedIdentifier(longOrderId),
-        tenantScopedIdentifier('demo.myshopify.com', longOrderId),
-    );
-
-    metaScriptNodes[0].onerror();
-    sandbox.metaBrowserSdkRetryAt = 0;
-    requests.length = 0;
-    await callbacks.page_viewed({
-        id: 'sdk-load-retry',
-        timestamp: '2026-06-24T00:00:30Z',
-        clientId: 'client-sdk-retry',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/sdk-retry' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {},
-    });
-    await sandbox.flushEventQueue();
-    assert.equal(metaScriptNodes.length, 2);
-    assert.equal(metaPixelWarnings.some(message => message.includes('SDK failed to load (attempt 1)')), true);
-
-    for (let index = 0; index < 600; index += 1) {
-        sandbox.sendMetaBrowserEvent('PageView', `queue-pressure-${index}`, {});
+    while (queue.length > META_PIXEL_MAX_QUEUE_SIZE) {
+        if (removeOldest(function (call) { return META_PIXEL_LOW_PRIORITY_EVENTS.has(call[2]); })) continue;
+        if (removeOldest(function (call) { return call[2] !== 'Purchase'; })) continue;
+        if (removeOldest(function () { return true; })) continue;
+        break;
     }
-    sandbox.sendMetaBrowserEvent('Purchase', 'queue-critical-purchase', { value: 1, currency: 'USD' });
-    const boundedMetaQueue = Array.from(sandbox.window.fbq.queue, call => Array.from(call));
-    assert.ok(boundedMetaQueue.length <= 500);
-    assert.deepEqual(
-        boundedMetaQueue.filter(call => call[0] === 'init').map(call => call[1]).sort(),
-        ['1234567890', '2222222222'],
-    );
-    assert.equal(boundedMetaQueue.some(call => call[2] === 'Purchase' && call[4]?.eventID === 'queue-critical-purchase'), true);
+}
 
-    const originalFetch = sandbox.fetch;
-    sandbox.fetch = async (url, options) => {
-        if (String(url).endsWith('/api/pixel-config')) {
-            return {
-                ok: true,
-                json: async () => ({
-                    shop_domain: 'demo.myshopify.com',
-                    pixel_ids: ['3333333333'],
-                }),
-            };
+function injectMetaBrowserPixelScript() {
+    if (metaBrowserSdkLoading || metaBrowserSdkLoadAttempts >= META_PIXEL_MAX_LOAD_ATTEMPTS) return;
+    if (Date.now() < metaBrowserSdkRetryAt) return;
+
+    metaBrowserSdkLoading = true;
+    metaBrowserSdkLoadAttempts += 1;
+    var attempt = metaBrowserSdkLoadAttempts;
+    try {
+        var script = document.createElement('script');
+        script.async = true;
+        script.src = META_PIXEL_SCRIPT_URL;
+        script.onload = function () {
+            metaBrowserSdkLoading = false;
+            metaBrowserSdkRetryAt = 0;
+            trimMetaBrowserQueue();
+        };
+        script.onerror = function () {
+            metaBrowserSdkLoading = false;
+            var delay = META_PIXEL_RETRY_BACKOFF_MS[Math.min(attempt - 1, META_PIXEL_RETRY_BACKOFF_MS.length - 1)];
+            metaBrowserSdkRetryAt = Date.now() + delay;
+            console.warn('Meta browser Pixel SDK failed to load (attempt ' + attempt + '); server CAPI remains active');
+            if (attempt < META_PIXEL_MAX_LOAD_ATTEMPTS && typeof setTimeout === 'function') {
+                setTimeout(function () {
+                    if (!metaBrowserSdkLoading && metaBrowserSdkLoadAttempts === attempt) {
+                        metaBrowserSdkRetryAt = 0;
+                        bootstrapMetaBrowserPixel();
+                    }
+                }, delay + 25);
+            }
+        };
+        var firstScript = document.getElementsByTagName && document.getElementsByTagName('script')[0];
+        if (firstScript && firstScript.parentNode) firstScript.parentNode.insertBefore(script, firstScript);
+        else {
+            var scriptParentNode = document.head || document.body || document.documentElement;
+            if (!scriptParentNode || !scriptParentNode.appendChild) throw new Error('No script parent available');
+            scriptParentNode.appendChild(script);
         }
-        return originalFetch(url, options);
-    };
-    await sandbox.refreshMetaRouteConfig();
-    sandbox.sendMetaBrowserEvent('ViewContent', 'dynamic-route-refresh', {});
-    const dynamicRouteCalls = Array.from(sandbox.window.fbq.queue, call => Array.from(call))
-        .filter(call => call[2] === 'ViewContent' && call[4]?.eventID === 'dynamic-route-refresh');
-    assert.deepEqual(dynamicRouteCalls.map(call => call[1]), ['3333333333']);
-    assert.equal(
-        Array.from(sandbox.window.fbq.queue, call => Array.from(call))
-            .some(call => call[0] === 'init' && call[1] === '3333333333'),
-        true,
-    );
-    sandbox.applyMetaRoutePixelIds(['1234567890', '2222222222']);
-    sandbox.fetch = originalFetch;
+    } catch (error) {
+        metaBrowserSdkLoading = false;
+        var retryDelay = META_PIXEL_RETRY_BACKOFF_MS[Math.min(attempt - 1, META_PIXEL_RETRY_BACKOFF_MS.length - 1)];
+        metaBrowserSdkRetryAt = Date.now() + retryDelay;
+        console.warn('Meta browser Pixel SDK injection failed; server CAPI remains active');
+        if (attempt < META_PIXEL_MAX_LOAD_ATTEMPTS && typeof setTimeout === 'function') {
+            setTimeout(function () {
+                if (!metaBrowserSdkLoading && metaBrowserSdkLoadAttempts === attempt) {
+                    metaBrowserSdkRetryAt = 0;
+                    bootstrapMetaBrowserPixel();
+                }
+            }, retryDelay + 25);
+        }
+    }
+}
 
-    const priorFbc = cookies.get('_fbc');
-    assert.equal(await sandbox.getOrCreateFbc(`https://demo.myshopify.com/?fbclid=${'x'.repeat(1025)}`), priorFbc);
-    assert.equal(await sandbox.getOrCreateFbc('https://demo.myshopify.com/?fbclid=invalid%20click'), priorFbc);
-    assert.equal(cookies.get('_fbc'), priorFbc);
+function bootstrapMetaBrowserPixel() {
+    var pixelIds = normalizedMetaPixelIds();
+    if (!pixelIds.length || typeof window === 'undefined' || typeof document === 'undefined') return false;
 
-    requests.length = 0;
-    await Promise.all(Array.from({ length: 25 }, (_, index) => (
-        callbacks.page_viewed({
-            timestamp: `2026-06-24T00:01:${String(index).padStart(2, '0')}Z`,
-            clientId: `client-${index}`,
-            context: {
-                document: {
-                    location: { href: `https://demo.myshopify.com/products/${index}` },
-                    referrer: 'https://facebook.com/',
-                },
-                navigator: { userAgent: 'Mozilla/5.0' },
-            },
-            data: {},
-        })
-    )));
-    await sandbox.flushEventQueue();
+    try {
+        if (!window.fbq) {
+            var fbq = function () {
+                if (fbq.callMethod) fbq.callMethod.apply(fbq, arguments);
+                else fbq.queue.push(arguments);
+            };
+            window.fbq = fbq;
+            window._fbq = fbq;
+            fbq.push = fbq;
+            fbq.loaded = true;
+            fbq.version = '2.0';
+            fbq.queue = [];
+        }
 
-    const pageViewBatchSizes = requests.map(request => Array.isArray(request.body.events) ? request.body.events.length : 1);
-    assert.deepEqual(pageViewBatchSizes, [20, 5]);
-    assert.ok(requests.every(request => request.options.keepalive === true));
+        if (!window.fbq.callMethod) injectMetaBrowserPixelScript();
 
-    requests.length = 0;
-    const sameMomentEvent = {
-        timestamp: '2026-06-24T00:02:00Z',
-        clientId: 'client-same',
-        context: {
-            document: {
-                location: { href: 'https://demo.myshopify.com/pages/about?fbclid=fb2' },
-                referrer: 'https://facebook.com/',
-            },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {},
-    };
-    await Promise.all([
-        callbacks.page_viewed({ ...sameMomentEvent, seq: 1 }),
-        callbacks.page_viewed({ ...sameMomentEvent, seq: 2 }),
-    ]);
-    await sandbox.flushEventQueue();
-
-    const sameMomentEvents = requests.flatMap(request => Array.isArray(request.body.events) ? request.body.events : [request.body]);
-    assert.equal(sameMomentEvents.length, 2);
-    assert.notEqual(sameMomentEvents[0].event_id, sameMomentEvents[1].event_id);
-
-    requests.length = 0;
-    sandbox.init = {
-        context: {
-            document: {
-                location: { href: 'https://demo.myshopify.com/init-fallback?fbclid=fb3' },
-                referrer: 'https://instagram.com/',
-            },
-            navigator: { userAgent: 'InitUA/1.0' },
-        },
-        data: {
-            customer: { id: 'gid://shopify/Customer/777', email: 'init@example.com' },
-        },
-    };
-    await callbacks.page_viewed({
-        timestamp: '2026-06-24T00:03:00Z',
-        clientId: 'client-init',
-        data: {},
-    });
-    await sandbox.flushEventQueue();
-
-    const initFallbackEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
-    assert.equal(initFallbackEvent.event_source_url, 'https://demo.myshopify.com/init-fallback?fbclid=fb3');
-    assert.equal(initFallbackEvent.user_agent, 'InitUA/1.0');
-    assert.equal(initFallbackEvent.external_id, '777');
-
-    requests.length = 0;
-    await callbacks.cart_viewed({
-        id: 'cart-view-1',
-        timestamp: '2026-06-24T00:04:00Z',
-        clientId: 'client-cart',
-        context: {
-            document: {
-                location: { href: 'https://demo.myshopify.com/cart' },
-            },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {
-            cart: {
-                totalQuantity: 3,
-                lines: [
-                    {
-                        merchandise: { id: 'gid://shopify/ProductVariant/222' },
-                        quantity: 3,
-                    },
-                ],
-            },
-        },
-    });
-    await sandbox.flushEventQueue();
-
-    const cartViewEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
-    assert.equal(cartViewEvent.event_name, 'CartView');
-    assert.equal(cartViewEvent.value, undefined);
-    assert.equal(cartViewEvent.num_items, 3);
-
-    requests.length = 0;
-    await callbacks.product_added_to_cart({
-        id: 'add-cart-1',
-        timestamp: '2026-06-24T00:04:30Z',
-        clientId: 'client-cart',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/products/shirt' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {
-            cartLine: {
-                merchandise: {
-                    id: 'gid://shopify/ProductVariant/333',
-                    price: { amount: 20, currencyCode: 'USD' },
-                    product: { title: 'Shirt', type: 'Apparel' },
-                },
-                quantity: 2,
-                cost: { totalAmount: { amount: 30, currencyCode: 'USD' } },
-            },
-        },
-    });
-    await sandbox.flushEventQueue();
-    const addToCart = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
-    assert.equal(addToCart.event_name, 'AddToCart');
-    assert.equal(addToCart.event_id, 'demo.myshopify.com:add-cart-1');
-    assert.equal(addToCart.value, 30);
-    assert.equal(addToCart.contents[0].item_price, 15);
-    assert.equal(addToCart.content_name, 'Shirt');
-    assert.equal(addToCart.content_category, 'Apparel');
-
-    requests.length = 0;
-    await callbacks.checkout_completed({
-        id: 'zero-purchase-event',
-        timestamp: '2026-06-24T00:05:00Z',
-        clientId: 'client-zero',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/checkouts/zero' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {
-            checkout: {
-                token: 'checkout-zero',
-                subtotalPrice: { amount: 0, currencyCode: 'USD' },
-                currencyCode: 'USD',
-                lineItems: [],
-            },
-        },
-    });
-    await sandbox.flushEventQueue();
-    const zeroPurchase = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
-    assert.equal(zeroPurchase.value, 0);
-    assert.equal(zeroPurchase.currency, 'USD');
-
-    requests.length = 0;
-    const queuedFbq = sandbox.window.fbq;
-    sandbox.window.fbq = () => {
-        throw new Error('simulated browser pixel failure');
-    };
-    await callbacks.page_viewed({
-        id: 'browser-pixel-failure',
-        timestamp: '2026-06-24T00:05:30Z',
-        clientId: 'client-browser-failure',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/browser-pixel-failure' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {},
-    });
-    await sandbox.flushEventQueue();
-    const capiFallbackEvent = Array.isArray(requests[0].body.events) ? requests[0].body.events[0] : requests[0].body;
-    assert.equal(capiFallbackEvent.event_id, 'demo.myshopify.com:browser-pixel-failure');
-    assert.equal(metaPixelWarnings.filter(message => message.includes('Meta browser Pixel event failed')).length, 2);
-    sandbox.window.fbq = queuedFbq;
-
-    requests.length = 0;
-    let releaseInFlightRequest;
-    sandbox.fetch = async (url, options) => {
-        requests.push({ url, options, body: JSON.parse(options.body) });
-        return new Promise(resolve => {
-            releaseInFlightRequest = resolve;
+        pixelIds.forEach(function (pixelId) {
+            if (initializedMetaBrowserPixelIds.has(pixelId)) return;
+            window.fbq('init', pixelId);
+            initializedMetaBrowserPixelIds.add(pixelId);
         });
-    };
-    await callbacks.page_viewed({
-        id: 'in-flight-page-view',
-        timestamp: '2026-06-24T00:06:00Z',
-        clientId: 'client-in-flight',
-        context: {
-            document: { location: { href: 'https://demo.myshopify.com/in-flight' } },
-            navigator: { userAgent: 'Mozilla/5.0' },
-        },
-        data: {},
+        trimMetaBrowserQueue();
+        return true;
+    } catch (error) {
+        console.warn('Meta browser Pixel initialization failed; server CAPI remains active');
+        return false;
+    }
+}
+
+function metaBrowserCustomData(customData) {
+    customData = customData || {};
+    return compact({
+        value: customData.value,
+        currency: customData.currency,
+        content_ids: customData.content_ids,
+        contents: customData.contents,
+        content_type: customData.content_type,
+        num_items: customData.num_items,
+        search_string: customData.search_string,
+        content_name: customData.content_name,
+        content_category: customData.content_category,
+        order_id: customData.order_id,
     });
-    const inFlightFlush = sandbox.flushEventQueue();
-    await new Promise(resolve => setImmediate(resolve));
-    const storedInFlight = JSON.parse(localStorage.get('capi_gateway_event_queue_v3:demo.myshopify.com'));
-    assert.equal(storedInFlight.some(item => item.event_id === 'demo.myshopify.com:in-flight-page-view'), true);
-    releaseInFlightRequest({ ok: true });
-    await inFlightFlush;
-    assert.equal(localStorage.has('capi_gateway_event_queue_v3:demo.myshopify.com'), false);
+}
 
-});
-
-test('admin page script parses and handles admin action failures', async () => {
-    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
-    const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
-    assert.match(html, /<link rel="stylesheet" href="\/admin\/assets\/admin\.css">/);
-    assert.doesNotMatch(html, /cdn\.tailwindcss\.com/);
-    const adminCss = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'admin.css'), 'utf8');
-    assert.match(adminCss, /\.app-header/);
-    assert.match(serverSource, /app\.get\('\/admin\/assets\/admin\.css'/);
-    assert.match(html, /<script src="\/admin\/assets\/vue\.global\.prod\.js"><\/script>/);
-    assert.doesNotMatch(html, /https:\/\/(?:unpkg\.com|cdn\.tailwindcss\.com)/);
-    assert.match(html, /生成代码已经同时发送 Meta 浏览器 Pixel 与本项目 CAPI，并自动复用同一 eventID/);
-    const localVue = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'vue.global.prod.js'), 'utf8');
-    assert.match(localVue, /vue v3\.5\.40/);
-    assert.match(serverSource, /app\.get\('\/admin\/assets\/vue\.global\.prod\.js'/);
-    assert.match(serverSource, /server\.requestTimeout = config\.httpRequestTimeoutMs/);
-    assert.match(serverSource, /server\.closeIdleConnections\?\.\(\)/);
-    assert.match(fs.readFileSync(path.join(__dirname, '..', 'ecosystem.config.js'), 'utf8'), /SHUTDOWN_TIMEOUT_MS/);
-    const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match => match[1]);
-    const adminScript = scripts.find(script => script.includes('createApp'));
-    assert.ok(adminScript, 'admin Vue script should exist');
-
-    let appOptions;
-    const sandbox = {
-        Vue: {
-            createApp: options => {
-                appOptions = options;
-                assert.equal(typeof options.data, 'function');
-                assert.equal(typeof options.computed.generatedCode, 'function');
-                assert.equal(typeof options.computed.emqSignals, 'function');
-                assert.equal(typeof options.computed.officialMetaQuality, 'function');
-                assert.equal(typeof options.methods.addPixel, 'function');
-                assert.equal(typeof options.methods.formatPercent, 'function');
-                assert.equal(typeof options.methods.officialAverageScore, 'function');
-                return { mount: () => {} };
-            },
-        },
-        window: { location: { origin: 'https://nestworks.com.au:8443' } },
-        console,
-    };
-    vm.runInNewContext(adminScript, sandbox);
-
-    const context = {
-        notice: null,
-        busy: {},
-        setNotice: appOptions.methods.setNotice,
-    };
-    const result = await appOptions.methods.runAction.call(context, 'savePixel', async () => {
-        throw new Error('permission denied');
+function sendMetaBrowserEvent(eventName, eventId, customData) {
+    if (!eventId || !bootstrapMetaBrowserPixel()) return false;
+    var command = META_STANDARD_BROWSER_EVENTS.has(eventName) ? 'trackSingle' : 'trackSingleCustom';
+    var parameters = metaBrowserCustomData(customData);
+    var options = { eventID: String(eventId) };
+    normalizedMetaPixelIds().forEach(function (pixelId) {
+        try {
+            window.fbq(command, pixelId, eventName, parameters, options);
+        } catch (error) {
+            console.warn('Meta browser Pixel event failed for dataset ' + pixelId);
+        }
     });
+    trimMetaBrowserQueue();
+    return true;
+}
 
-    assert.equal(result, null);
-    assert.equal(context.notice.type, 'error');
-    assert.equal(context.notice.message, 'permission denied');
-    assert.equal(context.busy.savePixel, false);
-    assert.equal(appOptions.methods.formatPercent(82.345), '82.3%');
-    assert.equal(appOptions.methods.formatPercent(null), '-');
-    const defaultSignalKeys = JSON.parse(JSON.stringify(appOptions.computed.emqSignals.call({ summary: {} }).map(item => item.key)));
-    assert.deepEqual(defaultSignalKeys, [
-        'email',
-        'phone',
-        'external_id',
-        'fbp',
-        'fbc',
-        'client_ip_address',
-        'client_user_agent',
+async function getCookieValue(name) {
+    try {
+        if (typeof browser !== 'undefined' && browser.cookie && browser.cookie.get) {
+            return await browser.cookie.get(name);
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+async function setCookieValue(name, value, days) {
+    if (!value) return;
+    var maxAge = (days || 90) * 24 * 60 * 60;
+    try {
+        if (typeof browser !== 'undefined' && browser.cookie && browser.cookie.set) {
+            await browser.cookie.set(name + '=' + encodeURIComponent(value) + '; max-age=' + maxAge + '; path=/; SameSite=Lax');
+            return;
+        }
+    } catch (error) {}
+}
+
+async function getStorageValue(key) {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.getItem) {
+            return await browser.localStorage.getItem(key);
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+async function setStorageValue(key, value) {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.setItem) {
+            await browser.localStorage.setItem(key, value);
+        }
+    } catch (error) {}
+}
+
+async function removeStorageValue(key) {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.removeItem) {
+            await browser.localStorage.removeItem(key);
+        }
+    } catch (error) {}
+}
+
+function applyMetaRoutePixelIds(values) {
+    if (!Array.isArray(values)) return false;
+    META_ROUTE_PIXEL_IDS = Array.from(new Set(values.map(function (value) {
+        return String(value || '').trim();
+    }).filter(function (value) {
+        return /^\d{5,32}$/.test(value);
+    })));
+    return true;
+}
+
+async function refreshMetaRouteConfig() {
+    try {
+        var cachedText = await getStorageValue(META_ROUTE_CONFIG_STORAGE_KEY);
+        var cached = cachedText ? JSON.parse(cachedText) : null;
+        var cacheBelongsToShop = cached && cached.shop_domain === SHOP_DOMAIN;
+        var cacheIsFresh = cached && Number(cached.expires_at || 0) > Date.now();
+        if (cacheBelongsToShop && cacheIsFresh && Array.isArray(cached.pixel_ids)) {
+            applyMetaRoutePixelIds(cached.pixel_ids);
+        }
+    } catch (error) {}
+
+    var options = requestOptionsForBody(JSON.stringify({
+        shop_domain: SHOP_DOMAIN,
+        ingest_token: SHOP_INGEST_TOKEN,
+    }));
+    options.keepalive = false;
+    try {
+        var response = await fetch(CAPI_PIXEL_CONFIG_URL, options);
+        if (!response || response.ok === false || typeof response.json !== 'function') return false;
+        var payload = await response.json();
+        if (!payload || payload.shop_domain !== SHOP_DOMAIN || !Array.isArray(payload.pixel_ids)) return false;
+        applyMetaRoutePixelIds(payload.pixel_ids);
+        await setStorageValue(META_ROUTE_CONFIG_STORAGE_KEY, JSON.stringify({
+            shop_domain: SHOP_DOMAIN,
+            pixel_ids: META_ROUTE_PIXEL_IDS,
+            expires_at: Date.now() + META_ROUTE_CONFIG_TTL_MS,
+        }));
+        return true;
+    } catch (error) {
+        return false;
+    } finally {
+        if (options._timeoutId) clearTimeout(options._timeoutId);
+    }
+}
+
+async function waitForMetaRouteConfig() {
+    if (!metaRouteConfigPromise || !metaRouteConfigPending) return;
+    await Promise.race([
+        metaRouteConfigPromise,
+        new Promise(function (resolve) { setTimeout(resolve, META_ROUTE_CONFIG_WAIT_MS); }),
     ]);
-    assert.equal(appOptions.methods.officialAverageScore({ summary: { average_score: 8.64 } }), '8.6/10');
-    assert.equal(appOptions.methods.officialAverageScore({ summary: {} }), '-');
-    assert.deepEqual(JSON.parse(JSON.stringify(appOptions.computed.officialMetaQuality.call({ summary: {} }))), []);
+}
+
+function startMetaRouteConfigRefresh() {
+    metaRouteConfigPending = true;
+    metaRouteConfigPromise = refreshMetaRouteConfig().finally(function () {
+        metaRouteConfigPending = false;
+    });
+}
+
+function scheduleMetaRouteConfigRefresh() {
+    if (typeof setTimeout !== 'function') return;
+    setTimeout(function () {
+        startMetaRouteConfigRefresh();
+        scheduleMetaRouteConfigRefresh();
+    }, META_ROUTE_CONFIG_TTL_MS);
+}
+
+function moneyAmount(value) {
+    var raw = value;
+    if (value && typeof value === 'object') {
+        raw = firstNonEmpty(value.amount, value.value);
+    }
+    var amount = Number(raw);
+    return Number.isFinite(amount) ? amount : undefined;
+}
+
+function moneyCurrency(value, fallback) {
+    return (value && (value.currencyCode || value.currency)) || fallback;
+}
+
+function firstNonEmpty() {
+    return Array.prototype.slice.call(arguments).find(function (value) {
+        return value !== undefined && value !== null && value !== '';
+    });
+}
+
+function normalizeShopifyId(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    var text = String(value).trim();
+    var marker = 'gid://shopify/';
+    if (!text.startsWith(marker)) return text || undefined;
+    return text.slice(marker.length).split('/').pop() || undefined;
+}
+
+function fallbackIdentifierDigest(value) {
+    var text = String(value || '');
+    var seeds = [2166136261, 2246822507, 3266489909, 668265263];
+    return seeds.map(function (seed, seedIndex) {
+        var hash = seed >>> 0;
+        for (var index = 0; index < text.length; index += 1) {
+            hash ^= text.charCodeAt(index) + seedIndex;
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+    }).join('');
+}
+
+async function rawSha256Hex(value) {
+    try {
+        var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+        var subtle = cryptoApi && cryptoApi.subtle;
+        var encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : undefined;
+        if (subtle && encoder) {
+            return toHex(await subtle.digest('SHA-256', encoder.encode(String(value))));
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+async function shopScopedIdentifier(value, maxLength) {
+    var normalized = normalizeShopifyId(value);
+    if (!normalized) return undefined;
+    var prefix = String(SHOP_DOMAIN || '').trim().toLowerCase() + ':';
+    var text = String(normalized).trim();
+    var scoped = text.toLowerCase().indexOf(prefix) === 0 ? prefix + text.slice(prefix.length) : prefix + text;
+    var boundedLength = Number(maxLength || 255);
+    if (scoped.length <= boundedLength) return scoped;
+    var digest = await rawSha256Hex(scoped) || fallbackIdentifierDigest(scoped);
+    var suffix = String(digest).slice(0, 32);
+    return scoped.slice(0, Math.max(0, boundedLength - suffix.length - 1)) + '-' + suffix;
+}
+
+function lineItemToContent(item) {
+    item = item || {};
+    var variant = item.variant || item.merchandise || {};
+    var product = item.product || variant.product || {};
+    var quantity = Number(item.quantity || 1);
+    var totalPrice = moneyAmount(item.cost && item.cost.totalAmount || item.finalLinePrice);
+    var price = moneyAmount(item.cost && item.cost.amountPerQuantity || variant.price);
+    if (totalPrice !== undefined && quantity > 0) {
+        price = totalPrice / quantity;
+    }
+    return {
+        id: normalizeShopifyId(variant.id || product.id || item.id),
+        quantity: Number.isFinite(quantity) ? quantity : 1,
+        item_price: price,
+    };
+}
+
+function compact(object) {
+    var output = {};
+    Object.keys(object).forEach(function (key) {
+        var value = object[key];
+        if (value !== undefined && value !== null && value !== '') output[key] = value;
+    });
+    return output;
+}
+
+function normalizeForHash(value, type, contextCountry) {
+    if (value === undefined || value === null) return undefined;
+    var normalized = String(value).trim().toLowerCase();
+    if (!normalized) return undefined;
+    if (type === 'email') {
+        if (/\s/.test(normalized)) return undefined;
+    } else if (type === 'phone') {
+        var rawPhone = String(value).trim();
+        var hasInternationalPrefix = /^\+|^00/.test(rawPhone);
+        normalized = rawPhone.replace(/[^0-9]/g, '').replace(/^0+/, '');
+        var phoneCountry = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+        if (!hasInternationalPrefix) {
+            var northAmericanCountries = ['us', 'usa', 'unitedstates', 'unitedstatesofamerica', 'ca', 'canada'];
+            if (northAmericanCountries.indexOf(phoneCountry) !== -1) {
+                if (/^\d{10}$/.test(normalized)) normalized = '1' + normalized;
+                else if (!/^1\d{10}$/.test(normalized)) normalized = '';
+            } else {
+                normalized = '';
+            }
+        }
+    } else if (type === 'name') {
+        normalized = normalized.replace(/[^\p{L}\p{N}]/gu, '');
+    } else if (type === 'city' || type === 'state') {
+        try {
+            normalized = normalized.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+        } catch (error) {}
+        normalized = normalized.replace(/[^\p{L}\p{N}]/gu, '');
+        if (type === 'state') {
+            var stateCountry = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+            var isUnitedStates = ['us', 'usa', 'unitedstates', 'unitedstatesofamerica'].indexOf(stateCountry) !== -1;
+            if (isUnitedStates && !/^[a-z]{2}$/.test(normalized)) normalized = '';
+        }
+    } else if (type === 'zip') {
+        normalized = normalized.replace(/[^a-z0-9]/g, '');
+        var country = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+        if (country === 'us' || country === 'usa' || country === 'unitedstates' || country === 'unitedstatesofamerica') {
+            var usZip = normalized.match(/^\d{5}/);
+            normalized = usZip ? usZip[0] : '';
+        }
+    } else if (type === 'country') {
+        normalized = /^[a-z]{2}$/.test(normalized) ? normalized : '';
+    } else {
+        normalized = normalized.replace(/\s+/g, '');
+    }
+    return normalized || undefined;
+}
+
+function isSha256Hex(value) {
+    return /^[a-f0-9]{64}$/.test(String(value || '').trim().toLowerCase());
+}
+
+function toHex(buffer) {
+    return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+    }).join('');
+}
+
+async function sha256Hex(value, type, contextCountry) {
+    var normalized = normalizeForHash(value, type, contextCountry);
+    if (!normalized) return undefined;
+    if (isSha256Hex(normalized)) return normalized;
+    try {
+        var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+        var subtle = cryptoApi && cryptoApi.subtle;
+        var encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : undefined;
+        if (subtle && encoder) {
+            return toHex(await subtle.digest('SHA-256', encoder.encode(normalized)));
+        }
+    } catch (error) {}
+    return undefined;
+}
+
+function randomId(prefix) {
+    try {
+        var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+        if (cryptoApi && cryptoApi.randomUUID) return prefix + '_' + cryptoApi.randomUUID();
+    } catch (error) {}
+    return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+}
+
+function safeDecode(value) {
+    try {
+        return decodeURIComponent(String(value || '').replace(/\+/g, ' '));
+    } catch (error) {
+        return String(value || '');
+    }
+}
+
+function getUrlParam(name, href) {
+    var text = String(href || '');
+    var queryStart = text.indexOf('?');
+    if (queryStart === -1) return undefined;
+
+    var queryEnd = text.indexOf('#', queryStart);
+    var query = text.slice(queryStart + 1, queryEnd === -1 ? text.length : queryEnd);
+    var parts = query.split('&');
+    for (var index = 0; index < parts.length; index += 1) {
+        var part = parts[index];
+        if (!part) continue;
+        var equalsIndex = part.indexOf('=');
+        var rawKey = equalsIndex === -1 ? part : part.slice(0, equalsIndex);
+        var rawValue = equalsIndex === -1 ? '' : part.slice(equalsIndex + 1);
+        var key = safeDecode(rawKey);
+        if (key === name) return safeDecode(rawValue) || undefined;
+    }
+    return undefined;
+}
+
+function shouldSendRecentEvent(eventName, eventId) {
+    var now = Date.now();
+    var key = eventName + ':' + eventId;
+    recentEvents.forEach(function (expiresAt, item) {
+        if (expiresAt <= now) recentEvents.delete(item);
+    });
+    if (recentEvents.has(key)) return false;
+    recentEvents.set(key, now + RECENT_EVENT_TTL_MS);
+    while (recentEvents.size > MAX_RECENT_EVENTS) {
+        recentEvents.delete(recentEvents.keys().next().value);
+    }
+    return true;
+}
+
+function eventIdFrom(value) {
+    var normalized = normalizeShopifyId(value);
+    return normalized ? String(normalized) : undefined;
+}
+
+function stableHash(value) {
+    var text = String(value || '');
+    var hash = 2166136261;
+    for (var index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+}
+
+async function fallbackEventId(eventName, event, currentUrl) {
+    var stableInput = [
+        SHOP_DOMAIN,
+        event && event.clientId,
+        event && event.timestamp,
+        event && event.seq,
+        event && event.name,
+        currentUrl,
+        eventName,
+    ].join('|');
+    var digest = await sha256Hex(stableInput, 'default');
+    if (digest) return eventName + '_' + digest.slice(0, 32);
+    // Two independent deterministic hashes keep fallback IDs stable across
+    // client retries in environments without Web Crypto.
+    var stablePart = stableHash(stableInput);
+    var stablePartReversed = stableHash(stableInput.split('').reverse().join(''));
+    return eventName + '_' + stablePart + stablePartReversed;
+}
+
+function purchaseEventId(checkout, event) {
+    checkout = checkout || {};
+    return firstNonEmpty(checkout.token, checkout.checkoutToken, eventIdFrom(checkout.order && checkout.order.id), checkout.order && checkout.order.name, event.id);
+}
+
+function checkoutStageEventId(checkout, event, eventName) {
+    checkout = checkout || {};
+    var baseId = firstNonEmpty(checkout.token, checkout.checkoutToken, event.id);
+    return baseId ? String(baseId) + ':' + eventName : undefined;
+}
+
+function checkoutLineItems(checkout) {
+    return Array.isArray(checkout && checkout.lineItems) ? checkout.lineItems : [];
+}
+
+function checkoutValue(checkout) {
+    checkout = checkout || {};
+    return moneyAmount(firstNonEmpty(checkout.totalPrice, checkout.subtotalPrice));
+}
+
+function checkoutCurrency(checkout) {
+    checkout = checkout || {};
+    return moneyCurrency(firstNonEmpty(checkout.totalPrice, checkout.subtotalPrice), checkout.currencyCode);
+}
+
+async function getFbp() {
+    // _fbp identifies a browser that the Meta Pixel has actually observed.
+    // Forward the real first-party cookie when present; inventing one would
+    // create a synthetic match signal and can reduce attribution accuracy.
+    return getCookieValue('_fbp');
+}
+
+async function getOrCreateFbc(href) {
+    var fbclid = String(getUrlParam('fbclid', href) || '').trim();
+    if (!fbclid || fbclid.length > 1024 || /\s/.test(fbclid)) fbclid = undefined;
+    var existing = await getCookieValue('_fbc');
+    if (fbclid && (!existing || !existing.endsWith('.' + fbclid))) {
+        var generated = 'fb.1.' + Date.now() + '.' + fbclid;
+        await setCookieValue('_fbc', generated);
+        return generated;
+    }
+    return existing;
+}
+
+async function getTtp() {
+    // TikTok documents ttp as the first-party cookie used with its Pixel.
+    // Forward a real existing value, but never fabricate a match identifier.
+    return getCookieValue('_ttp');
+}
+
+async function rememberTtclid(href) {
+    var fromUrl = getUrlParam('ttclid', href);
+    if (fromUrl) {
+        await setCookieValue('ttclid', fromUrl);
+        return fromUrl;
+    }
+    return getCookieValue('ttclid');
+}
+
+function primaryExternalId(event, customer, checkout, checkoutToken) {
+    return firstNonEmpty(
+        normalizeShopifyId(customer && customer.id),
+        normalizeShopifyId(checkout && checkout.order && checkout.order.customer && checkout.order.customer.id),
+        event && event.clientId,
+        checkoutToken
+    );
+}
+
+function getInitContext() {
+    try {
+        if (typeof init !== 'undefined' && init && init.context) return init.context;
+    } catch (error) {}
+    return {};
+}
+
+function getInitData() {
+    try {
+        if (typeof init !== 'undefined' && init && init.data) return init.data;
+    } catch (error) {}
+    return {};
+}
+
+function scheduleEventQueueFlush(delayMs) {
+    if (eventQueueTimer) clearTimeout(eventQueueTimer);
+    eventQueueTimer = setTimeout(function () {
+        eventQueueTimer = null;
+        flushEventQueue();
+    }, Math.max(0, delayMs || EVENT_QUEUE_FLUSH_MS));
+}
+
+function mergeQueuedEvents(events) {
+    var merged = [];
+    var indexes = new Map();
+    events.forEach(function (event) {
+        var key = [event.event_name, event.event_id].join(':');
+        if (!indexes.has(key)) {
+            indexes.set(key, merged.length);
+            merged.push(event);
+            return;
+        }
+        var index = indexes.get(key);
+        var existing = merged[index];
+        var combined = Object.assign({}, existing, event);
+        var firstQueuedAt = [existing._client_first_queued_at, event._client_first_queued_at]
+            .map(Number).filter(Number.isFinite);
+        var retryCount = Math.max(Number(existing._client_retry_count || 0), Number(event._client_retry_count || 0));
+        var nextAttemptAt = [existing._client_next_attempt_at, event._client_next_attempt_at]
+            .map(Number).filter(function (value) { return Number.isFinite(value) && value > 0; });
+        var existingTime = Date.parse(String(existing.timestamp || ''));
+        var eventTime = Date.parse(String(event.timestamp || ''));
+        combined._client_first_queued_at = firstQueuedAt.length ? Math.min.apply(Math, firstQueuedAt) : Date.now();
+        combined._client_retry_count = retryCount || undefined;
+        combined._client_next_attempt_at = nextAttemptAt.length ? Math.min.apply(Math, nextAttemptAt) : undefined;
+        combined.timestamp = firstNonEmpty(existing.timestamp, event.timestamp);
+        if (Number.isFinite(existingTime) && Number.isFinite(eventTime)) {
+            combined.timestamp = existingTime <= eventTime ? existing.timestamp : event.timestamp;
+        }
+        merged[index] = compact(combined);
+    });
+    return merged;
+}
+
+function storedEventPriority(event) {
+    var priorities = {
+        Purchase: 100,
+        AddPaymentInfo: 90,
+        InitiateCheckout: 80,
+        AddToCart: 70,
+        CheckoutShippingInfoSubmitted: 60,
+        CheckoutAddressInfoSubmitted: 60,
+        CheckoutContactInfoSubmitted: 60,
+    };
+    return priorities[event && event.event_name] || 10;
+}
+
+function boundStoredEvents(events) {
+    var merged = mergeQueuedEvents(events);
+    if (merged.length <= MAX_STORED_EVENTS) return merged;
+    return merged.map(function (event, index) {
+        return { event: event, index: index, priority: storedEventPriority(event) };
+    }).sort(function (left, right) {
+        if (right.priority !== left.priority) return right.priority - left.priority;
+        return right.index - left.index;
+    }).slice(0, MAX_STORED_EVENTS).sort(function (left, right) {
+        return left.index - right.index;
+    }).map(function (item) { return item.event; });
+}
+
+function persistEventQueue() {
+    // Keep unconfirmed in-flight requests in durable browser storage. If the
+    // page closes after the server accepted them, stable event IDs make the
+    // replay harmless; dropping them before acceptance would be irreversible.
+    var storable = boundStoredEvents(inFlightEvents.concat(eventQueue));
+    storageWriteChain = storageWriteChain.then(function () {
+        if (!storable.length) return removeStorageValue(STORAGE_QUEUE_KEY);
+        return setStorageValue(STORAGE_QUEUE_KEY, JSON.stringify(storable));
+    });
+    return storageWriteChain;
+}
+
+async function loadPersistedEventQueue() {
+    if (persistedQueueLoaded) return;
+    persistedQueueLoaded = true;
+    await storageWriteChain;
+    var stored = await getStorageValue(STORAGE_QUEUE_KEY);
+    if (!stored) return;
+    try {
+        var parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length) {
+            var merged = boundStoredEvents(parsed.concat(eventQueue));
+            eventQueue.splice(0, eventQueue.length);
+            Array.prototype.push.apply(eventQueue, merged);
+        }
+    } catch (error) {}
+}
+
+function enqueueEventPayload(payload) {
+    eventQueue.push(Object.assign({
+        _client_first_queued_at: Date.now(),
+    }, payload));
+    persistEventQueue();
+    if (!eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
+}
+
+function requestPayloadForEvents(events) {
+    return events.length === 1 ? events[0] : { shop_domain: SHOP_DOMAIN, events: events };
+}
+
+function serializedSize(value) {
+    try {
+        var serialized = typeof value === 'string' ? value : JSON.stringify(value);
+        if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(serialized).byteLength;
+        return unescape(encodeURIComponent(serialized)).length;
+    } catch (error) {
+        return KEEPALIVE_LIMIT_BYTES + 1;
+    }
+}
+
+function buildEventBatches(events) {
+    var batches = [];
+    var current = [];
+    events.forEach(function (event) {
+        var candidate = current.concat([event]);
+        var tooManyEvents = candidate.length > MAX_BATCH_EVENTS;
+        var tooLarge = serializedSize(requestPayloadForEvents(candidate)) >= KEEPALIVE_LIMIT_BYTES;
+        if (current.length && (tooManyEvents || tooLarge)) {
+            batches.push(current);
+            current = [event];
+        } else {
+            current = candidate;
+        }
+    });
+    if (current.length) batches.push(current);
+    return batches;
+}
+
+function retryAfterMsFromResponse(response) {
+    try {
+        if (!response || !response.headers || !response.headers.get) return 0;
+        var raw = response.headers.get('retry-after');
+        if (!raw) return 0;
+        var numeric = Number(raw);
+        if (Number.isFinite(numeric) && numeric >= 0) return Math.ceil(numeric * 1000);
+        var timestamp = Date.parse(String(raw));
+        return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 0;
+    } catch (error) {
+        return 0;
+    }
+}
+
+function isRetryableResponse(response) {
+    var status = Number(response && response.status);
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function requeueFailedEvents(events, retryAfterMs) {
+    var now = Date.now();
+    var retryable = events.filter(function (event) {
+        var firstQueuedAt = Number(event._client_first_queued_at || now);
+        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES && now - firstQueuedAt < CLIENT_RETRY_MAX_AGE_MS;
+    }).map(function (event) {
+        var nextRetryCount = Number(event._client_retry_count || 0) + 1;
+        var baseDelay = RETRY_BACKOFF_MS[Math.min(nextRetryCount - 1, RETRY_BACKOFF_MS.length - 1)] || EVENT_QUEUE_FLUSH_MS;
+        var jitter = 0.8 + (Math.random() * 0.4);
+        var delay = Math.max(Number(retryAfterMs || 0), Math.ceil(baseDelay * jitter));
+        return Object.assign({}, event, {
+            _client_retry_count: nextRetryCount,
+            _client_next_attempt_at: now + delay,
+            _client_first_queued_at: Number(event._client_first_queued_at || now),
+        });
+    });
+
+    if (!retryable.length) return;
+    Array.prototype.push.apply(eventQueue, retryable);
+    persistEventQueue();
+    if (!eventQueueTimer) scheduleEventQueueFlush(RETRY_BACKOFF_MS[0]);
+}
+
+function removeInFlightEvents(events) {
+    var keys = new Set(events.map(function (event) {
+        return [event.event_name, event.event_id].join(':');
+    }));
+    inFlightEvents = inFlightEvents.filter(function (event) {
+        return !keys.has([event.event_name, event.event_id].join(':'));
+    });
+}
+
+function requestOptionsForBody(body) {
+    var options = {
+        method: 'POST',
+        keepalive: serializedSize(body) < KEEPALIVE_LIMIT_BYTES,
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+    };
+
+    if (typeof AbortController !== 'undefined') {
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () {
+            controller.abort();
+        }, FETCH_TIMEOUT_MS);
+        options.signal = controller.signal;
+        options._timeoutId = timeoutId;
+    }
+
+    return options;
+}
+
+async function flushEventQueueOnce() {
+    if (eventQueueTimer) {
+        clearTimeout(eventQueueTimer);
+        eventQueueTimer = null;
+    }
+    await loadPersistedEventQueue();
+    if (!eventQueue.length) return;
+
+    var now = Date.now();
+    var dueEvents = [];
+    var waitingEvents = [];
+    eventQueue.splice(0, eventQueue.length).forEach(function (event) {
+        if (Number(event._client_next_attempt_at || 0) > now) {
+            waitingEvents.push(event);
+        } else {
+            dueEvents.push(event);
+        }
+    });
+    Array.prototype.push.apply(eventQueue, waitingEvents);
+    if (!dueEvents.length) {
+        await persistEventQueue();
+        var nextAttemptAt = Math.min.apply(Math, waitingEvents.map(function (event) {
+            return Number(event._client_next_attempt_at || (now + EVENT_QUEUE_FLUSH_MS));
+        }));
+        scheduleEventQueueFlush(Math.max(EVENT_QUEUE_FLUSH_MS, nextAttemptAt - now));
+        return;
+    }
+
+    inFlightEvents = dueEvents.slice();
+    await persistEventQueue();
+    var batches = buildEventBatches(dueEvents);
+    for (var index = 0; index < batches.length; index += 1) {
+        var batch = batches[index];
+        var requestPayload = requestPayloadForEvents(batch);
+        var options = requestOptionsForBody(JSON.stringify(requestPayload));
+
+        try {
+            var response = await fetch(CAPI_HUB_URL, options);
+            if (response && response.ok === false) {
+                if (isRetryableResponse(response)) {
+                    removeInFlightEvents(batch);
+                    requeueFailedEvents(batch, retryAfterMsFromResponse(response));
+                } else {
+                    removeInFlightEvents(batch);
+                    console.warn('CAPI gateway rejected a non-retryable event batch', response.status);
+                }
+            } else {
+                removeInFlightEvents(batch);
+            }
+        } catch (error) {
+            removeInFlightEvents(batch);
+            requeueFailedEvents(batch);
+        } finally {
+            if (options._timeoutId) clearTimeout(options._timeoutId);
+            delete options._timeoutId;
+        }
+    }
+
+    await persistEventQueue();
+    if (eventQueue.length && !eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
+}
+
+function flushEventQueue() {
+    if (flushPromise) return flushPromise;
+    flushPromise = flushEventQueueOnce().finally(function () {
+        flushPromise = null;
+        if (eventQueue.length && !eventQueueTimer) scheduleEventQueueFlush(EVENT_QUEUE_FLUSH_MS);
+    });
+    return flushPromise;
+}
+
+async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
+    customData = customData || {};
+    event = event || {};
+    var initContext = getInitContext();
+    var initData = getInitData();
+    var context = event.context || initContext || {};
+    var documentInfo = context.document || {};
+    var navigatorInfo = context.navigator || {};
+    var fallbackDocumentInfo = initContext.document || {};
+    var fallbackNavigatorInfo = initContext.navigator || {};
+    var locationInfo = documentInfo.location || fallbackDocumentInfo.location || {};
+    var checkout = event.data && event.data.checkout || {};
+    var normalizedOrderId = normalizeShopifyId(checkout.order && checkout.order.id);
+    var orderId = firstNonEmpty(checkout.order && checkout.order.name, normalizedOrderId);
+    var customer = event.data && event.data.customer || checkout.order && checkout.order.customer || initData.customer || {};
+    var billingAddress = checkout.billingAddress || {};
+    var shippingAddress = checkout.shippingAddress || {};
+    var address = billingAddress.city || billingAddress.zip || billingAddress.countryCode ? billingAddress : (shippingAddress || customer.defaultAddress || {});
+    var currentUrl = locationInfo.href || documentInfo.URL || documentInfo.referrer || fallbackDocumentInfo.URL || fallbackDocumentInfo.referrer;
+    var eventId = String(await shopScopedIdentifier(
+        eventIdFrom(forcedEventId) || event.id || await fallbackEventId(metaEventName, event, currentUrl)
+    ));
+    if (!shouldSendRecentEvent(metaEventName, eventId)) return;
+    await waitForMetaRouteConfig();
+    var scopedOrderId = await shopScopedIdentifier(firstNonEmpty(customData.order_id, orderId));
+    var browserCustomData = {
+        ...customData,
+        order_id: scopedOrderId,
+    };
+    sendMetaBrowserEvent(metaEventName, eventId, browserCustomData);
+
+    var fbp = await getFbp();
+    var fbc = await getOrCreateFbc(currentUrl);
+    var ttp = await getTtp();
+    var ttclid = await rememberTtclid(currentUrl);
+    var checkoutToken = checkout.token || checkout.checkoutToken;
+    var cartToken = normalizeShopifyId(event.data && event.data.cart && event.data.cart.id || checkout.cartToken);
+    var externalId = primaryExternalId(event, customer, checkout, checkoutToken);
+    var rawEmail = customer.email || checkout.email;
+    var rawPhone = customer.phone || checkout.phone || address.phone;
+    var rawFirstName = customer.firstName || address.firstName;
+    var rawLastName = customer.lastName || address.lastName;
+    var rawCity = address.city;
+    var rawState = address.provinceCode || address.province;
+    var rawZip = address.zip;
+    var rawCountry = address.countryCode || address.country;
+    var orderCustomer = checkout.order && checkout.order.customer || {};
+    var isFirstOrder = firstNonEmpty(orderCustomer.isFirstOrder, customer && customer.isFirstOrder);
+    var customerSegmentation;
+    if (isFirstOrder === true) {
+        customerSegmentation = 'new_customer_to_business';
+    } else if (isFirstOrder === false) {
+        customerSegmentation = 'existing_customer_to_business';
+    }
+    var hashedFields = await Promise.all([
+        sha256Hex(rawEmail, 'email'),
+        sha256Hex(rawPhone, 'phone', rawCountry),
+        sha256Hex(rawFirstName, 'name'),
+        sha256Hex(rawLastName, 'name'),
+        sha256Hex(rawCity, 'city'),
+        sha256Hex(rawState, 'state', rawCountry),
+        sha256Hex(rawZip, 'zip', rawCountry),
+        sha256Hex(rawCountry, 'country'),
+    ]);
+    var traceId = randomId('trace');
+
+    enqueueEventPayload(compact({
+        shop_domain: SHOP_DOMAIN,
+        ingest_token: SHOP_INGEST_TOKEN,
+            tenant_id: SHOP_DOMAIN,
+            schema_version: SCHEMA_VERSION,
+            source_version: SOURCE_VERSION,
+            trace_id: traceId,
+            pixel_ids: META_ROUTE_PIXEL_IDS,
+            dataset_ids: META_ROUTE_PIXEL_IDS,
+            event_name: metaEventName,
+            event_id: eventId,
+            action_source: 'website',
+            customer_segmentation: customerSegmentation,
+            timestamp: event.timestamp,
+            url: currentUrl,
+            event_source_url: currentUrl,
+            referrer: documentInfo.referrer || fallbackDocumentInfo.referrer,
+            user_agent: navigatorInfo.userAgent || fallbackNavigatorInfo.userAgent,
+            fbp: fbp,
+            fbc: fbc,
+            ttp: ttp,
+            ttclid: ttclid,
+            email_hash: hashedFields[0],
+            phone_hash: hashedFields[1],
+            first_name_hash: hashedFields[2],
+            last_name_hash: hashedFields[3],
+            city_hash: hashedFields[4],
+            state_hash: hashedFields[5],
+            zip_hash: hashedFields[6],
+            country_hash: hashedFields[7],
+            client_id: event.clientId,
+            checkout_token: checkoutToken,
+            cart_token: cartToken,
+            order_id: scopedOrderId,
+            route_hints: {
+                facebook_pixel_ids: META_ROUTE_PIXEL_IDS,
+                tiktok_pixel_ids: TIKTOK_ROUTE_PIXEL_IDS,
+            },
+            external_id: externalId,
+            value: customData.value,
+            currency: customData.currency,
+            content_ids: customData.content_ids,
+            contents: customData.contents,
+            content_type: customData.content_type,
+            num_items: customData.num_items,
+            search_string: customData.search_string,
+            content_name: customData.content_name,
+            content_category: customData.content_category,
+        }));
+}
+
+startMetaRouteConfigRefresh();
+scheduleMetaRouteConfigRefresh();
+
+analytics.subscribe('page_viewed', function (event) {
+    return sendDualChannelEvent('PageView', event);
 });
 
-test('deployment workflow preserves production secrets and verifies runtime readiness', () => {
-    const installer = fs.readFileSync(path.join(__dirname, '..', 'deploy', 'install_ubuntu.sh'), 'utf8');
-    const baotaTemplate = fs.readFileSync(
-        path.join(__dirname, '..', 'deploy', 'baota-nginx-non443.conf.template'),
-        'utf8',
-    );
-    const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
-    const restore = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'restore.sh'), 'utf8');
-    const ownershipRepair = fs.readFileSync(
-        path.join(__dirname, '..', 'scripts', 'repair-db-ownership.sh'),
-        'utf8',
-    );
-    const baotaConfigurator = fs.readFileSync(
-        path.join(__dirname, '..', 'deploy', 'configure_baota_nginx.sh'),
-        'utf8',
-    );
-    const baotaUpdater = fs.readFileSync(
-        path.join(__dirname, '..', 'deploy', 'update_baota.sh'),
-        'utf8',
-    );
+analytics.subscribe('cart_viewed', function (event) {
+    var cart = event.data && event.data.cart || {};
+    var lines = cart.lines || cart.cartLines || [];
+    var contents = lines.map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('CartView', event, {
+        value: moneyAmount(cart.cost && cart.cost.totalAmount),
+        currency: moneyCurrency(cart.cost && cart.cost.totalAmount),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+    });
+});
 
-    assert.match(installer, /FORCE_ENV_REWRITE="\$\{FORCE_ENV_REWRITE:-0\}"/);
-    assert.match(installer, /Preserving existing \.env and database credentials/);
-    assert.match(installer, /Creating a pre-upgrade database and environment backup/);
-    assert.match(installer, /DB_PASSWORD is required when FORCE_ENV_REWRITE=1/);
-    assert.match(installer, /AES_SECRET_KEY is required when FORCE_ENV_REWRITE=1/);
-    assert.match(installer, /SHOPIFY_APP_SECRET="\$\{SHOPIFY_APP_SECRET:-\}"/);
-    assert.match(installer, /SHOPIFY_PRIVACY_RETENTION_DAYS=30/);
-    assert.match(installer, /ALTER DATABASE .* OWNER TO/);
-    assert.match(installer, /ALTER TABLE %I\.%I OWNER TO %I/);
-    assert.match(installer, /ALTER SEQUENCE %I\.%I OWNER TO %I/);
-    assert.match(installer, /verify_runtime\(\)/);
-    assert.match(installer, /\/healthz/);
-    assert.match(installer, /\/readyz/);
-    assert.doesNotMatch(installer, /proxy_read_timeout 86400s/);
-    assert.match(baotaTemplate, /proxy_set_header Connection ""/);
-    assert.match(baotaTemplate, /proxy_read_timeout 35s/);
-    assert.match(baotaTemplate, /listen __PUBLIC_PORT__ ssl;/);
-    assert.match(baotaTemplate, /http2 on;/);
-    assert.doesNotMatch(baotaTemplate, /listen __PUBLIC_PORT__ ssl http2;/);
-    assert.match(ci, /npm run build:admin/);
-    assert.match(ci, /npm ci --omit=dev --ignore-scripts/);
-    assert.match(ci, /scripts\/repair-db-ownership\.sh/);
-    assert.match(ci, /deploy\/configure_baota_nginx\.sh/);
-    assert.match(ci, /deploy\/update_baota\.sh/);
-    assert.match(restore, /--single-transaction/);
-    assert.match(restore, /runtime remains stopped and maintenance mode stays enabled/);
-    assert.match(ownershipRepair, /DATABASE_URL must include a user and database name/);
-    assert.match(ownershipRepair, /\/www\/server\/nodejs/);
-    assert.match(ownershipRepair, /\/usr\/lib\/postgresql/);
-    assert.match(ownershipRepair, /runuser -u postgres -- "\$PSQL_BIN"/);
-    assert.doesNotMatch(ownershipRepair, /require\(['"]dotenv['"]\)/);
-    assert.match(ownershipRepair, /ALTER SCHEMA public OWNER TO/);
-    assert.match(ownershipRepair, /remaining_wrong_owners/);
-    assert.match(baotaConfigurator, /INSTALL_WATCHER/);
-    assert.match(baotaConfigurator, /nginx validation failed; restored the previous vhost configuration/);
-    assert.match(baotaConfigurator, /PathChanged=\$\{VHOST_FILE\}/);
-    assert.match(baotaConfigurator, /\/www\/server\/nginx\/sbin\/nginx/);
-    assert.match(baotaConfigurator, /kill -HUP "\$nginx_master_pid"/);
-    assert.doesNotMatch(baotaConfigurator, /systemctl reload nginx/);
-    assert.match(baotaUpdater, /npm ci --omit=dev/);
-    assert.match(baotaUpdater, /bash scripts\/repair-db-ownership\.sh/);
-    assert.match(baotaUpdater, /pm2 start .*src\/worker\.js/);
+analytics.subscribe('collection_viewed', function (event) {
+    var collection = event.data && event.data.collection || {};
+    return sendDualChannelEvent('CollectionView', event, {
+        content_category: collection.title,
+        content_name: collection.title,
+    });
+});
+
+analytics.subscribe('product_viewed', function (event) {
+    var variant = event.data && event.data.productVariant || {};
+    var product = event.data && event.data.product || variant.product || {};
+    var contentId = normalizeShopifyId(variant.id || product.id);
+    return sendDualChannelEvent('ViewContent', event, {
+        value: moneyAmount(variant.price),
+        currency: moneyCurrency(variant.price),
+        content_ids: contentId ? [contentId] : undefined,
+        contents: contentId ? [{ id: contentId, quantity: 1, item_price: moneyAmount(variant.price) }] : undefined,
+        content_type: 'product',
+        content_name: product.title || variant.title,
+    });
+});
+
+analytics.subscribe('product_added_to_cart', function (event) {
+    var line = event.data && event.data.cartLine || {};
+    var content = lineItemToContent(line);
+    var variant = line.merchandise || line.variant || {};
+    var product = variant.product || line.product || {};
+    return sendDualChannelEvent('AddToCart', event, {
+        value: moneyAmount(line.cost && line.cost.totalAmount),
+        currency: moneyCurrency(line.cost && line.cost.totalAmount),
+        content_ids: content.id ? [content.id] : undefined,
+        contents: content.id ? [content] : undefined,
+        content_type: 'product',
+        content_name: product.title || variant.title,
+        content_category: product.type,
+        num_items: content.quantity,
+    });
+});
+
+analytics.subscribe('product_removed_from_cart', function (event) {
+    var line = event.data && event.data.cartLine || {};
+    var content = lineItemToContent(line);
+    return sendDualChannelEvent('RemoveFromCart', event, {
+        value: moneyAmount(line.cost && line.cost.totalAmount),
+        currency: moneyCurrency(line.cost && line.cost.totalAmount),
+        content_ids: content.id ? [content.id] : undefined,
+        contents: content.id ? [content] : undefined,
+        content_type: 'product',
+        num_items: content.quantity,
+    });
+});
+
+analytics.subscribe('checkout_started', function (event) {
+    var checkout = event.data && event.data.checkout || {};
+    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('InitiateCheckout', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+    }, checkoutStageEventId(checkout, event, 'InitiateCheckout'));
+});
+
+analytics.subscribe('checkout_contact_info_submitted', function (event) {
+    var checkout = event.data && event.data.checkout || {};
+    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('CheckoutContactInfoSubmitted', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+    }, checkoutStageEventId(checkout, event, 'CheckoutContactInfoSubmitted'));
+});
+
+analytics.subscribe('checkout_address_info_submitted', function (event) {
+    var checkout = event.data && event.data.checkout || {};
+    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('CheckoutAddressInfoSubmitted', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+    }, checkoutStageEventId(checkout, event, 'CheckoutAddressInfoSubmitted'));
+});
+
+analytics.subscribe('checkout_shipping_info_submitted', function (event) {
+    var checkout = event.data && event.data.checkout || {};
+    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('CheckoutShippingInfoSubmitted', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+    }, checkoutStageEventId(checkout, event, 'CheckoutShippingInfoSubmitted'));
+});
+
+analytics.subscribe('payment_info_submitted', function (event) {
+    var checkout = event.data && event.data.checkout || {};
+    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('AddPaymentInfo', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+    }, checkoutStageEventId(checkout, event, 'AddPaymentInfo'));
+});
+
+analytics.subscribe('checkout_completed', function (event) {
+    var checkout = event.data && event.data.checkout || {};
+    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('Purchase', event, {
+        value: checkoutValue(checkout),
+        currency: checkoutCurrency(checkout),
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        order_id: firstNonEmpty(checkout.order && checkout.order.name, normalizeShopifyId(checkout.order && checkout.order.id)),
+    }, purchaseEventId(checkout, event));
+});
+
+analytics.subscribe('search_submitted', function (event) {
+    var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
+    return sendDualChannelEvent('Search', event, { search_string: query });
 });
