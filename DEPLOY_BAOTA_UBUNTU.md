@@ -115,6 +115,7 @@ REDIS_URL=redis://127.0.0.1:6379
 
 AES_SECRET_KEY=replace_with_at_least_32_random_characters
 INGEST_TOKEN_SECRET=replace_with_a_different_32_character_random_secret
+#Windows本地CMD生成密钥：node -e "const c=require('crypto');console.log('AES_SECRET_KEY='+c.randomBytes(32).toString('hex'));console.log('INGEST_TOKEN_SECRET='+c.randomBytes(32).toString('hex'))"
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=replace_with_a_strong_admin_password
 REQUIRE_INGEST_TOKEN=true
