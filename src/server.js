@@ -4065,7 +4065,7 @@ app.use((err, req, res, next) => {
     if (err.code === '42501') {
         console.error(err);
         return res.status(500).json({
-            error: 'Database permission denied. Grant the app database user privileges on shops, pixels, shop_pixel_routes, event_store, shopify_webhook_inbox, shopify_privacy_inbox, shopify_reconcile_state, event_id_aliases, event_deliveries, dead_letters, meta_quality_snapshots, and their sequences.',
+            error: 'Database permission denied. The DATABASE_URL user must own the project tables and sequences. Run sudo bash scripts/repair-db-ownership.sh from the project directory, then npm run migrate and npm run doctor.',
             code: err.code,
         });
     }

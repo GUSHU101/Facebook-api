@@ -80,6 +80,23 @@ GRANT ALL PRIVILEGES ON DATABASE capi_saas TO capi_user;
 
 如果数据库或用户已经存在，不要重复创建，也不要随意更换数据库密码。旧版本升级时保留原数据库和 `.env`。
 
+数据库、`public` schema、项目表和序列必须由 `.env` 的 `DATABASE_URL` 用户拥有。不要使用
+`sudo -u postgres psql -d capi_saas -f init.sql` 导入结构，否则表会归 `postgres` 所有，后台运行和后续
+`ALTER TABLE` 迁移都会遇到权限错误。结构始终通过项目用户执行的 `npm run migrate` 创建。
+
+如果数据库曾由宝塔面板、`postgres` 用户或旧安装方式创建，可在填好 `.env` 后执行一次幂等修复：
+
+```bash
+cd /www/wwwroot/capi-saas
+sudo bash scripts/repair-db-ownership.sh
+npm run migrate
+npm run doctor
+```
+
+修复脚本会从 `DATABASE_URL` 自动读取数据库名和用户，只调整该专用数据库 `public` schema 中现有表与
+序列的所有权，不删除或重建业务数据。完成后，正常拉取代码和重复执行 `npm run migrate` 都不再需要手工
+`GRANT`。每个项目应使用独立数据库，不要把其他应用的表混放在 `capi_saas` 的 `public` schema。
+
 ## 4. 配置 `.env`
 
 ```bash
@@ -148,6 +165,7 @@ npm run doctor
 
 `migrate` 可重复运行：它不会清空店铺、像素、事件或投递历史；大型索引使用在线创建方式。`doctor` 会检查数据库结构、跨店路由一致性、事件汇总一致性、Redis 策略、连接权限和超时配置。
 它还会验证已保存凭据能否用当前 `AES_SECRET_KEY` 解密，并检查 Shopify 支付 webhook 收件箱；任何 `FAIL` 都必须在启动前处理。
+自检还会要求项目表和序列由 `DATABASE_URL` 用户拥有，因为只有所有者才能安全执行后续结构迁移；若所有者错误，按提示运行 `sudo bash scripts/repair-db-ownership.sh`。
 
 任何 `FAIL` 都应在启动前处理，不要跳过。
 

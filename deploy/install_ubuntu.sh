@@ -336,7 +336,52 @@ END
 
 SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\\gexec
+ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+\\connect ${DB_NAME}
+
+ALTER SCHEMA public OWNER TO ${DB_USER};
+GRANT USAGE, CREATE ON SCHEMA public TO ${DB_USER};
+
+DO \$ownership\$
+DECLARE
+  object_record record;
+BEGIN
+  FOR object_record IN
+    SELECT schemaname, tablename
+    FROM pg_tables
+    WHERE schemaname = 'public'
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE %I.%I OWNER TO %I',
+      object_record.schemaname,
+      object_record.tablename,
+      '${DB_USER}'
+    );
+  END LOOP;
+
+  FOR object_record IN
+    SELECT schemaname, sequencename
+    FROM pg_sequences
+    WHERE schemaname = 'public'
+  LOOP
+    EXECUTE format(
+      'ALTER SEQUENCE %I.%I OWNER TO %I',
+      object_record.schemaname,
+      object_record.sequencename,
+      '${DB_USER}'
+    );
+  END LOOP;
+END
+\$ownership\$;
+
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
+
+ALTER DEFAULT PRIVILEGES FOR ROLE ${DB_USER} IN SCHEMA public
+  GRANT ALL PRIVILEGES ON TABLES TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${DB_USER} IN SCHEMA public
+  GRANT ALL PRIVILEGES ON SEQUENCES TO ${DB_USER};
 SQL
 }
 

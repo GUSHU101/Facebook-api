@@ -435,6 +435,29 @@ async function main() {
             throw new Error(`Database user ${user} needs USAGE and CREATE on schema public in ${database}`);
         }
 
+        const ownedRelations = [...runtimeTables, ...runtimeSequences];
+        const { rows: wrongOwners } = await pool.query(
+            `SELECT relation.relname AS relation_name,
+                    pg_get_userbyid(relation.relowner) AS owner
+             FROM pg_class relation
+             JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = 'public'
+               AND relation.relname = ANY($1::text[])
+               AND relation.relowner <> (SELECT usesysid FROM pg_user WHERE usename = current_user)
+             ORDER BY relation.relname`,
+            [ownedRelations],
+        );
+        if (wrongOwners.length > 0) {
+            const examples = wrongOwners
+                .slice(0, 5)
+                .map(row => `${row.relation_name} (owner=${row.owner})`)
+                .join(', ');
+            throw new Error(
+                `Database user ${user} must own project tables and sequences for safe migrations; `
+                + `wrong owners: ${examples}. Run sudo bash scripts/repair-db-ownership.sh`,
+            );
+        }
+
         const tablePrivileges = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
         for (const table of runtimeTables) {
             const privilegeChecks = tablePrivileges.map(privilege => (

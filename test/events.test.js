@@ -1858,6 +1858,10 @@ test('deployment workflow preserves production secrets and verifies runtime read
     );
     const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
     const restore = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'restore.sh'), 'utf8');
+    const ownershipRepair = fs.readFileSync(
+        path.join(__dirname, '..', 'scripts', 'repair-db-ownership.sh'),
+        'utf8',
+    );
 
     assert.match(installer, /FORCE_ENV_REWRITE="\$\{FORCE_ENV_REWRITE:-0\}"/);
     assert.match(installer, /Preserving existing \.env and database credentials/);
@@ -1866,6 +1870,9 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(installer, /AES_SECRET_KEY is required when FORCE_ENV_REWRITE=1/);
     assert.match(installer, /SHOPIFY_APP_SECRET="\$\{SHOPIFY_APP_SECRET:-\}"/);
     assert.match(installer, /SHOPIFY_PRIVACY_RETENTION_DAYS=30/);
+    assert.match(installer, /ALTER DATABASE .* OWNER TO/);
+    assert.match(installer, /ALTER TABLE %I\.%I OWNER TO %I/);
+    assert.match(installer, /ALTER SEQUENCE %I\.%I OWNER TO %I/);
     assert.match(installer, /verify_runtime\(\)/);
     assert.match(installer, /\/healthz/);
     assert.match(installer, /\/readyz/);
@@ -1874,6 +1881,10 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaTemplate, /proxy_read_timeout 35s/);
     assert.match(ci, /npm run build:admin/);
     assert.match(ci, /npm ci --omit=dev --ignore-scripts/);
+    assert.match(ci, /scripts\/repair-db-ownership\.sh/);
     assert.match(restore, /--single-transaction/);
     assert.match(restore, /runtime remains stopped and maintenance mode stays enabled/);
+    assert.match(ownershipRepair, /DATABASE_URL must include a user and database name/);
+    assert.match(ownershipRepair, /ALTER SCHEMA public OWNER TO/);
+    assert.match(ownershipRepair, /remaining_wrong_owners/);
 });

@@ -149,6 +149,9 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    ```
 
    `npm run migrate` 会应用统一数据库结构并在线创建规模化索引。它可安全用于新数据库和已有数据库，不会删除业务数据。
+   迁移必须使用 `.env` 中 `DATABASE_URL` 指定的应用数据库用户执行，不要用 `postgres` 直接导入 `init.sql`。
+   如果宝塔或旧部署已经把表创建为 `postgres` 所有，可执行一次 `sudo bash scripts/repair-db-ownership.sh`；
+   它会把专用数据库的 `public` schema、项目表和序列转交给应用用户，之后升级无需重复手工授权。
 
 3. 配置 `.env`：
 
