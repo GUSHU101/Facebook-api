@@ -871,9 +871,10 @@ function scheduleMetaRouteConfigRefresh() {
 }
 
 function moneyAmount(value) {
-    var raw = value && typeof value === 'object'
-        ? firstNonEmpty(value.amount, value.value)
-        : value;
+    var raw = value;
+    if (value && typeof value === 'object') {
+        raw = firstNonEmpty(value.amount, value.value);
+    }
     var amount = Number(raw);
     return Number.isFinite(amount) ? amount : undefined;
 }
@@ -940,9 +941,10 @@ function lineItemToContent(item) {
     var product = item.product || variant.product || {};
     var quantity = Number(item.quantity || 1);
     var totalPrice = moneyAmount(item.cost && item.cost.totalAmount || item.finalLinePrice);
-    var price = totalPrice !== undefined && quantity > 0
-        ? totalPrice / quantity
-        : moneyAmount(item.cost && item.cost.amountPerQuantity || variant.price);
+    var price = moneyAmount(item.cost && item.cost.amountPerQuantity || variant.price);
+    if (totalPrice !== undefined && quantity > 0) {
+        price = totalPrice / quantity;
+    }
     return {
         id: normalizeShopifyId(variant.id || product.id || item.id),
         quantity: Number.isFinite(quantity) ? quantity : 1,
@@ -1228,9 +1230,10 @@ function mergeQueuedEvents(events) {
         combined._client_first_queued_at = firstQueuedAt.length ? Math.min.apply(Math, firstQueuedAt) : Date.now();
         combined._client_retry_count = retryCount || undefined;
         combined._client_next_attempt_at = nextAttemptAt.length ? Math.min.apply(Math, nextAttemptAt) : undefined;
-        combined.timestamp = Number.isFinite(existingTime) && Number.isFinite(eventTime)
-            ? (existingTime <= eventTime ? existing.timestamp : event.timestamp)
-            : firstNonEmpty(existing.timestamp, event.timestamp);
+        combined.timestamp = firstNonEmpty(existing.timestamp, event.timestamp);
+        if (Number.isFinite(existingTime) && Number.isFinite(eventTime)) {
+            combined.timestamp = existingTime <= eventTime ? existing.timestamp : event.timestamp;
+        }
         merged[index] = compact(combined);
     });
     return merged;
@@ -1521,9 +1524,12 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     var rawCountry = address.countryCode || address.country;
     var orderCustomer = checkout.order && checkout.order.customer || {};
     var isFirstOrder = firstNonEmpty(orderCustomer.isFirstOrder, customer && customer.isFirstOrder);
-    var customerSegmentation = isFirstOrder === true
-        ? 'new_customer_to_business'
-        : (isFirstOrder === false ? 'existing_customer_to_business' : undefined);
+    var customerSegmentation;
+    if (isFirstOrder === true) {
+        customerSegmentation = 'new_customer_to_business';
+    } else if (isFirstOrder === false) {
+        customerSegmentation = 'existing_customer_to_business';
+    }
     var hashedFields = await Promise.all([
         sha256Hex(rawEmail, 'email'),
         sha256Hex(rawPhone, 'phone', rawCountry),
