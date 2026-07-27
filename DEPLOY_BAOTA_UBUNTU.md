@@ -309,14 +309,7 @@ ls -l /www/server/panel/vhost/cert/Facebook_api_main/privkey.pem
 
 ```bash
 cd /www/wwwroot/Facebook-api-main
-sudo env \
-  DOMAIN=pixel.atelierwrap.cc \
-  BT_SITE_NAME=Facebook_api_main \
-  PROJECT_DIR=/www/wwwroot/Facebook-api-main \
-  PUBLIC_PORT=8443 \
-  INTERNAL_PORT=3000 \
-  INSTALL_WATCHER=1 \
-  bash deploy/configure_baota_nginx.sh
+sudo env DOMAIN=pixel.atelierwrap.cc BT_SITE_NAME=Facebook_api_main PROJECT_DIR=/www/wwwroot/Facebook-api-main PUBLIC_PORT=8443 INTERNAL_PORT=3000 INSTALL_WATCHER=1 bash deploy/configure_baota_nginx.sh
 ```
 
 这一次需要明确域名，因为 Nginx 必须知道证书对应的主机名。参数会保存到 systemd 服务，普通部署和重启不需要再次输入。
