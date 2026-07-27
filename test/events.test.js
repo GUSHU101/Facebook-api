@@ -1216,6 +1216,12 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     // the code a merchant copies from the admin UI.
     const generated = Function(`return \`${renderedTemplate}\`;`)();
 
+    assert.doesNotMatch(
+        generated,
+        /\n\s*[?:]/,
+        'generated Shopify pixel must not start a line with a ternary operator',
+    );
+
     assert.equal(generated.includes('document.createElement'), true);
     assert.equal(generated.includes('typeof document'), true);
     assert.equal(generated.includes('connect.facebook.net/en_US/fbevents.js'), true);
