@@ -321,7 +321,8 @@ sudo env DOMAIN=pixel.atelierwrap.cc BT_SITE_NAME=Facebook_api_main PROJECT_DIR=
 - 生成 `8443 SSL → 127.0.0.1:3000` 反向代理。
 - 禁止访问 `.env`、`.git`、日志、SQL、备份和 `node_modules`。
 - 执行 `nginx -t`，失败则自动恢复旧配置。
-- 成功后平滑重载 Nginx。
+- 只验证宝塔的 `/www/server/nginx/sbin/nginx`，不会误用 Ubuntu 的另一套 Nginx。
+- 成功后直接向宝塔 Nginx 主进程发送平滑重载信号，避免两套 Nginx 争抢 80/443 端口。
 - 安装 systemd 文件监视器；宝塔重写 vhost 后自动恢复 8443。
 
 检查监视器：
@@ -333,7 +334,7 @@ systemctl status capi-baota-nginx-facebook-api-main.path
 检查 Nginx：
 
 ```bash
-nginx -t || /www/server/nginx/sbin/nginx -t
+/www/server/nginx/sbin/nginx -t
 curl -I https://pixel.atelierwrap.cc:8443/healthz
 ```
 
@@ -500,6 +501,36 @@ ufw status
 ```
 
 同时检查云厂商安全组 TCP 8443。
+
+### `bind() to 0.0.0.0:443 failed` 或提示重复 Nginx
+
+这不是 Node.js 的 `3000` 端口冲突。通常是系统 Nginx 与宝塔 Nginx 同时存在，或旧版配置脚本误向系统 Nginx 发送了重载命令。最新版脚本只操作宝塔 Nginx。
+
+先查看当前 Nginx 主进程和监听者，不要执行 `killall nginx`：
+
+```bash
+ps -ef | grep '[n]ginx: master'
+sudo ss -ltnp | grep -E ':(80|443|8443)\b'
+sudo cat /www/server/nginx/logs/nginx.pid
+sudo readlink -f "/proc/$(cat /www/server/nginx/logs/nginx.pid)/exe"
+```
+
+最后一条命令正常应输出：
+
+```text
+/www/server/nginx/sbin/nginx
+```
+
+随后拉取最新版并重新配置：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+git pull --ff-only origin main
+sudo /www/server/nginx/sbin/nginx -t
+sudo env DOMAIN=pixel.atelierwrap.cc BT_SITE_NAME=Facebook_api_main PROJECT_DIR=/www/wwwroot/Facebook-api-main PUBLIC_PORT=8443 INTERNAL_PORT=3000 INSTALL_WATCHER=1 bash deploy/configure_baota_nginx.sh
+```
+
+如果 PID 对应的程序不是 `/www/server/nginx/sbin/nginx`，或者显示两个 `nginx: master process`，请先在宝塔“软件商店 → Nginx”中重启宝塔 Nginx；不要继续启动 Ubuntu 的 `nginx.service`。新版脚本会拒绝修改配置并给出明确错误，避免再次争抢端口。
 
 ## 13. 停用自动 8443 管理
 

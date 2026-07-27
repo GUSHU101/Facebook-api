@@ -1887,6 +1887,9 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.doesNotMatch(installer, /proxy_read_timeout 86400s/);
     assert.match(baotaTemplate, /proxy_set_header Connection ""/);
     assert.match(baotaTemplate, /proxy_read_timeout 35s/);
+    assert.match(baotaTemplate, /listen __PUBLIC_PORT__ ssl;/);
+    assert.match(baotaTemplate, /http2 on;/);
+    assert.doesNotMatch(baotaTemplate, /listen __PUBLIC_PORT__ ssl http2;/);
     assert.match(ci, /npm run build:admin/);
     assert.match(ci, /npm ci --omit=dev --ignore-scripts/);
     assert.match(ci, /scripts\/repair-db-ownership\.sh/);
@@ -1904,6 +1907,9 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaConfigurator, /INSTALL_WATCHER/);
     assert.match(baotaConfigurator, /nginx validation failed; restored the previous vhost configuration/);
     assert.match(baotaConfigurator, /PathChanged=\$\{VHOST_FILE\}/);
+    assert.match(baotaConfigurator, /\/www\/server\/nginx\/sbin\/nginx/);
+    assert.match(baotaConfigurator, /kill -HUP "\$nginx_master_pid"/);
+    assert.doesNotMatch(baotaConfigurator, /systemctl reload nginx/);
     assert.match(baotaUpdater, /npm ci --omit=dev/);
     assert.match(baotaUpdater, /bash scripts\/repair-db-ownership\.sh/);
     assert.match(baotaUpdater, /pm2 start .*src\/worker\.js/);

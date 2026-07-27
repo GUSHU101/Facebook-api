@@ -61,13 +61,23 @@ certificate_dir="/www/server/panel/vhost/cert/${BT_SITE_NAME}"
 [ -s "${certificate_dir}/fullchain.pem" ] || fail "SSL certificate not found: ${certificate_dir}/fullchain.pem"
 [ -s "${certificate_dir}/privkey.pem" ] || fail "SSL private key not found: ${certificate_dir}/privkey.pem"
 
-if command -v nginx >/dev/null 2>&1; then
-  NGINX_BIN="$(command -v nginx)"
-elif [ -x /www/server/nginx/sbin/nginx ]; then
-  NGINX_BIN=/www/server/nginx/sbin/nginx
-else
-  fail "nginx executable was not found"
-fi
+# This is deliberately pinned to Baota's Nginx. Using `nginx` from PATH or a
+# generic systemd Nginx service can target Ubuntu's separate installation and
+# make two masters compete for ports 80/443.
+NGINX_BIN="${NGINX_BIN:-/www/server/nginx/sbin/nginx}"
+NGINX_PID_FILE="${NGINX_PID_FILE:-/www/server/nginx/logs/nginx.pid}"
+[ -x "$NGINX_BIN" ] || fail "Baota nginx executable was not found: ${NGINX_BIN}"
+[ -s "$NGINX_PID_FILE" ] || fail "Baota nginx is not running (missing PID file: ${NGINX_PID_FILE}); start Nginx in Baota first"
+
+nginx_master_pid="$(tr -d '[:space:]' < "$NGINX_PID_FILE")"
+[[ "$nginx_master_pid" =~ ^[0-9]+$ ]] || fail "invalid Baota nginx PID in ${NGINX_PID_FILE}"
+kill -0 "$nginx_master_pid" 2>/dev/null \
+  || fail "Baota nginx master PID ${nginx_master_pid} is not running; start Nginx in Baota first"
+
+nginx_master_exe="$(readlink -f "/proc/${nginx_master_pid}/exe" 2>/dev/null || true)"
+expected_nginx_exe="$(readlink -f "$NGINX_BIN")"
+[ "$nginx_master_exe" = "$expected_nginx_exe" ] \
+  || fail "PID ${nginx_master_pid} is not Baota nginx (${nginx_master_exe:-unknown}); resolve duplicate Nginx installations before continuing"
 
 unit_slug="$(printf '%s' "$BT_SITE_NAME" | tr '[:upper:]_' '[:lower:]-')"
 service_name="capi-baota-nginx-${unit_slug}.service"
@@ -136,11 +146,9 @@ if ! [ -f "$VHOST_FILE" ] || ! cmp -s "$rendered_file" "$VHOST_FILE"; then
   fi
 
   rm -f -- "$failure_state"
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
-    systemctl reload nginx
-  else
-    "$NGINX_BIN" -s reload
-  fi
+  # Signal the already-running Baota master directly. Never ask systemd to
+  # locate an ambiguous service named `nginx` on a Baota host.
+  kill -HUP "$nginx_master_pid"
   changed=1
 fi
 

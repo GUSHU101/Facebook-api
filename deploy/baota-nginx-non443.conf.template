@@ -37,7 +37,8 @@ server
 
 server
 {
-    listen __PUBLIC_PORT__ ssl http2;
+    listen __PUBLIC_PORT__ ssl;
+    http2 on;
     server_name __DOMAIN__;
     server_tokens off;
     index index.html index.htm default.htm default.html;
