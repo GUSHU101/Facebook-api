@@ -2,6 +2,10 @@
 
 本方案不依赖宝塔/aaPanel。安装脚本会在 Ubuntu 上配置 Node.js、PM2、PostgreSQL、Redis、Nginx、数据库迁移、运行自检以及可选的 DNS-01 SSL。
 
+> 如果服务器已经安装宝塔，并希望由宝塔管理 Node 项目，请停止阅读本文，改用
+> [宝塔面板完整部署指南](DEPLOY_BAOTA_UBUNTU.md)。不要在同一项目上同时运行宝塔 Node API 与本文的
+> `capi-api` PM2 进程，否则会争用 3000 端口。
+
 默认架构使用：
 
 - Node 内部端口：`3000`
@@ -19,6 +23,9 @@
 
 ## 2. 最小一键安装
 
+建议先进入 root shell，并确认域名、证书方案和云安全组已经准备好。以下命令只需执行一次；其中
+`capi.example.com` 必须替换为真实域名。
+
 不自动签发证书时：
 
 ```bash
@@ -32,6 +39,15 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 ```
 
 脚本会生成数据库、后台和 AES 强随机密钥，并在最后显示首次登录信息。立即将这些信息存入密码管理器；尤其不能丢失 `.env` 中的 `AES_SECRET_KEY`。
+
+安装成功必须同时满足：
+
+```text
+PM2 中 capi-api 和 capi-worker 均为 online
+http://127.0.0.1:3000/healthz 返回成功
+http://127.0.0.1:3000/readyz 返回成功
+npm run doctor 没有 FAIL
+```
 
 没有有效证书时，脚本只生成：
 
@@ -161,6 +177,12 @@ sudo env \
 
 不要在普通升级中使用 `FORCE_ENV_REWRITE=1`。如果确实要重建 `.env`，必须同时显式提供原有或计划使用的 `DB_PASSWORD`、`ADMIN_PASSWORD`、`AES_SECRET_KEY`、`INGEST_TOKEN_SECRET`；错误的 AES 密钥会让历史平台 Token 无法解密，错误的采集密钥会让尚未更新的 Shopify 像素返回 401。
 
+普通重启服务器不需要重新运行安装器。日常操作只有三种：
+
+1. 普通重启：systemd 自动启动 PostgreSQL、Redis、Nginx 和 PM2 保存的 API/Worker。
+2. 更新代码：重新下载最新安装脚本，使用首次部署时相同的域名和参数执行；已有 `.env` 默认受保护。
+3. 更换域名：为新域名签发证书，使用新 `DOMAIN` 重新执行安装器，并更新 Shopify Webhook 与 Customer Events 代码。
+
 ## 7. 安装后配置
 
 打开：
@@ -248,3 +270,6 @@ sudo -u capi-saas env HOME=/var/lib/capi-saas npm --prefix /www/wwwroot/capi-saa
 - 事件积压：检查 Worker、Redis noeviction、平台限流冷却、数据库连接和最旧到期事件。
 - Purchase 缺失：检查 `orders/paid` webhook、HMAC secret、付款状态和 `SHOPIFY_WEB_ORDER_SOURCES`。
 - 重复或串店疑虑：运行 `npm run doctor` 并查看后台投递完整性；数据库触发器会拒绝跨店事件/路由组合。
+- `Cannot find module`：确认安装器的 `npm ci --omit=dev` 步骤成功，且 PM2 的 `cwd` 为 `/www/wwwroot/capi-saas`。
+- `Database permission denied`：重新运行最新版安装器；它会在迁移前把数据库、schema、现有表和序列所有权幂等修复为应用数据库用户。
+- 8443 无法访问：依次检查证书文件、`nginx -t`、`ss -lntp | grep ':8443'`、UFW 和云安全组。

@@ -13,10 +13,11 @@ npm run build:admin
 
 然后提交重新生成的 `src/public/admin.css` 和 `src/public/vue.global.prod.js`。生产服务器不需要安装这些开发依赖，因为编译后的资源已经包含在仓库中。
 
-宝塔/aaPanel 不是必需依赖：
+先选择一种部署方式，二者不要混用：
 
 - 纯 Ubuntu VPS：[Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md)
-- 宝塔 Node 项目部署：[宝塔部署指南](DEPLOY_BAOTA_UBUNTU.md)
+- 宝塔 Node 项目部署：[宝塔完整部署指南](DEPLOY_BAOTA_UBUNTU.md)。宝塔用户更新代码后统一运行
+  `sudo bash deploy/update_baota.sh`，不要再手工寻找 Node/psql、创建 `/tmp` 脚本或用 PM2 重复启动 API。
 - 发布前检查：[GitHub 发布检查清单](GITHUB_RELEASE_CHECKLIST.md)
 
 Ubuntu 一键安装示例：
@@ -220,6 +221,8 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    ```
 
 5. 打开管理后台。避免使用公网 `443` 时，可使用 `https://capi.example.com:8443/admin`。
+   宝塔部署可运行 `deploy/configure_baota_nginx.sh` 并设置 `INSTALL_WATCHER=1`，自动生成、验证、回滚并持续维护
+   8443 vhost；具体参数见 [宝塔部署指南](DEPLOY_BAOTA_UBUNTU.md)。
 6. 添加 Shopify 店铺；建议同时填写具备 `read_orders` 的 Admin API Token，以启用支付订单对账。再添加一条或多条平台路由，路由表单支持让同一个凭证同时关联多个店铺：
    - Facebook / Meta：Pixel 或 Dataset ID，以及 System User Access Token。
    - TikTok：Pixel Code，以及 Events API Access Token。

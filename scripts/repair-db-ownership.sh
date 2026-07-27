@@ -41,7 +41,25 @@ echo "Using PostgreSQL client from ${PSQL_BIN}"
 mapfile -t connection_parts < <(
   cd "$APP_DIR"
   node <<'NODE'
-require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+
+const envPath = path.join(process.cwd(), '.env');
+if (typeof process.loadEnvFile === 'function') {
+    process.loadEnvFile(envPath);
+} else {
+    const line = fs.readFileSync(envPath, 'utf8')
+        .split(/\r?\n/)
+        .find(value => /^\s*DATABASE_URL\s*=/.test(value));
+    if (line) {
+        let value = line.replace(/^\s*DATABASE_URL\s*=\s*/, '').trim();
+        if ((value.startsWith('"') && value.endsWith('"'))
+            || (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+        }
+        process.env.DATABASE_URL = value;
+    }
+}
 
 const raw = process.env.DATABASE_URL;
 if (!raw) throw new Error('DATABASE_URL is missing from .env');

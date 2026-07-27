@@ -1,334 +1,519 @@
-# Ubuntu + 宝塔面板生产部署指南
+# Ubuntu 宝塔面板完整部署指南（Node 项目 + 8443）
 
-本文用于在 Ubuntu VPS 上通过宝塔/aaPanel 部署本项目。生产架构为：
+本文只讲一种部署方式：**宝塔面板管理 API，PM2 只管理 Worker，Nginx 对外提供 8443 HTTPS**。
+不要把本文命令和 Ubuntu 一键安装脚本混用，也不要同时用宝塔和 `ecosystem.config.js` 启动 API，否则会争用 3000 端口。
+
+本文统一使用以下示例；你的值不同才需要替换：
 
 ```text
-Shopify / 管理员
-        │ HTTPS :8443
-        ▼
-宝塔 Nginx
-        │ http://127.0.0.1:3000
-        ▼
-PM2: capi-api + capi-worker
-        ├── PostgreSQL：事件、路由、去重和投递账本
-        └── Redis/BullMQ：异步调度、租约和限流状态
+项目目录：/www/wwwroot/Facebook-api-main
+宝塔站点标识：Facebook_api_main
+公网域名：pixel.atelierwrap.cc
+公网 HTTPS：8443
+Node 内部端口：3000
+数据库名：capi_saas
+数据库用户：capi_saas
 ```
 
-示例使用公网 HTTPS `8443`，不占用 `443`。如果你使用标准 `443`，需同步修改 Nginx、云安全组和所有 Shopify URL。
+## 1. 最终运行结构
 
-## 1. 部署前检查
+```text
+Shopify Customer Events / Shopify Webhook / 管理员
+                         │
+                         │ https://pixel.atelierwrap.cc:8443
+                         ▼
+                 宝塔 Nginx（SSL）
+                         │
+                         │ http://127.0.0.1:3000
+                         ▼
+              宝塔 Node 项目：src/server.js
+                         │
+             ┌───────────┴───────────┐
+             ▼                       ▼
+       PostgreSQL                Redis / BullMQ
+             ▲                       │
+             └──── PM2：capi-worker ─┘
+```
 
-- Ubuntu 20.04、22.04 或 24.04，建议至少 2 核 CPU、4 GB 内存。
-- 域名 A/AAAA 记录已经指向服务器。
-- 云安全组放行 `80/tcp` 和 `8443/tcp`；不要公开 PostgreSQL `5432`、Redis `6379` 和 Node `3000`。
-- 宝塔安装 Nginx、PostgreSQL、Redis、Node.js 20/22/24 和 PM2。
-- Redis `maxmemory-policy` 必须为 `noeviction`。
-- 服务器时间和时区同步正常；事件时间统一由应用按 UTC 处理。
+端口规则：
 
-- 项目目录进终端更新依赖：npm ci --omit=dev
+- 公网只开放 `80/tcp` 和 `8443/tcp`。
+- Node 保持 `PORT=3000`，不要改成 8443。
+- 不要向公网开放 `3000`、`5432`、`6379`。
+- Nginx 负责证书和 HTTPS，Node 只接收本机 HTTP。
 
-检查版本：
+## 2. 宝塔需要安装的软件
+
+在“软件商店”安装并启动：
+
+- Nginx
+- PostgreSQL
+- Redis
+- Node.js 版本管理器
+- Node.js 20 或更高版本
+- PM2
+
+宝塔可能把程序安装在自定义目录，例如：
+
+```text
+/www/server/nodejs/v20.20.2/bin/node
+/www/server/pgsql/bin/psql
+/www/server/nginx/sbin/nginx
+```
+
+因此 root 终端直接执行 `node` 或 `psql` 可能显示找不到命令。项目脚本会自动扫描这些宝塔目录，**不要再创建 `/tmp` 修复脚本，也不需要手工创建软链接**。
+
+Redis 必须使用不驱逐队列元数据的策略。在宝塔终端执行：
 
 ```bash
-node --version
-npm --version
-pm2 --version
-psql --version
 redis-cli ping
 redis-cli CONFIG GET maxmemory-policy
 ```
 
-如果 Redis 策略不是 `noeviction`：
+正确结果包含：
+
+```text
+PONG
+noeviction
+```
+
+如果不是 `noeviction`：
 
 ```bash
 redis-cli CONFIG SET maxmemory-policy noeviction
 redis-cli CONFIG REWRITE
 ```
 
-## 2. 下载项目
+## 3. 下载正式 main 代码
 
-推荐目录为 `/www/wwwroot/capi-saas`：
+首次部署：
 
 ```bash
 cd /www/wwwroot
-git clone https://github.com/GUSHU101/Facebook-api.git capi-saas
-cd /www/wwwroot/capi-saas
-git branch --show-current
+git clone --branch main https://github.com/GUSHU101/Facebook-api.git Facebook-api-main
+cd /www/wwwroot/Facebook-api-main
+git status -sb
 ```
 
-只提交编译后的后台 CSS/Vue 资源，不需要在生产服务器安装开发依赖：
+应该看到当前分支为 `main`。
+
+已有目录只更新代码：
 
 ```bash
-npm ci --omit=dev
-npm run check
+cd /www/wwwroot/Facebook-api-main
+git pull --ff-only origin main
 ```
 
-## 3. 创建 PostgreSQL 数据库
+如果 `git pull` 提示本地修改冲突，不要使用 `git reset --hard`。先备份 `.env`，并确认修改来自哪里。
 
-新安装可进入 PostgreSQL：
+## 4. 创建 PostgreSQL 数据库
 
-```bash
-sudo -u postgres psql
-```
-
-执行以下 SQL，并替换强密码：
-
-```sql
-CREATE USER capi_user WITH PASSWORD 'replace_with_a_strong_database_password';
-CREATE DATABASE capi_saas OWNER capi_user;
-GRANT ALL PRIVILEGES ON DATABASE capi_saas TO capi_user;
-\q
-```
-
-如果数据库或用户已经存在，不要重复创建，也不要随意更换数据库密码。旧版本升级时保留原数据库和 `.env`。
-
-数据库、`public` schema、项目表和序列必须由 `.env` 的 `DATABASE_URL` 用户拥有。不要使用
-`sudo -u postgres psql -d capi_saas -f init.sql` 导入结构，否则表会归 `postgres` 所有，后台运行和后续
-`ALTER TABLE` 迁移都会遇到权限错误。结构始终通过项目用户执行的 `npm run migrate` 创建。
-
-如果数据库曾由宝塔面板、`postgres` 用户或旧安装方式创建，可在填好 `.env` 后执行一次幂等修复：
-
-```bash
-cd /www/wwwroot/capi-saas
-sudo bash scripts/repair-db-ownership.sh
-npm run migrate
-npm run doctor
-```
-
-修复脚本会从 `DATABASE_URL` 自动读取数据库名和用户，只调整该专用数据库 `public` schema 中现有表与
-序列的所有权，不删除或重建业务数据。完成后，正常拉取代码和重复执行 `npm run migrate` 都不再需要手工
-`GRANT`。每个项目应使用独立数据库，不要把其他应用的表混放在 `capi_saas` 的 `public` schema。
-
-## 4. 配置 `.env`
-
-```bash
-cd /www/wwwroot/capi-saas
-cp .env.example .env
-chmod 600 .env
-nano .env
-```
-
-必须修改：
-
-```env
-PORT=3000
-DATABASE_URL=postgres://capi_user:replace_with_a_strong_database_password@127.0.0.1:5432/capi_saas
-REDIS_URL=redis://127.0.0.1:6379
-
-AES_SECRET_KEY=replace_with_at_least_32_random_characters
-INGEST_TOKEN_SECRET=replace_with_a_different_32_character_random_secret
-#Windows本地CMD生成密钥：node -e "const c=require('crypto');console.log('AES_SECRET_KEY='+c.randomBytes(32).toString('hex'));console.log('INGEST_TOKEN_SECRET='+c.randomBytes(32).toString('hex'))"
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=replace_with_a_strong_admin_password
-REQUIRE_INGEST_TOKEN=true
-
-# 只有这些 Shopify source_name 可生成网站 Purchase。
-SHOPIFY_WEB_ORDER_SOURCES=web
-# 同一个自建应用跨店共用时可填；每店独立应用时留空。
-SHOPIFY_APP_SECRET=
-SHOPIFY_API_VERSION=2026-07
-SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
-SHOPIFY_RECONCILE_LOOKBACK_HOURS=48
-SHOPIFY_RECONCILE_MAX_ORDERS=1000
-SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES=100
-COMMERCE_ITEM_LIMIT=1000
-
-# Shopify Customer Events 运行在沙箱中，建议采集接口保持 *；管理接口不启用 CORS。
-CORS_ORIGIN=*
-TRUST_PROXY_HOPS=1
-```
-
-重要规则：
-
-- `AES_SECRET_KEY` 上线后必须永久保存。更换它会导致已保存的平台 Token 无法解密，`npm run doctor` 会直接报告失败而不是让密文被误当作令牌继续运行。
-- `INGEST_TOKEN_SECRET` 用于店铺采集 Token，应与 AES 密钥不同并永久备份；轮换时可把旧值暂存到 `INGEST_TOKEN_PREVIOUS_SECRET`，待所有 Shopify 像素更新后清空。
-- `SHOPIFY_WEB_ORDER_SOURCES=web` 是安全默认值。只有确认某个 Headless/自定义销售渠道属于网站流量时，才加入对应 `source_name`。
-- Shopify 客户事件沙箱的请求 Origin 不应假定为店铺域名。`/api/pixel-event` 与 `/api/pixel-config` 不使用 Cookie 身份，建议保持 `CORS_ORIGIN=*`；管理 API 没有启用 CORS，采集安全由店铺 Token、租户校验、限流和服务端路由承担。
-- `PIXEL_RATE_LIMIT_PER_MINUTE=600` 是默认的店铺/IP 宽松保护，多 API 实例通过 Redis 共用计数；Redis 故障时自动退回单进程保护。设为 `0` 前必须确认 CDN/WAF 已提供可靠限流。
-- `COMMERCE_ITEM_LIMIT=1000` 控制单个购物事件最多保留的商品行数，可按超大订单需求提高，但不得超过 5000；系统会对超限事件记录截断诊断，避免单个异常请求无限占用内存。
-- 不要把 `.env` 上传到 GitHub、网盘或工单。
-
-### 多实例容量
-
-PostgreSQL 最大连接数近似为：
+推荐直接在宝塔 PostgreSQL 管理页面创建：
 
 ```text
-(API_INSTANCES + WORKER_INSTANCES) × DB_POOL_MAX
+数据库名：capi_saas
+用户名：capi_saas
+密码：使用至少 24 位随机密码
+访问权限：仅本机
 ```
 
-默认 `1 + 1` 个实例、每实例连接池 `20`，理论上最多约 40 条应用连接。扩容前必须给 PostgreSQL 管理连接、迁移和监控预留余量。
+数据库密码建议只用字母、数字、点、下划线、波浪号或连字符，避免连接 URL 需要额外编码。
 
-## 5. 迁移和自检
+不要执行：
 
 ```bash
-cd /www/wwwroot/capi-saas
-npm run migrate
-npm run doctor
+sudo -u postgres psql -d capi_saas -f init.sql
 ```
 
-`migrate` 可重复运行：它不会清空店铺、像素、事件或投递历史；大型索引使用在线创建方式。`doctor` 会检查数据库结构、跨店路由一致性、事件汇总一致性、Redis 策略、连接权限和超时配置。
-它还会验证已保存凭据能否用当前 `AES_SECRET_KEY` 解密，并检查 Shopify 支付 webhook 收件箱；任何 `FAIL` 都必须在启动前处理。
-自检还会要求项目表和序列由 `DATABASE_URL` 用户拥有，因为只有所有者才能安全执行后续结构迁移；若所有者错误，按提示运行 `sudo bash scripts/repair-db-ownership.sh`。
+这样会让表归 `postgres` 所有，导致后台出现 `500 Database permission denied`。项目结构只通过 `npm run migrate` 创建。
 
-任何 `FAIL` 都应在启动前处理，不要跳过。
+如果数据库曾由 `postgres` 创建也不用删除；第 6 节的宝塔更新脚本会自动修复数据库、schema、表和序列所有权，不清空数据。
 
-## 6. 使用 PM2 启动
+## 5. 创建并填写 `.env`
 
 ```bash
-cd /www/wwwroot/capi-saas
-pm2 startOrReload ecosystem.config.js --update-env
-pm2 save
-pm2 status
-pm2 startup
+cd /www/wwwroot/Facebook-api-main
+cp .env.example .env
 ```
 
-`pm2 startup` 会输出一条需要以 root 执行的命令；执行后再次运行 `pm2 save`。
+在服务器终端生成两个不同的密钥：
 
-进程职责：
+```bash
+openssl rand -hex 32
+openssl rand -hex 32
+```
 
-- `capi-api`：接收事件、验证 Shopify webhook、管理后台、出箱救援和定时维护。
-- `capi-worker`：按店铺与凭证租约投递 Meta CAPI/TikTok Events API。
+第一组填入 `AES_SECRET_KEY`，第二组填入 `INGEST_TOKEN_SECRET`。再生成后台密码：
 
-本机检查：
+```bash
+openssl rand -hex 16
+```
+
+也可以在已经安装 Node.js 的 Windows 本地 CMD 一次生成两组密钥：
+
+```cmd
+node -e "const c=require('crypto');console.log('AES_SECRET_KEY='+c.randomBytes(32).toString('hex'));console.log('INGEST_TOKEN_SECRET='+c.randomBytes(32).toString('hex'))"
+```
+
+实际输出只复制到服务器 `.env` 和自己的密码管理器，不要发送到聊天或提交到 GitHub。
+
+编辑文件：
+
+```bash
+nano /www/wwwroot/Facebook-api-main/.env
+```
+
+至少确认以下内容：
+
+```env
+NODE_ENV=production
+PORT=3000
+
+DATABASE_URL=postgres://capi_saas:这里填写真实数据库密码@127.0.0.1:5432/capi_saas
+REDIS_URL=redis://127.0.0.1:6379
+
+FB_API_VERSION=v25.0
+
+AES_SECRET_KEY=第一组64位随机字符
+INGEST_TOKEN_SECRET=第二组不同的64位随机字符
+INGEST_TOKEN_PREVIOUS_SECRET=
+
+ADMIN_USERNAME=capiadmin
+ADMIN_PASSWORD=至少16位的新随机密码
+REQUIRE_INGEST_TOKEN=true
+
+SHOPIFY_WEB_ORDER_SOURCES=web
+SHOPIFY_APP_SECRET=
+SHOPIFY_API_VERSION=2026-07
+
+CORS_ORIGIN=*
+TRUST_PROXY_HOPS=1
+
+API_INSTANCES=1
+WORKER_INSTANCES=1
+```
+
+规则：
+
+- 示例文字不能原样使用。
+- `AES_SECRET_KEY` 与 `INGEST_TOKEN_SECRET` 必须不同。
+- `.env` 不得提交到 GitHub、发送到聊天或放进截图。
+- 正式保存 Meta/Shopify Token 后不能随意更换 `AES_SECRET_KEY`。
+- 轮换采集密钥时，旧值临时放入 `INGEST_TOKEN_PREVIOUS_SECRET`；所有店铺更新后再清空。
+- 多店铺确实安装同一个 Shopify 应用时，可在 `SHOPIFY_APP_SECRET` 填共享 Client Secret；每店独立应用时保持为空，在项目后台逐店保存。
+- `SHOPIFY_WEB_ORDER_SOURCES=web` 不要随意加入 POS、草稿订单等来源。
+
+设置文件权限，使宝塔运行用户可读取、其他用户不可读取：
+
+```bash
+chown root:www /www/wwwroot/Facebook-api-main/.env
+chmod 640 /www/wwwroot/Facebook-api-main/.env
+```
+
+## 6. 首次准备或以后更新：只运行这一条脚本
+
+先在宝塔 Node 项目页面停止 API，然后执行：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+sudo bash deploy/update_baota.sh
+```
+
+不要在命令前手工添加 Node 或 PostgreSQL 路径。脚本会自动：
+
+1. 找到宝塔安装的最新 Node.js 和 npm。
+2. 执行 `npm ci --omit=dev` 安装锁定的生产依赖。
+3. 执行 JavaScript 语法检查。
+4. 自动找到宝塔或系统 PostgreSQL 的 `psql`。
+5. 幂等修复数据库、`public` schema、现有表和序列所有权。
+6. 执行 `npm run migrate`。
+7. 执行 `npm run doctor`。
+8. 创建或重启唯一的 `capi-worker`。
+9. 执行 `pm2 save` 保存 Worker 开机状态。
+
+成功结尾应为：
+
+```text
+[baota-update] update completed successfully
+[baota-update] restart the API project once in Baota
+```
+
+任何一步失败，先处理屏幕上第一条 `[baota-update:error]` 或 `FAIL`，不要跳过自检启动生产服务。
+
+## 7. 在宝塔创建 Node 项目
+
+宝塔 → 网站/Node 项目 → 添加 Node 项目：
+
+```text
+项目名称：Facebook_api_main
+项目目录：/www/wwwroot/Facebook-api-main
+Node 版本：20 或更高
+运行方式：npm
+启动命令：npm start
+内部端口：3000
+绑定域名：先不依赖宝塔默认 443，后面由 8443 脚本接管
+```
+
+如果面板要求“启动文件”而不是命令，填写：
+
+```text
+src/server.js
+```
+
+不能填写：
+
+```text
+src
+```
+
+否则会报：
+
+```text
+Cannot find module '/www/wwwroot/Facebook-api-main/src'
+```
+
+启动 API 后检查：
 
 ```bash
 curl -fsS http://127.0.0.1:3000/healthz
 curl -fsS http://127.0.0.1:3000/readyz
 ```
 
-`/readyz` 只有在 PostgreSQL 与 Redis 均可用时才返回 HTTP 200。Redis 暂时异常时返回 HTTP 503 和 `status=degraded`，因此宝塔或负载均衡器应把 `/readyz` 用作就绪探针、把始终反映进程存活的 `/healthz` 用作存活探针；已经到达 API 的事件仍会优先持久化到 PostgreSQL，Redis 恢复后自动继续派发。
+`healthz` 表示进程存活；`readyz` 只有 PostgreSQL 和 Redis 都正常时才返回 HTTP 200。
 
-## 7. 配置宝塔 Nginx 和非 443 HTTPS
-
-仓库提供完整模板：[deploy/baota-nginx-non443.conf.template](deploy/baota-nginx-non443.conf.template)。复制到宝塔“网站 → 配置文件”，替换：
-
-- `__DOMAIN__`：例如 `capi.example.com`
-- `__PROJECT_DIR__`：`/www/wwwroot/capi-saas`
-- `__BT_SITE_NAME__`：宝塔站点标识/证书目录名
-- `__PUBLIC_PORT__`：`8443`
-- `__INTERNAL_PORT__`：`3000`
-
-必须确认：
-
-- 配置中没有 `listen 443 ssl` 或 `listen 443 quic`。
-- SSL 证书与私钥路径真实存在，建议用 DNS-01 方式签发。
-- `proxy_pass` 指向 `127.0.0.1:3000`，不要指向公网 IP。
-- `X-Forwarded-Proto` 为 `https`，`X-Forwarded-Port` 为 `8443`。
-- Nginx 已阻止访问 `.env`、`.git`、备份、日志、SQL 和 `node_modules`。
-
-保存前检查并平滑重载：
-
-```bash
-nginx -t
-systemctl reload nginx
-curl -I https://capi.example.com:8443/admin
-```
-
-如果使用 Cloudflare，需确保所选代理模式支持自定义 HTTPS 端口；否则先使用 DNS only 验证源站。
-
-## 8. 后台配置多店铺和多像素
-
-打开：
-
-```text
-https://capi.example.com:8443/admin
-```
-
-推荐顺序：
-
-1. 添加 Shopify 店铺，域名使用 `store.myshopify.com`，保存 webhook secret；建议同时填写具备 `read_orders` 的 Admin API Token 以启用支付对账。店铺采集 Token 由系统独立生成。
-2. 添加 Meta Dataset/Pixel 或 TikTok Pixel 凭证。
-3. 在路由选择中把一个凭证关联到多个店铺，或把一个店铺关联到多个凭证。
-4. 复制该店铺生成的 Shopify Custom Pixel 代码到 `Settings → Customer events`。
-5. 测试阶段设置平台 Test Event Code，验证后再清空。
-
-本地数据库始终按认证后的 `shop_id` 隔离事件、别名、重试和投递账本。多个店铺共用同一个外部 Pixel 时，平台侧数据会按你的配置聚合，但本系统不会把店铺事件路由串到未关联的像素。
-
-## 9. 配置 Shopify 自建应用与付款 webhook
-
-本项目不是上架应用。每个店铺在 Shopify 后台创建并安装自建应用，至少授予 `read_orders`，然后把该应用的 Client Secret 填入项目后台“Webhook Secret”，把 Admin API access token 填入“Admin API Token”。浏览器行为仍由第 8 节粘贴到 `Settings → Customer events` 的自定义像素采集。
-
-每个店铺的自建应用都必须配置：
-
-```text
-主题：orders/paid
-地址：https://capi.example.com:8443/api/webhook/orders/paid
-格式：JSON
-```
-
-后台填写的 Shopify Webhook Secret 必须与签名 webhook 的 App Client Secret 一致。服务端验证 `X-Shopify-Hmac-Sha256`，使用 `X-Shopify-Webhook-Id` 防重复。
-
-浏览器 `checkout_completed` 只创建 `AWAITING_PAYMENT` 候选；只有 HMAC 验证成功的 `orders/paid` 才能解锁 Purchase。这样不会把未付款、延迟付款或失败付款误判为成功购买。
-
-如果同一个自建应用安装在多个店铺，可在 `.env` 设置同一个 `SHOPIFY_APP_SECRET`；若每个店铺分别创建应用，则保持该变量为空并在后台逐店保存各自 Secret。可选隐私 Webhook 地址如下：
-
-```text
-customers/data_request → https://capi.example.com:8443/api/webhook/customers/data_request
-customers/redact       → https://capi.example.com:8443/api/webhook/customers/redact
-shop/redact            → https://capi.example.com:8443/api/webhook/shop/redact
-```
-
-数据访问请求需要在管理后台下载报告、安全交付并确认完成；客户/店铺删除请求由持久化隐私收件箱自动处理。
-
-## 10. 上线验收
-
-按店铺逐一完成：
-
-- `PageView`、`ViewContent`、`AddToCart`、`InitiateCheckout`、`AddPaymentInfo` 可见。
-- 支付前没有 Purchase；付款后只有一个相同 `event_id` 的 Purchase。
-- Purchase 包含正确 `value`、`currency`、`content_ids`、`contents` 和 `order_id`。
-- `_fbp`/`_ttp` 只在真实 Cookie 存在时发送，`_fbc` 只来自真实 `fbclid`。
-- 一个店铺绑定多个像素时，每条路由都有独立成功/失败状态。
-- 多店铺共用像素时，管理后台的事件和投递诊断仍按店铺隔离。
-- `/readyz`、PM2 状态、Worker 日志和后台“投递完整性”均正常。
-- 后台数据库总量、事件账本、Webhook 收件箱占用符合磁盘容量预算；为 PostgreSQL 数据目录配置磁盘告警。
-
-## 11. 安全升级、备份和回滚
-
-每次客户事件代码版本升级并通过健康检查后，都要进入管理后台重新复制当前生成的 Shopify Customer Events 代码到所有店铺。`shopify-pixel-v14` 的店铺级事件/订单 ID、离线队列、Meta SDK 有界重试、浏览器队列上限以及 Pixel/CAPI 双通道逻辑位于店铺端，服务器更新不会自动替换 Shopify 中已粘贴的旧代码。v14 每 60 秒同步当前活动 Meta 路由，因此日常新增、停用或重新分配 Pixel 不需要仅为路由列表重贴代码。连接前请停用相同 Dataset 的主题 Meta 代码、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，避免无法去重的第三条事件源。
-
-升级前：
-
-```bash
-cd /www/wwwroot/capi-saas
-npm run backup
-git status --short
-git pull --ff-only origin main
-npm ci --omit=dev
-npm run check
-npm test
-npm run migrate
-npm run doctor
-pm2 startOrReload ecosystem.config.js --update-env
-pm2 save
-```
-
-不要覆盖已有 `.env`。备份目录默认为 `/www/wwwroot/capi-saas/backups`，其中的 `.env` 副本含解密密钥，权限必须保持 `600/700`，并应复制到受保护的异机存储。默认保留 30 天，可通过 `BACKUP_RETENTION_DAYS` 调整；设为 `0` 表示不自动清理。
-
-数据库回滚：
-
-```bash
-cd /www/wwwroot/capi-saas
-CONFIRM=RESTORE bash scripts/restore.sh backups/capi-db-YYYYMMDDTHHMMSSZ.dump
-```
-
-恢复脚本会创建 `.maintenance`、停止可见的 PM2 API/Worker，并在单一数据库事务内恢复；迁移和自检通过后才重新加载进程。任何步骤失败时会保留维护态且不会启动可能不兼容的运行时；不要绕过该流程单独执行 `pg_restore --clean`。
-
-## 12. 故障排查
+检查 Worker：
 
 ```bash
 pm2 status
-pm2 logs capi-api --lines 200 --nostream
-pm2 logs capi-worker --lines 200 --nostream
-npm run doctor
-redis-cli INFO memory
-redis-cli INFO clients
-sudo -u postgres psql -d capi_saas -c 'select now();'
-tail -n 200 /www/wwwlogs/你的站点.error.log
+pm2 logs capi-worker --lines 50 --nostream
 ```
 
-- 后台打不开：先检查 Nginx `nginx -t`、安全组端口、证书和 `capi-api`。
-- 事件已接收但未发送：检查 `capi-worker`、Redis、平台凭证冷却和后台最旧到期事件。
-- Purchase 不出现：检查 `orders/paid` webhook 响应、HMAC secret、订单来源白名单及付款状态。
-- 部分像素失败：只修复对应路由凭证；成功路由不会被重发。
-- 数据增长：检查保留周期、autovacuum、数据库空间和 Worker 消费速率，不要直接删除 `PENDING` 数据。
+API 由宝塔管理，Worker 由 PM2 管理。不要再运行：
+
+```bash
+pm2 startOrReload ecosystem.config.js
+```
+
+否则它会额外启动一个 `capi-api`，与宝塔 API 争用 3000 端口。
+
+## 8. 首次自动配置 8443 HTTPS
+
+先在宝塔创建站点并为当前域名成功签发 SSL 证书。确认文件存在：
+
+```bash
+ls -l /www/server/panel/vhost/cert/Facebook_api_main/fullchain.pem
+ls -l /www/server/panel/vhost/cert/Facebook_api_main/privkey.pem
+```
+
+然后只执行一次：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+sudo env \
+  DOMAIN=pixel.atelierwrap.cc \
+  BT_SITE_NAME=Facebook_api_main \
+  PROJECT_DIR=/www/wwwroot/Facebook-api-main \
+  PUBLIC_PORT=8443 \
+  INTERNAL_PORT=3000 \
+  INSTALL_WATCHER=1 \
+  bash deploy/configure_baota_nginx.sh
+```
+
+这一次需要明确域名，因为 Nginx 必须知道证书对应的主机名。参数会保存到 systemd 服务，普通部署和重启不需要再次输入。
+
+脚本会：
+
+- 备份原 vhost 到 `/www/backup/capi-nginx-vhosts`。
+- 生成 `80 → https://域名:8443` 跳转。
+- 生成 `8443 SSL → 127.0.0.1:3000` 反向代理。
+- 禁止访问 `.env`、`.git`、日志、SQL、备份和 `node_modules`。
+- 执行 `nginx -t`，失败则自动恢复旧配置。
+- 成功后平滑重载 Nginx。
+- 安装 systemd 文件监视器；宝塔重写 vhost 后自动恢复 8443。
+
+检查监视器：
+
+```bash
+systemctl status capi-baota-nginx-facebook-api-main.path
+```
+
+检查 Nginx：
+
+```bash
+nginx -t || /www/server/nginx/sbin/nginx -t
+curl -I https://pixel.atelierwrap.cc:8443/healthz
+```
+
+云服务器安全组和本机防火墙必须开放 TCP 8443：
+
+```bash
+ufw allow 8443/tcp
+```
+
+不要开放公网 3000。
+
+### 更换域名
+
+1. 修改 DNS。
+2. 在宝塔为新域名重新签发证书。
+3. 使用新 `DOMAIN` 再执行一次上面的配置脚本。
+4. 更新 Shopify Webhook 地址。
+5. 从新域名后台重新复制各店铺 Customer Events 代码。
+
+如果宝塔站点标识仍为 `Facebook_api_main`，脚本会更新原监视器。如果重新创建站点并改变了标识，先停用旧监视器：
+
+```bash
+systemctl disable --now capi-baota-nginx-facebook-api-main.path
+```
+
+## 9. Shopify 自建应用配置
+
+本项目是独立服务器端，不是应用商店上架应用。对每个店铺：
+
+1. 创建并安装你有权管理的 Shopify 自建应用。
+2. 至少授予 `read_orders`。
+3. 把 Client Secret 填入项目后台该店铺的 Webhook Secret。
+4. 把 Admin API access token 填入项目后台该店铺的 Admin API Token。
+5. 配置 `orders/paid` webhook：
+
+```text
+主题：orders/paid
+格式：JSON
+地址：https://pixel.atelierwrap.cc:8443/api/webhook/orders/paid
+```
+
+可选隐私 webhook：
+
+```text
+https://pixel.atelierwrap.cc:8443/api/webhook/customers/data_request
+https://pixel.atelierwrap.cc:8443/api/webhook/customers/redact
+https://pixel.atelierwrap.cc:8443/api/webhook/shop/redact
+```
+
+浏览器端：
+
+1. 打开 `https://pixel.atelierwrap.cc:8443/admin`。
+2. 添加 Shopify 店铺。
+3. 添加一个或多个 Meta/TikTok 凭证。
+4. 建立店铺与像素路由；支持多店铺共用一个像素，也支持一个店铺投递到多个像素。
+5. 复制该店铺生成的 Shopify Custom Pixel 代码。
+6. 粘贴到 Shopify `Settings → Customer events` 并连接。
+
+同一个 Meta Dataset 不要同时再启用主题 Meta Pixel、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，否则第三方事件无法保证复用同一 eventID，会造成重复。
+
+## 10. 日常操作：只记住三种情况
+
+### A. 普通重启服务器或 Node
+
+只需在宝塔重启 Node 项目。数据库修复、依赖安装和迁移不会自动执行，也不需要执行。Worker 在正确完成 `pm2 save` 与 PM2 开机设置后自动恢复。
+
+### B. 更新正式 main 代码
+
+先在宝塔停止 API，然后：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+git pull --ff-only origin main
+sudo bash deploy/update_baota.sh
+```
+
+脚本成功后在宝塔启动 API。8443 监视器不需要重新安装。
+
+### C. 更换域名
+
+重新签发证书，再用新 `DOMAIN` 执行一次 `configure_baota_nginx.sh`，然后更新 Shopify Webhook 和 Customer Events 代码。
+
+## 11. 上线验收
+
+```bash
+curl -fsS http://127.0.0.1:3000/healthz
+curl -fsS http://127.0.0.1:3000/readyz
+curl -I https://pixel.atelierwrap.cc:8443/admin
+pm2 status
+```
+
+然后逐店在测试事件中检查：
+
+- PageView
+- ViewContent
+- AddToCart
+- InitiateCheckout
+- AddPaymentInfo
+- 付款成功后的唯一 Purchase
+
+测试完成后清空每个店铺路由上的 Meta Test Event Code。
+
+## 12. 常见错误对照
+
+### `Cannot find module 'dotenv'`
+
+原因：没有安装生产依赖。停止 API 后执行：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+sudo bash deploy/update_baota.sh
+```
+
+### `ERROR: node is required`
+
+原因：服务器仍是旧脚本。先拉取最新正式代码：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+git pull --ff-only origin main
+sudo bash deploy/update_baota.sh
+```
+
+最新版会自动寻找 `/www/server/nodejs/*/bin/node`。
+
+### `runuser: failed to execute psql`
+
+同样说明仍是旧脚本。最新版会自动寻找 `/www/server/**/bin/psql` 和 `/usr/lib/postgresql/*/bin/psql`，不需要 `/tmp` 临时脚本。
+
+### `500 Database permission denied`
+
+执行统一更新脚本；它会自动调用 `scripts/repair-db-ownership.sh`：
+
+```bash
+sudo bash /www/wwwroot/Facebook-api-main/deploy/update_baota.sh
+```
+
+### `Cannot find module .../src`
+
+宝塔启动文件错误。改成 `src/server.js` 或启动命令 `npm start`。
+
+### 公网 502
+
+先检查内部 API：
+
+```bash
+curl -v http://127.0.0.1:3000/healthz
+```
+
+内部失败就查看宝塔 Node 日志；内部成功再看：
+
+```bash
+tail -n 100 /www/wwwlogs/Facebook_api_main.error.log
+```
+
+### 8443 连接被拒绝
+
+检查：
+
+```bash
+systemctl status capi-baota-nginx-facebook-api-main.path
+ss -lntp | grep ':8443'
+ufw status
+```
+
+同时检查云厂商安全组 TCP 8443。
+
+## 13. 停用自动 8443 管理
+
+只有你确定要重新交给宝塔管理端口时才执行：
+
+```bash
+systemctl disable --now capi-baota-nginx-facebook-api-main.path
+```
+
+停用监视器不会删除当前 Nginx 配置，也不会删除备份。
