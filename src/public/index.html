@@ -816,9 +816,9 @@ async function refreshMetaRouteConfig() {
     try {
         var cachedText = await getStorageValue(META_ROUTE_CONFIG_STORAGE_KEY);
         var cached = cachedText ? JSON.parse(cachedText) : null;
-        if (cached && cached.shop_domain === SHOP_DOMAIN
-            && Number(cached.expires_at || 0) > Date.now()
-            && Array.isArray(cached.pixel_ids)) {
+        var cacheBelongsToShop = cached && cached.shop_domain === SHOP_DOMAIN;
+        var cacheIsFresh = cached && Number(cached.expires_at || 0) > Date.now();
+        if (cacheBelongsToShop && cacheIsFresh && Array.isArray(cached.pixel_ids)) {
             applyMetaRoutePixelIds(cached.pixel_ids);
         }
     } catch (error) {}
@@ -973,8 +973,8 @@ function normalizeForHash(value, type, contextCountry) {
         normalized = rawPhone.replace(/[^0-9]/g, '').replace(/^0+/, '');
         var phoneCountry = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
         if (!hasInternationalPrefix) {
-            if (phoneCountry === 'us' || phoneCountry === 'usa' || phoneCountry === 'unitedstates'
-                || phoneCountry === 'unitedstatesofamerica' || phoneCountry === 'ca' || phoneCountry === 'canada') {
+            var northAmericanCountries = ['us', 'usa', 'unitedstates', 'unitedstatesofamerica', 'ca', 'canada'];
+            if (northAmericanCountries.indexOf(phoneCountry) !== -1) {
                 if (/^\\d{10}$/.test(normalized)) normalized = '1' + normalized;
                 else if (!/^1\\d{10}$/.test(normalized)) normalized = '';
             } else {
@@ -990,8 +990,8 @@ function normalizeForHash(value, type, contextCountry) {
         normalized = normalized.replace(/[^\\p{L}\\p{N}]/gu, '');
         if (type === 'state') {
             var stateCountry = String(contextCountry || '').trim().toLowerCase().replace(/[^a-z]/g, '');
-            if ((stateCountry === 'us' || stateCountry === 'usa' || stateCountry === 'unitedstates' || stateCountry === 'unitedstatesofamerica')
-                && !/^[a-z]{2}$/.test(normalized)) normalized = '';
+            var isUnitedStates = ['us', 'usa', 'unitedstates', 'unitedstatesofamerica'].indexOf(stateCountry) !== -1;
+            if (isUnitedStates && !/^[a-z]{2}$/.test(normalized)) normalized = '';
         }
     } else if (type === 'zip') {
         normalized = normalized.replace(/[^a-z0-9]/g, '');
@@ -1356,8 +1356,7 @@ function requeueFailedEvents(events, retryAfterMs) {
     var now = Date.now();
     var retryable = events.filter(function (event) {
         var firstQueuedAt = Number(event._client_first_queued_at || now);
-        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES
-            && now - firstQueuedAt < CLIENT_RETRY_MAX_AGE_MS;
+        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES && now - firstQueuedAt < CLIENT_RETRY_MAX_AGE_MS;
     }).map(function (event) {
         var nextRetryCount = Number(event._client_retry_count || 0) + 1;
         var baseDelay = RETRY_BACKOFF_MS[Math.min(nextRetryCount - 1, RETRY_BACKOFF_MS.length - 1)] || EVENT_QUEUE_FLUSH_MS;
