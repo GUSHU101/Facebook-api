@@ -645,7 +645,7 @@
                                 <td class="font-semibold">{{ log.emq_estimate || '—' }}/10</td>
                                 <td class="font-mono text-slate-500">{{ summarizeQuality(log.quality) }}</td>
                                 <td class="font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
-                                <td class="font-mono text-slate-500">{{ summarizeResponse(log.fb_response) }}</td>
+                                <td class="font-mono text-slate-500 whitespace-normal break-words max-w-md" :title="summarizeResponse(log.route_deliveries, log.fb_response)">{{ summarizeResponse(log.route_deliveries, log.fb_response) }}</td>
                             </tr>
                             <tr v-if="!logs.length"><td colspan="9" class="table-empty">当前筛选范围内暂无事件记录。</td></tr>
                         </tbody>
@@ -2541,20 +2541,31 @@ analytics.subscribe('search_submitted', function (event) {
                         PARTIAL_FAILED: 'text-orange-600',
                     }[status] || 'text-slate-700';
                 },
-                summarizeResponse(value) {
-                    if (!value) return '等待处理';
-                    const deliveries = value.deliveries || [];
+                summarizeResponse(routeDeliveries, legacyResponse) {
+                    const deliveries = Array.isArray(routeDeliveries) && routeDeliveries.length
+                        ? routeDeliveries
+                        : (legacyResponse?.deliveries || []);
+                    if (!deliveries.length && !legacyResponse) return '等待处理';
                     if (deliveries.length) return deliveries.map(item => {
-                        const response = item.response || {};
-                        const acknowledged = response.accepted_event === true
+                        const response = item.platform_response || item.response || {};
+                        const acknowledged = item.accepted_event === true
+                            || response.accepted_event === true
                             || Number(response.accepted_event_count || 0) === 1
                             || Number(response.events_received || 0) > 0;
-                        const trace = response.fbtrace_id ? ` · ${response.fbtrace_id}` : '';
-                        const messageCount = Array.isArray(response.meta_messages) ? response.meta_messages.length : 0;
+                        const traceId = item.fbtrace_id || response.fbtrace_id;
+                        const trace = traceId ? ` · trace ${traceId}` : '';
+                        const responseMessages = response.meta_messages || response.messages;
+                        const messageCount = Array.isArray(responseMessages) ? responseMessages.length : 0;
                         const messages = messageCount ? ` · Meta消息 ${messageCount}` : '';
-                        return `${item.pixel_id}:${item.status}${acknowledged ? ' · API收件已确认（非最终计入）' : ''}${messages}${trace}`;
+                        const errorCode = item.error_code ?? item.code;
+                        const errorMessage = String(item.error_message || item.message || '').replace(/\s+/g, ' ').trim();
+                        const error = errorCode !== undefined && errorCode !== null
+                            ? ` · 错误 ${errorCode}${errorMessage ? `: ${errorMessage.slice(0, 500)}` : ''}`
+                            : (errorMessage ? ` · ${errorMessage.slice(0, 500)}` : '');
+                        const platform = item.platform ? `${item.platform}/` : '';
+                        return `${platform}${item.pixel_id}:${item.status}${acknowledged ? ' · API收件已确认（非最终计入）' : ''}${error}${messages}${trace}`;
                     }).join(', ');
-                    return value.fbtrace_id || JSON.stringify(value).slice(0, 120);
+                    return legacyResponse.fbtrace_id || JSON.stringify(legacyResponse).slice(0, 500);
                 },
                 summarizeQuality(value) {
                     const missingMatch = (value?.missing_match_signals || []).map(item => `匹配:${item}`);

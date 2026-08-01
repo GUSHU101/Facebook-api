@@ -38,7 +38,11 @@ const {
 const { mergePersistedEventPayload } = require('../src/events/merge');
 const { FUNNEL_EVENT_NAMES, decorateFunnelSummary } = require('../src/events/funnel');
 const { eventHasSuccessfulDelivery, shouldSkipPixel, successfulDeliveryKeys } = require('../src/platforms/delivery');
-const { aggregateDeliveryStatus, retryDelaySeconds } = require('../src/platforms/delivery-state');
+const {
+    aggregateDeliveryStatus,
+    retryDelaySeconds,
+    summarizePermanentRouteFailures,
+} = require('../src/platforms/delivery-state');
 const {
     isolateMetaBatch,
     normalizeMetaCookie,
@@ -801,6 +805,30 @@ test('delivery status remains pending until every configured route is terminal',
     assert.equal(aggregateDeliveryStatus(['SUCCESS', 'SUCCESS']), 'SUCCESS');
     assert.equal(aggregateDeliveryStatus(['SUCCESS', 'FAILED_PERMANENT']), 'PARTIAL_FAILED');
     assert.equal(aggregateDeliveryStatus(['FAILED_PERMANENT', 'FAILED_PERMANENT']), 'FAILED');
+});
+
+test('permanent route failure summaries preserve the actionable Meta error and collapse duplicates', () => {
+    const summary = summarizePermanentRouteFailures([
+        {
+            route_id: 1,
+            platform: 'facebook',
+            pixel_id: '1234567890',
+            code: 190,
+            message: 'Invalid OAuth access token.',
+        },
+        {
+            route_id: 1,
+            platform: 'facebook',
+            pixel_id: '1234567890',
+            code: 190,
+            message: 'Invalid OAuth access token.',
+        },
+    ]);
+
+    assert.equal(
+        summary,
+        'Permanent route failures: route=1 facebook pixel=1234567890 code=190 count=2: Invalid OAuth access token.',
+    );
 });
 
 test('route retry backoff is exponential and capped', () => {
@@ -2408,6 +2436,7 @@ test('admin page script parses and handles admin action failures', async () => {
     assert.match(serverSource, /app\.get\('\/admin\/assets\/vue\.global\.prod\.js'/);
     assert.match(serverSource, /server\.requestTimeout = config\.httpRequestTimeoutMs/);
     assert.match(serverSource, /server\.closeIdleConnections\?\.\(\)/);
+    assert.match(serverSource, /INVALID_META_DATASET_ID/);
     assert.match(fs.readFileSync(path.join(__dirname, '..', 'ecosystem.config.js'), 'utf8'), /SHUTDOWN_TIMEOUT_MS/);
     const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match => match[1]);
     const adminScript = scripts.find(script => script.includes('createApp'));
@@ -2456,6 +2485,16 @@ test('admin page script parses and handles admin action failures', async () => {
     assert.equal(context.busy.savePixel, false);
     assert.equal(appOptions.methods.formatPercent(82.345), '82.3%');
     assert.equal(appOptions.methods.formatPercent(null), '-');
+    assert.equal(
+        appOptions.methods.summarizeResponse([{
+            platform: 'facebook',
+            pixel_id: '1234567890',
+            status: 'FAILED_PERMANENT',
+            error_code: '190',
+            error_message: 'Invalid OAuth access token.',
+        }]),
+        'facebook/1234567890:FAILED_PERMANENT · 错误 190: Invalid OAuth access token.',
+    );
     const defaultSignalKeys = JSON.parse(JSON.stringify(appOptions.computed.emqSignals.call({ summary: {} }).map(item => item.key)));
     assert.deepEqual(defaultSignalKeys, [
         'email',
