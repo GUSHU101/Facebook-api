@@ -221,7 +221,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         const pageViewLedger = await waitForCondition(async () => {
             const { rows } = await pool.query(
                 `SELECT event.status, event.request_payload, delivery.status AS delivery_status,
-                        delivery.response_payload
+                        delivery.platform_response
                  FROM event_store event
                  JOIN event_deliveries delivery ON delivery.event_store_id = event.id
                  WHERE event.shop_id = $1 AND event.event_name = 'PageView' AND event.event_id = $2`,
@@ -230,7 +230,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
             return rows[0]?.status === 'SUCCESS' ? rows[0] : null;
         }, 'PageView SUCCESS ledger');
         assert.equal(pageViewLedger.delivery_status, 'SUCCESS');
-        assert.equal(pageViewLedger.response_payload.accepted_event, true);
+        assert.equal(pageViewLedger.platform_response.accepted_event, true);
         assert.doesNotMatch(pageViewLedger.request_payload.event_source_url, /email=/i);
 
         const checkoutToken = `checkout-${suffix}`;
@@ -286,7 +286,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         const purchaseLedger = await waitForCondition(async () => {
             const { rows } = await pool.query(
                 `SELECT event.status, event.request_payload, delivery.status AS delivery_status,
-                        delivery.response_payload
+                        delivery.platform_response
                  FROM event_store event
                  JOIN event_deliveries delivery ON delivery.event_store_id = event.id
                  WHERE event.shop_id = $1 AND event.event_name = 'Purchase' AND event.event_id = $2`,
@@ -296,7 +296,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         }, 'paid Purchase SUCCESS ledger', 30_000);
         assert.equal(purchaseLedger.delivery_status, 'SUCCESS');
         assert.equal(purchaseLedger.request_payload._payment_confirmed, true);
-        assert.equal(purchaseLedger.response_payload.accepted_event, true);
+        assert.equal(purchaseLedger.platform_response.accepted_event, true);
 
         const deliveredEvents = metaRequests.flatMap(request => request.body.data || []);
         assert.equal(deliveredEvents.filter(event => event.event_name === 'PageView').length, 1);
