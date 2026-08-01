@@ -1,4 +1,4 @@
-# 官方文档对照与 v17 升级记录
+# 官方文档对照与 v18 升级记录
 
 核对日期：2026-08-01
 
@@ -7,6 +7,12 @@
 - [Meta Node.js Business SDK](https://github.com/facebook/facebook-nodejs-business-sdk)
 - [Meta Conversions API Direct Integration Playbook](https://storage.googleapis.com/lr-tech-docs-resources/PDFs/Conversions-API-Direct-Integration-Playbook_English.pdf)
 - [Meta Pixel / Dataset 官方说明](https://www.facebook.com/help/messenger-app/952192354843755)
+- [Meta CAPI Server Event 参数](https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/server-event)
+- [Meta CAPI Customer Information 参数](https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/customer-information-parameters)
+- [Meta Pixel 与 CAPI 去重](https://developers.facebook.com/documentation/ads-commerce/conversions-api/deduplicate-pixel-and-server-events)
+- [Meta CAPI 最佳实践](https://developers.facebook.com/documentation/ads-commerce/conversions-api/best-practices)
+- [Meta Pixel 高级匹配](https://developers.facebook.com/docs/facebook-pixel/advanced/advanced-matching)
+- [Meta Dataset Quality API](https://developers.facebook.com/documentation/ads-commerce/conversions-api/dataset-quality-api)
 - [Shopify API 版本机制](https://shopify.dev/docs/api/usage/versioning)
 - [Shopify Web Pixels API](https://shopify.dev/docs/api/web-pixels-api)
 - [Shopify Web Pixels 标准事件](https://shopify.dev/docs/api/web-pixels-api/standard-events)
@@ -34,7 +40,7 @@
 6. `checkout_completed` 不是绝对可靠的付款凭据：官方说明目标页面未加载时事件可能完全不触发。因此 Purchase 继续以验签后的 `orders/paid` Webhook 为付款权威，并用 Admin GraphQL 定期补偿。
 7. 保存 Shopify Webhook 的 `X-Shopify-API-Version`，后台展示近 7 天实际版本；`npm run doctor` 会对版本不一致失败告警。
 8. Meta 官方质量响应没有事件级指标时标记 `EMPTY`，不伪装为成功或编造 EMQ。
-9. 删除 Meta 官方 `ServerEvent` 未定义的根字段 `customer_segmentation`；Shopify 新客/老客状态只保存在本系统私有 `_source.customer_lifecycle`，不会进入实际 CAPI 请求。
+9. 不发送 Meta `ServerEvent` 未定义的根字段 `customer_segmentation`；按 2026-02 更新的官方示例，将 Shopify 新客/老客状态映射为 `custom_data.customer_segmentation` 的 `new_customer_to_business` / `existing_customer_to_business`。
 10. Admin GraphQL 补偿的在线订单仍使用 `action_source=website`；补偿 Purchase 的事件时间优先取最后一笔成功 `SALE/CAPTURE` 交易的 `processedAt`，而不是把订单创建/处理时间误当付款时间。
 11. 浏览器批量采集中被 4xx 拒绝的单条事件会进入脱敏死信诊断，避免有效事件继续处理后，被拒绝事件在后台无痕消失；诊断不保存采集 Token 或原始邮箱/电话。
 12. 商品匹配只使用 Shopify Variant/Product/SKU 这类持久商品身份；临时的 CartLine、CheckoutLineItem 和 Order LineItem ID 不再冒充 Meta Catalog 商品 ID，缺少真实商品身份时宁可省略并在参数诊断中显示缺失。
@@ -60,6 +66,13 @@
 24. 官方文档说明：在 Admin API 中创建的店铺级 Webhook 订阅可能在持续失败后被 Shopify 删除；自建应用也必须通过 Admin GraphQL 管理订阅。系统新增 `ORDERS_PAID` 订阅只读定时审计，识别缺失、旧 URI 和查询错误。
 25. 后台“修复 Webhook”先查询现状，只在正确的 `${PUBLIC_BASE_URL}/api/webhook/orders/paid` 缺失时调用 `webhookSubscriptionCreate`。系统不会自动删除其他地址，避免破坏并行系统；数据库稳定 Purchase ID 仍会吸收重复订阅产生的重复付款通知。
 
+### v18 官方接口契约升级
+
+26. Dataset Quality API 改用 v26 官方 `dataset_id + fields=web{...}` 请求，不再发送旧 `web_metric_type`；解析官方 `event_match_quality.composite_score`，并保存匹配键反馈、事件覆盖率、去重反馈、数据新鲜度和 ACR。
+27. 可选 `META_PARTNER_AGENT` 只在已经与 Meta 确认标识时作为请求根字段发送；`META_QUALITY_AGENT_NAME` 用于 Dataset Quality 的 `agent_name` 筛选。留空时均不发送，避免伪造平台归因。
+28. Shopify Pixel v18 在首次具备客户上下文的事件上，用 `fbq('init', pixelId, userData)` 提供官方高级匹配字段。浏览器 Pixel 负责哈希；CAPI 使用同一规范化输入的 SHA-256，且 `external_id` 在两端都加入店铺域名命名空间。
+29. 浏览器和服务端同时限制事件专属参数：`num_items` 只用于 `InitiateCheckout`，`search_string` 只用于 `Search`；新客/老客只进入 `custom_data.customer_segmentation`。
+
 - 多店共享一个 Meta Dataset 时，Meta 端的质量、受众、归因和学习结果必然是合并视图；本项目后台的店铺自然日漏斗用于逐店对账。
-- 每个 Shopify 店铺必须粘贴为该店铺生成的 v17 代码，不能跨店复制采集 Token。
+- 每个 Shopify 店铺必须粘贴为该店铺生成的 v18 代码，不能跨店复制采集 Token。
 - 同一 Dataset 不应同时启用另一套主题 Pixel、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，除非它能复用完全相同的事件名与事件 ID。

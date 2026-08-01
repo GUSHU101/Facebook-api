@@ -645,6 +645,7 @@ async function postFacebookBatch(pixel, token, dbEvents) {
         prepareMetaEvent(stripPrivateFields({ ...event.request_payload }))
     ));
     const requestBody = { data: finalEvents };
+    if (config.metaPartnerAgent) requestBody.partner_agent = config.metaPartnerAgent;
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
 
     const url = `${config.facebookGraphBaseUrl}/${config.fbApiVersion}/${pixel.pixel_id}/events`;

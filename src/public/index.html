@@ -152,7 +152,7 @@
                                     <div class="mt-1 text-xs text-slate-500">{{ s.paid_webhook_last_checked_at ? formatTime(s.paid_webhook_last_checked_at) : '等待审计' }}</div>
                                 </td>
                                 <td>
-                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v17' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
+                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v18' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
                                     <div class="mt-1 text-xs text-slate-500">客户端自报：{{ s.pixel_last_seen_at ? formatTime(s.pixel_last_seen_at) : '新版首个事件进入后显示' }} · 自报丢失诊断 {{ s.pixel_diagnostic_count || 0 }}</div>
                                 </td>
                                 <td>{{ formatTime(s.created_at) }}</td>
@@ -692,7 +692,7 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v17";
+const SOURCE_VERSION = "shopify-pixel-v18";
 const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
 const META_STANDARD_BROWSER_EVENTS = new Set([
     'PageView', 'ViewContent', 'Search', 'AddToCart',
@@ -743,6 +743,7 @@ var storageFailureSignalActive = false;
 const recordedStorageFailureCodes = new Set();
 const activeGatewayControllers = new Set();
 const initializedMetaBrowserPixelIds = new Set();
+var lastMetaAdvancedMatching;
 var metaBrowserSdkLoading = false;
 var metaBrowserSdkLoadAttempts = 0;
 var metaBrowserSdkRetryAt = 0;
@@ -835,7 +836,7 @@ function injectMetaBrowserPixelScript() {
     }
 }
 
-function bootstrapMetaBrowserPixel() {
+function bootstrapMetaBrowserPixel(advancedMatching) {
     var pixelIds = normalizedMetaPixelIds();
     if (!trackingAllowedByPrivacy() || !pixelIds.length || typeof window === 'undefined' || typeof document === 'undefined') return false;
 
@@ -855,9 +856,14 @@ function bootstrapMetaBrowserPixel() {
 
         if (!window.fbq.callMethod) injectMetaBrowserPixelScript();
 
+        if (advancedMatching !== undefined) lastMetaAdvancedMatching = advancedMatching || {};
         pixelIds.forEach(function (pixelId) {
             if (initializedMetaBrowserPixelIds.has(pixelId)) return;
-            window.fbq('init', pixelId);
+            // Wait for the first event's customer context before init. Meta's
+            // advanced matching contract accepts raw normalized values here;
+            // the browser Pixel hashes them before transmission.
+            if (lastMetaAdvancedMatching === undefined) return;
+            window.fbq('init', pixelId, lastMetaAdvancedMatching);
             initializedMetaBrowserPixelIds.add(pixelId);
         });
         trimMetaBrowserQueue();
@@ -868,9 +874,9 @@ function bootstrapMetaBrowserPixel() {
     }
 }
 
-function metaBrowserCustomData(customData) {
+function metaBrowserCustomData(customData, eventName) {
     customData = customData || {};
-    return compact({
+    var output = compact({
         value: customData.value,
         currency: customData.currency,
         content_ids: customData.content_ids,
@@ -881,13 +887,17 @@ function metaBrowserCustomData(customData) {
         content_name: customData.content_name,
         content_category: customData.content_category,
         order_id: customData.order_id,
+        customer_segmentation: customData.customer_segmentation,
     });
+    if (eventName !== 'InitiateCheckout') delete output.num_items;
+    if (eventName !== 'Search') delete output.search_string;
+    return output;
 }
 
-function sendMetaBrowserEvent(eventName, eventId, customData) {
-    if (!eventId || !bootstrapMetaBrowserPixel()) return false;
+function sendMetaBrowserEvent(eventName, eventId, customData, advancedMatching) {
+    if (!eventId || !bootstrapMetaBrowserPixel(advancedMatching)) return false;
     var command = META_STANDARD_BROWSER_EVENTS.has(eventName) ? 'trackSingle' : 'trackSingleCustom';
-    var parameters = metaBrowserCustomData(customData);
+    var parameters = metaBrowserCustomData(customData, eventName);
     var options = { eventID: String(eventId) };
     normalizedMetaPixelIds().forEach(function (pixelId) {
         try {
@@ -1505,6 +1515,30 @@ function primaryExternalId(event, customer, checkout, checkoutToken) {
     );
 }
 
+function metaCustomerSegmentation(customerLifecycle) {
+    if (customerLifecycle === 'new_customer') return 'new_customer_to_business';
+    if (customerLifecycle === 'existing_customer') return 'existing_customer_to_business';
+    return undefined;
+}
+
+async function metaBrowserAdvancedMatching(customer, address, checkout, event, externalId) {
+    customer = customer || {};
+    address = address || {};
+    checkout = checkout || {};
+    var country = address.countryCode || address.country;
+    return compact({
+        em: normalizeForHash(customer.email || checkout.email, 'email'),
+        ph: normalizeForHash(customer.phone || checkout.phone || address.phone, 'phone', country),
+        fn: normalizeForHash(customer.firstName || address.firstName, 'name'),
+        ln: normalizeForHash(customer.lastName || address.lastName, 'name'),
+        ct: normalizeForHash(address.city, 'city'),
+        st: normalizeForHash(address.provinceCode || address.province, 'state', country),
+        zp: normalizeForHash(address.zip, 'zip', country),
+        country: normalizeForHash(country, 'country'),
+        external_id: await shopScopedIdentifier(externalId || event && event.clientId),
+    });
+}
+
 function getInitContext() {
     try {
         if (typeof init !== 'undefined' && init && init.context) return init.context;
@@ -1950,12 +1984,6 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     await waitForMetaRouteConfig();
     if (!trackingAllowedByPrivacy()) return;
     var scopedOrderId = await shopScopedIdentifier(firstNonEmpty(customData.order_id, orderId));
-    var browserCustomData = {
-        ...customData,
-        order_id: scopedOrderId,
-    };
-    sendMetaBrowserEvent(metaEventName, eventId, browserCustomData);
-
     var fbp = await getFbp();
     var fbc = await getOrCreateFbc(currentUrl);
     var ttp = await getTtp();
@@ -1979,6 +2007,13 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     } else if (isFirstOrder === false) {
         customerLifecycle = 'existing_customer';
     }
+    var browserCustomData = {
+        ...customData,
+        order_id: scopedOrderId,
+        customer_segmentation: metaCustomerSegmentation(customerLifecycle),
+    };
+    var browserMatching = await metaBrowserAdvancedMatching(customer, address, checkout, event, externalId);
+    sendMetaBrowserEvent(metaEventName, eventId, browserCustomData, browserMatching);
     var hashedFields = await Promise.all([
         sha256Hex(rawEmail, 'email'),
         sha256Hex(rawPhone, 'phone', rawCountry),

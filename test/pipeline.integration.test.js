@@ -122,6 +122,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         SHOP_CONTINUATION_DELAY_MS: '25',
         DELIVERY_RETRY_BASE_SECONDS: '1',
         QUEUE_BACKOFF_MS: '100',
+        META_PARTNER_AGENT: 'capi_saas_hub_test',
     };
     const cwd = require('node:path').join(__dirname, '..');
     const server = spawn(process.execPath, ['src/server.js'], {
@@ -209,7 +210,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         const commonEvent = {
             shop_domain: shopDomain,
             schema_version: '2.0',
-            source_version: 'shopify-pixel-v17',
+            source_version: 'shopify-pixel-v18',
             source_provider: 'shopify_web_pixels',
             timestamp: new Date().toISOString(),
             url: `https://${shopDomain}/products/integration?utm_source=e2e&email=remove@example.com`,
@@ -441,6 +442,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         assert.ok(metaRequests.every(request => request.authorization === `Bearer ${metaToken}`));
         assert.ok(metaRequests.every(request => request.url === `/v26.0/${metaPixelId}/events`));
         assert.ok(metaRequests.every(request => request.body.test_event_code === 'TEST-E2E'));
+        assert.ok(metaRequests.every(request => request.body.partner_agent === 'capi_saas_hub_test'));
     } catch (error) {
         let ledgerDiagnostics = [];
         if (shopId) {
