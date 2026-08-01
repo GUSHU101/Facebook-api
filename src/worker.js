@@ -10,6 +10,7 @@ const pool = require('./utils/db');
 const redis = require('./utils/redis');
 const workerRedis = redis.createBullMqWorkerConnection();
 const { credentialFingerprint, decryptTokenIfPossible } = require('./utils/crypto');
+const { enqueueReschedulableJob } = require('./utils/queue');
 const { stripPrivateFields } = require('./events/common');
 const { isolateMetaBatch, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const {
@@ -485,7 +486,8 @@ async function scheduleShopContinuation(shopId) {
 async function scheduleRouteRetry(shopId, retryAfterSeconds) {
     const delayMs = Math.max(1000, Math.ceil(Number(retryAfterSeconds || 1) * 1000));
     const dueSecond = Math.ceil((Date.now() + delayMs) / 1000);
-    const retryJob = await capiQueue.add(
+    const retryJob = await enqueueReschedulableJob(
+        capiQueue,
         'send-fb-batch',
         { shopId },
         {

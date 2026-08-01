@@ -56,6 +56,7 @@ const {
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
 const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
+const { enqueueReschedulableJob } = require('../src/utils/queue');
 const { consumeWeightedWindow } = require('../src/utils/weighted-rate-limit');
 const {
     boundedScalarValues,
@@ -737,6 +738,46 @@ test('route retry backoff is exponential and capped', () => {
     assert.equal(retryDelaySeconds(20, 5, 900), 900);
 });
 
+test('coalesced queue jobs reuse live work but replace retained terminal jobs', async () => {
+    const liveCalls = [];
+    const liveQueue = {
+        async add(name, data, options) {
+            liveCalls.push({ name, data, options });
+            return { id: options.jobId, getState: async () => 'delayed' };
+        },
+    };
+    const liveJob = await enqueueReschedulableJob(
+        liveQueue,
+        'send-fb-batch',
+        { shopId: 7 },
+        { delay: 1000, jobId: 'retry-7-100' },
+        () => 'unused',
+    );
+    assert.equal(liveCalls.length, 1);
+    assert.equal(liveJob.id, 'retry-7-100');
+
+    const terminalCalls = [];
+    const terminalQueue = {
+        async add(name, data, options) {
+            terminalCalls.push({ name, data, options });
+            return {
+                id: options.jobId,
+                getState: async () => terminalCalls.length === 1 ? 'completed' : 'waiting',
+            };
+        },
+    };
+    const replacement = await enqueueReschedulableJob(
+        terminalQueue,
+        'send-fb-batch',
+        { shopId: 7 },
+        { delay: 1000, jobId: 'retry-7-100' },
+        () => 'replacement',
+    );
+    assert.equal(terminalCalls.length, 2);
+    assert.equal(terminalCalls[1].options.jobId, 'retry-7-100-replacement');
+    assert.equal(replacement.id, 'retry-7-100-replacement');
+});
+
 test('platform retry control honors Retry-After and adds bounded jitter', () => {
     assert.equal(parseRetryAfterSeconds('120', 0), 120);
     assert.equal(parseRetryAfterSeconds('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120);
@@ -988,6 +1029,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     const schema = fs.readFileSync(path.join(__dirname, '..', 'init.sql'), 'utf8');
     const scaleIndexes = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'scale-indexes.sql'), 'utf8');
     const workerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'worker.js'), 'utf8');
+    const queueSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'utils', 'queue.js'), 'utf8');
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shop_pixel_routes/);
     assert.match(schema, /reporting_timezone VARCHAR\(64\) NOT NULL DEFAULT 'UTC'/);
     assert.match(schema, /shopify_api_version VARCHAR\(20\)/);
@@ -1116,8 +1158,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /SET status = CASE WHEN \$2::boolean THEN 'PENDING' ELSE status END,[\s\S]*?request_payload = \$4::jsonb/);
     assert.match(serverSource, /GROUP BY e\.shop_id\s+ORDER BY e\.shop_id ASC/);
     assert.match(serverSource, /jobId: `rescue-\$\{shopId\}-\$\{rescueMinute\}`/);
-    assert.match(serverSource, /const state = await job\.getState\(\)/);
-    assert.match(serverSource, /state === 'completed' \|\| state === 'failed'/);
+    assert.match(serverSource, /enqueueReschedulableJob\(/);
+    assert.match(workerSource, /enqueueReschedulableJob\(/);
+    assert.match(queueSource, /const state = await job\.getState\(\)/);
+    assert.match(queueSource, /state !== 'completed' && state !== 'failed'/);
     assert.match(serverSource, /cleanupExpiredOperationalData/);
     assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
     assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
