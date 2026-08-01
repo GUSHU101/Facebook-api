@@ -49,7 +49,7 @@ Security notes:
 Upgrade/redeploy:
 
 - The one-command installer can be run again on the same VPS.
-- It creates a database and `.env` backup before pulling an existing installation.
+- It creates a database and `.env` backup before pulling an existing installation; only a structurally validated PostgreSQL archive is atomically published.
 - Existing `.env` and encryption/database credentials are preserved by default.
 - Existing repositories are updated with `git pull --ff-only`.
 - PM2 uses reload semantics for `capi-api` and `capi-worker`, avoiding duplicate processes.

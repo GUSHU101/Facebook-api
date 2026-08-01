@@ -223,7 +223,7 @@ sudo bash deploy/update_baota.sh
 
 1. 找到宝塔安装的最新 Node.js、npm 与 PostgreSQL 工具。
 2. 按项目目录所有者确定 Node/PM2 运行用户，避免 root 与 `www` 各启动一个 Worker。
-3. 在改动数据库前创建数据库快照和受限权限的 `.env` 备份。
+3. 在改动数据库前创建数据库快照和受限权限的 `.env` 备份；数据库归档通过 `pg_restore --list` 校验后才会以正式文件名原子发布，中断或损坏的临时文件会自动清理。
 4. 开启维护模式并停止唯一 Worker。
 5. 执行 `npm ci --omit=dev`、JavaScript 语法检查和数据库所有权修复。
 6. 执行 `npm run migrate` 与 `npm run doctor`。
@@ -231,6 +231,15 @@ sudo bash deploy/update_baota.sh
 8. 执行 `pm2 save` 并在全部步骤成功后退出维护模式。
 
 如果任一步失败，脚本会保留 `.maintenance`，尝试恢复更新前的 Worker，并明确要求修复后重新执行；不要手工删除维护文件后带病运行。
+
+需要进行灾难恢复时，先选择 `backups/capi-db-*.dump` 中经过校验的归档，再明确确认执行：
+
+```bash
+cd /www/wwwroot/Facebook-api-main
+sudo env CONFIRM=RESTORE bash scripts/restore.sh /绝对路径/capi-db-时间戳-进程号.dump
+```
+
+恢复脚本会在进入维护模式前再次检查归档，只停止并重新启动恢复前实际存在的 `capi-api`/`capi-worker` PM2 进程，并在迁移、自检或进程重启失败时保留维护模式。恢复会覆盖数据库对象，必须先确认文件路径和目标数据库正确。
 
 成功结尾应为：
 

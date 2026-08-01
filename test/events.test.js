@@ -2256,6 +2256,7 @@ test('deployment workflow preserves production secrets and verifies runtime read
         'utf8',
     );
     const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+    const backup = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'backup.sh'), 'utf8');
     const restore = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'restore.sh'), 'utf8');
     const ownershipRepair = fs.readFileSync(
         path.join(__dirname, '..', 'scripts', 'repair-db-ownership.sh'),
@@ -2294,8 +2295,22 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(ci, /scripts\/repair-db-ownership\.sh/);
     assert.match(ci, /deploy\/configure_baota_nginx\.sh/);
     assert.match(ci, /deploy\/update_baota\.sh/);
+    assert.match(backup, /trap cleanup_partial_files EXIT/);
+    assert.match(backup, /pg_dump .*--file="\$DB_TMP"/);
+    assert.match(backup, /pg_restore --list "\$DB_TMP"/);
+    assert.match(backup, /mv -f -- "\$DB_TMP" "\$db_file"/);
     assert.match(restore, /--single-transaction/);
+    assert.ok(
+        restore.indexOf('pg_restore --list "$BACKUP_FILE"') < restore.indexOf('\n  stop_runtime\n'),
+        'restore archives must be validated before runtime is stopped',
+    );
+    assert.match(restore, /for process_name in capi-api capi-worker/);
+    assert.match(restore, /pm2_as_runtime_user stop "\$process_name"/);
+    assert.match(restore, /pm2_as_runtime_user restart capi-api --update-env/);
+    assert.match(restore, /pm2_as_runtime_user restart capi-worker --update-env/);
+    assert.doesNotMatch(restore, /startOrReload/);
     assert.match(restore, /runtime remains stopped and maintenance mode stays enabled/);
+    assert.match(baotaUpdater, /command -v pg_restore .*fail "pg_restore was not found/);
     assert.match(ownershipRepair, /DATABASE_URL must include a user and database name/);
     assert.match(ownershipRepair, /\/www\/server\/nodejs/);
     assert.match(ownershipRepair, /\/usr\/lib\/postgresql/);

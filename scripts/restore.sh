@@ -6,7 +6,8 @@ BACKUP_FILE="${1:-${BACKUP_FILE:-}}"
 CONFIRM="${CONFIRM:-}"
 MAINTENANCE_FILE="${MAINTENANCE_FILE:-${APP_DIR}/.maintenance}"
 RESTORE_DRAIN_SECONDS="${RESTORE_DRAIN_SECONDS:-35}"
-RUNTIME_STOPPED=0
+API_WAS_STOPPED=0
+WORKER_WAS_STOPPED=0
 PM2_USER="${PM2_USER:-$(stat -c '%U' "$APP_DIR" 2>/dev/null || id -un)}"
 PM2_USER_HOME="${PM2_USER_HOME:-$(getent passwd "$PM2_USER" 2>/dev/null | cut -d: -f6)}"
 
@@ -44,10 +45,24 @@ pm2_as_runtime_user() {
 stop_runtime() {
   umask 077
   printf 'database restore in progress\n' > "$MAINTENANCE_FILE"
-  if command -v pm2 >/dev/null 2>&1 && pm2_as_runtime_user describe capi-api >/dev/null 2>&1; then
-    log "Stopping API and Worker before destructive restore"
-    RUNTIME_STOPPED=1
-    pm2_as_runtime_user stop capi-api capi-worker >/dev/null || true
+  local visible_runtime=0
+  if command -v pm2 >/dev/null 2>&1; then
+    local process_name
+    for process_name in capi-api capi-worker; do
+      if pm2_as_runtime_user describe "$process_name" >/dev/null 2>&1; then
+        visible_runtime=1
+        log "Stopping ${process_name} before destructive restore"
+        pm2_as_runtime_user stop "$process_name" >/dev/null
+        if [ "$process_name" = "capi-api" ]; then
+          API_WAS_STOPPED=1
+        else
+          WORKER_WAS_STOPPED=1
+        fi
+      fi
+    done
+  fi
+  if [ "$visible_runtime" = "1" ]; then
+    log "All visible PM2 runtime processes are stopped"
   else
     log "PM2 runtime not visible; waiting ${RESTORE_DRAIN_SECONDS}s for maintenance mode to drain requests"
     sleep "$RESTORE_DRAIN_SECONDS"
@@ -55,19 +70,21 @@ stop_runtime() {
 }
 
 restart_runtime() {
-  if [ "$RUNTIME_STOPPED" = "1" ]; then
-    log "Restarting API and Worker"
-    (cd "$APP_DIR" && pm2_as_runtime_user startOrReload ecosystem.config.js --update-env >/dev/null)
+  if [ "$API_WAS_STOPPED" = "1" ]; then
+    log "Restarting the previously running API"
+    pm2_as_runtime_user restart capi-api --update-env >/dev/null
   fi
-  rm -f "$MAINTENANCE_FILE"
+  if [ "$WORKER_WAS_STOPPED" = "1" ]; then
+    log "Restarting the previously running Worker"
+    pm2_as_runtime_user restart capi-worker --update-env >/dev/null
+  fi
+  rm -f -- "$MAINTENANCE_FILE"
 }
 
 handle_restore_exit() {
   local status="$?"
-  if [ "$status" -eq 0 ]; then
-    restart_runtime
-  else
-    log "Restore or validation failed; runtime remains stopped and maintenance mode stays enabled"
+  if [ "$status" -ne 0 ]; then
+    log "Restore, validation, or runtime restart failed; runtime remains stopped and maintenance mode stays enabled"
   fi
   return "$status"
 }
@@ -79,6 +96,9 @@ main() {
 
   load_env
   command -v pg_restore >/dev/null 2>&1 || fail "pg_restore is not installed"
+
+  log "Validating backup archive before entering maintenance mode"
+  pg_restore --list "$BACKUP_FILE" >/dev/null
 
   trap handle_restore_exit EXIT
   trap 'exit 130' INT TERM
@@ -95,6 +115,7 @@ main() {
 
   log "Running schema migration and recovery validation"
   (cd "$APP_DIR" && as_runtime_user npm run migrate && as_runtime_user npm run doctor)
+  restart_runtime
   trap - INT TERM
   log "Restore complete and runtime validation passed"
 }

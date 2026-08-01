@@ -143,10 +143,12 @@ worker restarted.
     of platform plus decrypted access token. The scope and cooldown are also
     persisted on every matching credential row, so database rows sharing one
     token retain the same throttle after Redis or process restarts.
-42. Backup and restore scripts parse dotenv without shell evaluation. Restore
-    enters maintenance, stops/drains writers, restores in one database
-    transaction, validates the migrated database and credential key, then
-    reloads the runtime. A failed restore remains stopped in maintenance mode.
+42. Backup and restore scripts parse dotenv without shell evaluation. Backups
+    are written to private temporary files, structurally validated and only then
+    atomically published. Restore validates the archive before maintenance,
+    stops/drains writers, restores in one database transaction, validates the
+    migrated database and credential key, then restarts only the PM2 processes
+    it actually stopped. A failed restore or restart remains in maintenance mode.
 43. Meta errors are explicitly scoped. HTTP 401/403 and credential,
     permission, application, or missing-object codes such as 10, 102, 190,
     200, 803, and 2500 never enter recursive event isolation. Unknown
