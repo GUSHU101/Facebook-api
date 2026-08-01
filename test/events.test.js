@@ -1329,6 +1329,8 @@ test('CORS and partial-delivery safeguards remain wired into the runtime', () =>
     assert.match(workerSource, /error\.partialDelivery =/);
     assert.match(workerSource, /retryable_event_ids/);
     assert.match(workerSource, /await applyPlatformResult\(/);
+    assert.match(workerSource, /await scheduleRouteRetry\(normalizedShopId, retryAfterSeconds\)/);
+    assert.match(workerSource, /jobId: `route-retry-\$\{shopId\}-\$\{dueSecond\}`/);
     assert.match(workerSource, /JOIN pixels active_pixel[\s\S]*active_pixel\.status = 'active'/);
     assert.match(serverSource, /SELECT DISTINCT ON \(m\.pixel_route_id, m\.shop_id\)/);
 });

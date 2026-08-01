@@ -479,6 +479,22 @@ async function scheduleShopContinuation(shopId) {
     return true;
 }
 
+async function scheduleRouteRetry(shopId, retryAfterSeconds) {
+    const delayMs = Math.max(1000, Math.ceil(Number(retryAfterSeconds || 1) * 1000));
+    const dueSecond = Math.ceil((Date.now() + delayMs) / 1000);
+    await capiQueue.add(
+        'send-fb-batch',
+        { shopId },
+        {
+            delay: delayMs,
+            // Coalesce routes for the same shop and due second. Stable IDs
+            // avoid a retry storm while PostgreSQL remains authoritative and
+            // the minute-scale rescue scanner remains the final safety net.
+            jobId: `route-retry-${shopId}-${dueSecond}`,
+        },
+    );
+}
+
 async function insertDeadLetter(shopId, dbEvents, reason) {
     await pool.query(
         `INSERT INTO dead_letters (shop_id, payload, error_reason)
@@ -1357,6 +1373,14 @@ const worker = new Worker('capi-events', async job => {
         );
     }
     if (retryNeeded) {
+        try {
+            await scheduleRouteRetry(normalizedShopId, retryAfterSeconds);
+        } catch (error) {
+            console.error(
+                `Failed to schedule prompt route retry for shop ${normalizedShopId}; PostgreSQL rescue remains active:`,
+                error.message,
+            );
+        }
         throw new RetryableError(
             'One or more routes were safely deferred for retry',
             { code: 'ROUTE_RETRY_SCHEDULED', retryAfterSeconds },
