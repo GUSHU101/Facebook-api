@@ -402,8 +402,8 @@ Before production rollout, verify all of the following in a staging stack:
 
 ## Official references used
 
-- Meta Graph API v25.0 changelog:
-  https://developers.facebook.com/docs/graph-api/changelog/version25.0/
+- Meta Marketing API changelog and available versions:
+  https://developers.facebook.com/documentation/ads-commerce/marketing-api/marketing-api-changelog/
 - Meta Conversions API event deduplication:
   https://developers.facebook.com/documentation/ads-commerce/conversions-api/deduplicate-pixel-and-server-events
 - Meta Conversions API parameters:

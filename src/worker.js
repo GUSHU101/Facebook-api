@@ -210,7 +210,7 @@ async function markDeliverySuccess(routeId, claims, responseForEvent) {
 }
 
 async function markDeliveryFailure(routeId, claims, classification, expectedCredentialVersion = null) {
-    if (claims.length === 0) return [];
+    if (claims.length === 0) return { eventStoreIds: [], retryDelaySeconds: 0 };
     const retryDelay = retryDelayWithJitterSeconds(
         classification.attempt,
         config.deliveryRetryBaseSeconds,
@@ -224,9 +224,9 @@ async function markDeliveryFailure(routeId, claims, classification, expectedCred
              SELECT * FROM UNNEST($2::bigint[], $3::int[])
          )
          UPDATE event_deliveries ed
-         SET status = $4,
+         SET status = $4::varchar(30),
              next_attempt_at = CASE
-                 WHEN $4 = 'RETRYABLE_FAILED'
+                 WHEN $4::varchar(30) = 'RETRYABLE_FAILED'
                  THEN NOW() + ($5::int * INTERVAL '1 second')
                  ELSE ed.next_attempt_at
              END,
@@ -261,7 +261,10 @@ async function markDeliveryFailure(routeId, claims, classification, expectedCred
             expectedCredentialVersion,
         ],
     );
-    return rows.map(row => String(row.event_store_id));
+    return {
+        eventStoreIds: rows.map(row => String(row.event_store_id)),
+        retryDelaySeconds: classification.retryable ? retryDelay : 0,
+    };
 }
 
 async function deferRouteEvents(routeId, eventIds, delaySeconds, code, message) {
@@ -479,6 +482,24 @@ async function scheduleShopContinuation(shopId) {
     return true;
 }
 
+async function scheduleRouteRetry(shopId, retryAfterSeconds) {
+    const delayMs = Math.max(1000, Math.ceil(Number(retryAfterSeconds || 1) * 1000));
+    const dueSecond = Math.ceil((Date.now() + delayMs) / 1000);
+    const retryJob = await capiQueue.add(
+        'send-fb-batch',
+        { shopId },
+        {
+            delay: delayMs,
+            // Coalesce routes for the same shop and due second. Stable IDs
+            // avoid a retry storm while PostgreSQL remains authoritative and
+            // the minute-scale rescue scanner remains the final safety net.
+            jobId: `route-retry-${shopId}-${dueSecond}`,
+        },
+    );
+    console.warn(`[DeliveryRetry] scheduled job=${retryJob.id} shop=${shopId} delay_ms=${delayMs}`);
+    return retryJob.id;
+}
+
 async function insertDeadLetter(shopId, dbEvents, reason) {
     await pool.query(
         `INSERT INTO dead_letters (shop_id, payload, error_reason)
@@ -624,7 +645,7 @@ async function postFacebookBatch(pixel, token, dbEvents) {
     const requestBody = { data: finalEvents };
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
 
-    const url = `https://graph.facebook.com/${config.fbApiVersion}/${pixel.pixel_id}/events`;
+    const url = `${config.facebookGraphBaseUrl}/${config.fbApiVersion}/${pixel.pixel_id}/events`;
     await reserveCredentialRequest(pixel.credential_scope);
     const response = await axios.post(
         url,
@@ -853,7 +874,17 @@ async function recordCredentialSuccess(credentialScope, rateControl = {}) {
         ],
     );
     if (cooldownSeconds > 0) {
-        await redis.set(`cooldown:delivery-credential:${credentialScope}`, '1', 'EX', cooldownSeconds);
+        await redis.set(
+            `cooldown:delivery-credential:${credentialScope}`,
+            '1',
+            'EX',
+            cooldownSeconds,
+        ).catch(error => {
+            // PostgreSQL rate_limit_until is authoritative. A Redis partition
+            // must not turn an already accepted platform response into a job
+            // failure or prevent the durable delivery ledger from advancing.
+            console.error(`[CredentialCooldown] Redis success cooldown mirror failed scope=${credentialScope}: ${error.message}`);
+        });
     }
 }
 
@@ -895,7 +926,11 @@ async function recordCredentialFailure(credentialScope, classification) {
             '1',
             'EX',
             Math.ceil(cooldownSeconds),
-        );
+        ).catch(error => {
+            // The database cooldown written above remains effective even when
+            // the low-latency Redis mirror is temporarily unavailable.
+            console.error(`[CredentialCooldown] Redis failure cooldown mirror failed scope=${credentialScope}: ${error.message}`);
+        });
     }
     return Math.ceil(cooldownSeconds);
 }
@@ -1040,7 +1075,7 @@ async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliv
         const failureClaims = claimsForEvents(failedDbEvents, claimedEvents);
         const maxAttempt = Math.max(1, ...failureClaims.map(item => item.attemptCount));
         const normalizedFailure = { ...failure, route_id: pixel.route_id, status: 'FAILED' };
-        const updatedIds = await markDeliveryFailure(pixel.route_id, failureClaims, {
+        const { eventStoreIds: updatedIds } = await markDeliveryFailure(pixel.route_id, failureClaims, {
             retryable: false,
             code: failure.code,
             message: failure.message,
@@ -1062,6 +1097,9 @@ const worker = new Worker('capi-events', async job => {
         throw new Error('Invalid job payload');
     }
     const normalizedShopId = Number(shopId);
+    if (String(job.id || '').startsWith('route-retry-')) {
+        console.warn(`[DeliveryRetry] consuming job=${job.id} shop=${normalizedShopId}`);
+    }
     const shopLease = await acquireRedisLease(`lock:delivery-shop:${normalizedShopId}`);
     if (!shopLease) {
         throw new RetryableError('Shop delivery lease is busy', {
@@ -1079,6 +1117,9 @@ const worker = new Worker('capi-events', async job => {
         event.status === 'PENDING' && Number(event.shop_id) === normalizedShopId
     ));
     if (sendableDbEvents.length === 0) {
+        if (String(job.id || '').startsWith('route-retry-')) {
+            console.warn(`[DeliveryRetry] no due PostgreSQL event for job=${job.id} shop=${normalizedShopId}`);
+        }
         if (Array.isArray(dbEvents)) await scheduleShopContinuation(normalizedShopId);
         return;
     }
@@ -1294,12 +1335,13 @@ const worker = new Worker('capi-events', async job => {
                 Number(classification.retryAfterSeconds || 0),
                 credentialDelay,
             );
-            let updatedIds = await markDeliveryFailure(
+            let failureUpdate = await markDeliveryFailure(
                 pixel.route_id,
                 claims,
                 classification,
                 pixel.credential_version,
             );
+            let updatedIds = failureUpdate.eventStoreIds;
             if (
                 updatedIds.length === 0
                 && claims.length > 0
@@ -1312,7 +1354,8 @@ const worker = new Worker('capi-events', async job => {
                     retryAfterSeconds: config.credentialBusyDelaySeconds,
                     attempt: maxAttempt,
                 };
-                updatedIds = await markDeliveryFailure(pixel.route_id, claims, classification);
+                failureUpdate = await markDeliveryFailure(pixel.route_id, claims, classification);
+                updatedIds = failureUpdate.eventStoreIds;
             }
             if (updatedIds.length > 0) {
                 deliveries.push({
@@ -1331,7 +1374,9 @@ const worker = new Worker('capi-events', async job => {
                 retryNeeded = true;
                 retryAfterSeconds = Math.max(
                     retryAfterSeconds,
-                    Number(classification.retryAfterSeconds || config.deliveryRetryBaseSeconds),
+                    Number(failureUpdate.retryDelaySeconds
+                        || classification.retryAfterSeconds
+                        || config.deliveryRetryBaseSeconds),
                 );
             }
         } finally {
@@ -1357,6 +1402,14 @@ const worker = new Worker('capi-events', async job => {
         );
     }
     if (retryNeeded) {
+        try {
+            await scheduleRouteRetry(normalizedShopId, retryAfterSeconds);
+        } catch (error) {
+            console.error(
+                `Failed to schedule prompt route retry for shop ${normalizedShopId}; PostgreSQL rescue remains active:`,
+                error.message,
+            );
+        }
         throw new RetryableError(
             'One or more routes were safely deferred for retry',
             { code: 'ROUTE_RETRY_SCHEDULED', retryAfterSeconds },
@@ -1380,6 +1433,11 @@ const worker = new Worker('capi-events', async job => {
 
 worker.on('failed', async (job, err) => {
     if (!job) return;
+
+    console.error(
+        `[DeliveryJobFailure] job=${job.id} attempt=${job.attemptsMade}/${job.opts.attempts || 1}`
+        + ` code=${err?.code || 'UNKNOWN'} message=${err?.message || 'Unknown worker failure'}`,
+    );
 
     const attemptsExhausted = job.attemptsMade >= (job.opts.attempts || 1);
     if (attemptsExhausted) {

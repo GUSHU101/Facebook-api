@@ -2382,10 +2382,10 @@ async function drainShopifyWebhookInbox(limit = config.shopifyWebhookInboxBatchS
                 const delaySeconds = Math.min(900, 2 ** Math.min(9, Number(row.attempt_count)));
                 await pool.query(
                     `UPDATE shopify_webhook_inbox
-                     SET status = $2,
+                     SET status = $2::varchar(30),
                          next_attempt_at = NOW() + ($3::int * INTERVAL '1 second'),
                          lease_expires_at = NULL,
-                         processed_at = CASE WHEN $2 = 'FAILED_PERMANENT' THEN NOW() ELSE NULL END,
+                         processed_at = CASE WHEN $2::varchar(30) = 'FAILED_PERMANENT' THEN NOW() ELSE NULL END,
                          error_message = $4
                      WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $5`,
                     [row.id, permanent ? 'FAILED_PERMANENT' : 'RETRYABLE_FAILED', delaySeconds, String(error.message).slice(0, 4000), row.attempt_count],
@@ -3267,12 +3267,12 @@ async function drainShopifyPrivacyInbox(limit = config.shopifyPrivacyBatchSize) 
                 const scrubPayload = outcome.status === 'SUCCESS';
                 await pool.query(
                     `UPDATE shopify_privacy_inbox
-                     SET status = $3,
+                     SET status = $3::varchar(30),
                          payload = CASE WHEN $4::boolean THEN NULL ELSE payload END,
                          shop_domain = CASE WHEN $4::boolean THEN NULL ELSE shop_domain END,
                          result = $5::jsonb,
                          processed_at = NOW(),
-                         completed_at = CASE WHEN $3 = 'SUCCESS' THEN NOW() ELSE NULL END,
+                         completed_at = CASE WHEN $3::varchar(30) = 'SUCCESS' THEN NOW() ELSE NULL END,
                          lease_expires_at = NULL,
                          error_message = NULL
                      WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $2`,
@@ -3283,10 +3283,10 @@ async function drainShopifyPrivacyInbox(limit = config.shopifyPrivacyBatchSize) 
                 const delaySeconds = Math.min(3600, 2 ** Math.min(12, Number(row.attempt_count)));
                 await pool.query(
                     `UPDATE shopify_privacy_inbox
-                     SET status = $3,
+                     SET status = $3::varchar(30),
                          next_attempt_at = NOW() + ($4::int * INTERVAL '1 second'),
                          lease_expires_at = NULL,
-                         processed_at = CASE WHEN $3 = 'FAILED_PERMANENT' THEN NOW() ELSE NULL END,
+                         processed_at = CASE WHEN $3::varchar(30) = 'FAILED_PERMANENT' THEN NOW() ELSE NULL END,
                          error_message = $5
                      WHERE id = $1 AND status = 'PROCESSING' AND attempt_count = $2`,
                     [
@@ -3963,9 +3963,9 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
              )
              SELECT shop_id,
                     $2,
-                    $3,
+                    $3::varchar(100),
                     CASE
-                        WHEN $3::text IS NOT NULL
+                        WHEN $3::varchar(100) IS NOT NULL
                             THEN NOW() + ($4::int * INTERVAL '1 minute')
                         ELSE NULL
                     END

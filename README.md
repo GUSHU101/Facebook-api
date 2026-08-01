@@ -163,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    PORT=3000
    DATABASE_URL=postgres://user:password@host:5432/db
    REDIS_URL=redis://host:6379
-   FB_API_VERSION=v25.0
+   FB_API_VERSION=v26.0
    REQUIRE_INGEST_TOKEN=true
    SHOPIFY_WEB_ORDER_SOURCES=web
    SHOPIFY_API_VERSION=2026-07
