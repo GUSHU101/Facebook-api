@@ -224,9 +224,9 @@ async function markDeliveryFailure(routeId, claims, classification, expectedCred
              SELECT * FROM UNNEST($2::bigint[], $3::int[])
          )
          UPDATE event_deliveries ed
-         SET status = $4,
+         SET status = $4::varchar(30),
              next_attempt_at = CASE
-                 WHEN $4 = 'RETRYABLE_FAILED'
+                 WHEN $4::varchar(30) = 'RETRYABLE_FAILED'
                  THEN NOW() + ($5::int * INTERVAL '1 second')
                  ELSE ed.next_attempt_at
              END,
