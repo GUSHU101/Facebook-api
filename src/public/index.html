@@ -152,7 +152,7 @@
                                     <div class="mt-1 text-xs text-slate-500">{{ s.paid_webhook_last_checked_at ? formatTime(s.paid_webhook_last_checked_at) : '等待审计' }}</div>
                                 </td>
                                 <td>
-                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v18' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
+                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v19' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
                                     <div class="mt-1 text-xs text-slate-500">客户端自报：{{ s.pixel_last_seen_at ? formatTime(s.pixel_last_seen_at) : '新版首个事件进入后显示' }} · 自报丢失诊断 {{ s.pixel_diagnostic_count || 0 }}</div>
                                 </td>
                                 <td>{{ formatTime(s.created_at) }}</td>
@@ -512,7 +512,17 @@
                                 </div>
                             </div>
                             <div v-if="officialEvents(item).length" class="mt-3 flex flex-wrap gap-2">
-                                <span v-for="event in officialEvents(item)" :key="event.event_name" class="px-2 py-1 rounded-md bg-white border font-mono text-xs">{{ event.event_name }}: {{ event.score }}/10</span>
+                                <span v-for="event in officialEvents(item)" :key="event.event_name" class="px-2 py-1 rounded-md bg-white border font-mono text-xs">
+                                    {{ event.event_name }}: {{ officialEventScore(event) }} · 覆盖 {{ officialEventCoverage(event) }} · {{ officialEventFreshness(event) }}
+                                </span>
+                            </div>
+                            <div v-if="officialDiagnostics(item).length" class="mt-3 space-y-2">
+                                <div class="text-xs font-semibold text-amber-800">Meta 官方诊断（{{ officialDiagnostics(item).length }}）</div>
+                                <div v-for="diagnostic in officialDiagnostics(item)" :key="diagnostic.key" class="rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                                    <div class="font-semibold">{{ diagnostic.event_name }} · {{ diagnostic.name }}</div>
+                                    <div v-if="diagnostic.percentage !== undefined" class="font-mono mt-1">影响 {{ formatPercent(diagnostic.percentage) }}</div>
+                                    <div v-if="diagnostic.solution" class="mt-1">{{ diagnostic.solution }}</div>
+                                </div>
                             </div>
                             <div v-if="item.error_message" class="mt-3 text-xs text-red-700 font-mono">{{ item.error_message }}</div>
                         </div>
@@ -692,7 +702,7 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v18";
+const SOURCE_VERSION = "shopify-pixel-v19";
 const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
 const META_STANDARD_BROWSER_EVENTS = new Set([
     'PageView', 'ViewContent', 'Search', 'AddToCart',
@@ -2504,7 +2514,9 @@ analytics.subscribe('search_submitted', function (event) {
                             || Number(response.accepted_event_count || 0) === 1
                             || Number(response.events_received || 0) > 0;
                         const trace = response.fbtrace_id ? ` · ${response.fbtrace_id}` : '';
-                        return `${item.pixel_id}:${item.status}${acknowledged ? ' · API已确认' : ''}${trace}`;
+                        const messageCount = Array.isArray(response.meta_messages) ? response.meta_messages.length : 0;
+                        const messages = messageCount ? ` · Meta消息 ${messageCount}` : '';
+                        return `${item.pixel_id}:${item.status}${acknowledged ? ' · API收件已确认（非最终计入）' : ''}${messages}${trace}`;
                     }).join(', ');
                     return value.fbtrace_id || JSON.stringify(value).slice(0, 120);
                 },
@@ -2544,6 +2556,26 @@ analytics.subscribe('search_submitted', function (event) {
                 },
                 officialEvents(item) {
                     return Array.isArray(item?.summary?.events) ? item.summary.events : [];
+                },
+                officialEventScore(event) {
+                    return Number.isFinite(Number(event?.score)) ? `${Number(event.score).toFixed(1)}/10` : '待生成';
+                },
+                officialEventCoverage(event) {
+                    const value = event?.event_coverage?.percentage;
+                    return Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)}%` : '-';
+                },
+                officialEventFreshness(event) {
+                    const value = String(event?.data_freshness?.upload_frequency || '').trim();
+                    return value ? `新鲜度 ${value}` : '新鲜度 -';
+                },
+                officialDiagnostics(item) {
+                    return this.officialEvents(item).flatMap(event => (
+                        Array.isArray(event.diagnostics) ? event.diagnostics : []
+                    ).map((diagnostic, index) => ({
+                        ...diagnostic,
+                        event_name: event.event_name,
+                        key: `${event.event_name}:${diagnostic.name || index}`,
+                    })));
                 },
             },
             mounted() {

@@ -616,11 +616,17 @@ function perEventAcceptanceResponse(pixel, deliveryResult, eventStoreId) {
             platform: 'facebook',
             pixel_id: pixel.pixel_id,
             status: 'SUCCESS',
+            // A successful CAPI response confirms request receipt. Meta can
+            // still deduplicate or discard the event later because of consent
+            // controls and policies, so do not describe this as final counting.
+            receipt_acknowledged: true,
+            receipt_finality: 'NOT_FINAL',
             accepted_event: true,
             accepted_event_count: 1,
             api_version: config.fbApiVersion,
             test_mode: Boolean(pixel.test_event_code),
             fbtrace_id: batch?.fbtrace_id || null,
+            meta_messages: batch?.messages || [],
             meta_batch_events_received: Number(batch?.events_received || 0),
             meta_batch_size: Array.isArray(batch?.event_store_ids) ? batch.event_store_ids.length : 0,
         };
@@ -669,6 +675,19 @@ async function postFacebookBatch(pixel, token, dbEvents) {
     return {
         fbtrace_id: response.data.fbtrace_id,
         events_received: Number(response.data.events_received || 0),
+        messages: (Array.isArray(response.data.messages) ? response.data.messages : [])
+            .slice(0, 20)
+            .map(message => {
+                if (message && typeof message === 'object') {
+                    return Object.fromEntries(Object.entries(message).slice(0, 20).map(([key, value]) => [
+                        String(key).slice(0, 100),
+                        typeof value === 'string'
+                            ? value.slice(0, 2000)
+                            : String(JSON.stringify(value) ?? value ?? '').slice(0, 2000),
+                    ]));
+                }
+                return String(message).slice(0, 2000);
+            }),
         event_ids: eventIds(dbEvents),
         event_store_ids: eventStoreIds(dbEvents),
         rate_control: metaRateControlFromHeaders(response.headers),
