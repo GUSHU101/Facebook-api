@@ -1463,6 +1463,9 @@ worker.on('error', error => {
     console.error('Worker runtime error:', error);
 });
 
+let shuttingDown = false;
+let workerHeartbeatInFlight = null;
+
 async function writeWorkerHeartbeat() {
     await redis.set(
         'health:capi-worker',
@@ -1472,17 +1475,25 @@ async function writeWorkerHeartbeat() {
     );
 }
 
+function refreshWorkerHeartbeat() {
+    if (shuttingDown || workerHeartbeatInFlight) return workerHeartbeatInFlight;
+    const execution = writeWorkerHeartbeat()
+        .catch(error => {
+            console.error('Worker heartbeat failed:', error.message);
+        })
+        .finally(() => {
+            if (workerHeartbeatInFlight === execution) workerHeartbeatInFlight = null;
+        });
+    workerHeartbeatInFlight = execution;
+    return execution;
+}
+
 const workerHeartbeatTimer = setInterval(() => {
-    void writeWorkerHeartbeat().catch(error => {
-        console.error('Worker heartbeat failed:', error.message);
-    });
+    void refreshWorkerHeartbeat();
 }, Math.max(5_000, Math.floor(config.workerHeartbeatTtlSeconds * 1000 / 3)));
 workerHeartbeatTimer.unref?.();
-void writeWorkerHeartbeat().catch(error => {
-    console.error('Initial worker heartbeat failed:', error.message);
-});
+void refreshWorkerHeartbeat();
 
-let shuttingDown = false;
 async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -1495,6 +1506,7 @@ async function shutdown(signal) {
     try {
         clearInterval(workerHeartbeatTimer);
         await worker.close();
+        if (workerHeartbeatInFlight) await workerHeartbeatInFlight;
         await capiQueue.close();
         await pool.end();
         await workerRedis.quit();

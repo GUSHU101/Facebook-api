@@ -57,6 +57,7 @@ const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok
 const { missingMatchSignals } = require('../src/utils/emq');
 const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
 const { enqueueReschedulableJob } = require('../src/utils/queue');
+const { createTrackedCronScheduler } = require('../src/utils/scheduler');
 const { consumeWeightedWindow } = require('../src/utils/weighted-rate-limit');
 const {
     boundedScalarValues,
@@ -799,6 +800,94 @@ test('coalesced queue jobs reuse live work but replace terminal or missing jobs'
     assert.equal(raceReplacement.id, 'dispatch-8-normal-100-race-replacement');
 });
 
+test('tracked cron tasks never overlap and graceful shutdown drains active work', async () => {
+    const callbacks = [];
+    const stoppedTasks = [];
+    const reportedErrors = [];
+    const fakeCron = {
+        validate: expression => expression === '* * * * * *',
+        schedule(expression, callback) {
+            callbacks.push(callback);
+            return { stop: () => stoppedTasks.push(expression) };
+        },
+    };
+    const scheduler = createTrackedCronScheduler(fakeCron, {
+        onError: (error, label) => reportedErrors.push({ error, label }),
+    });
+
+    let releaseExecution;
+    let starts = 0;
+    scheduler.schedule('* * * * * *', async () => {
+        starts += 1;
+        await new Promise(resolve => { releaseExecution = resolve; });
+    }, 'slow-maintenance');
+
+    const first = callbacks[0]();
+    await Promise.resolve();
+    assert.equal(starts, 1);
+    assert.equal(scheduler.activeCount(), 1);
+    assert.equal(callbacks[0](), undefined, 'overlapping invocation must be skipped');
+    assert.equal(starts, 1);
+
+    let drained = false;
+    const drain = scheduler.stopAndDrain().then(() => { drained = true; });
+    await Promise.resolve();
+    assert.equal(scheduler.isStopping(), true);
+    assert.equal(drained, false, 'shutdown must wait for the active handler');
+    assert.deepEqual(stoppedTasks, ['* * * * * *']);
+    assert.equal(callbacks[0](), undefined, 'shutdown must reject future invocations');
+
+    releaseExecution();
+    await Promise.all([first, drain]);
+    assert.equal(drained, true);
+    assert.equal(scheduler.activeCount(), 0);
+    assert.deepEqual(reportedErrors, []);
+});
+
+test('tracked immediate background work joins the same shutdown drain', async () => {
+    const fakeCron = { validate: () => true, schedule: () => ({ stop() {} }) };
+    const scheduler = createTrackedCronScheduler(fakeCron);
+    let release;
+    const execution = scheduler.run(
+        () => new Promise(resolve => { release = resolve; }),
+        'immediate-webhook-drain',
+    );
+    await Promise.resolve();
+    assert.equal(scheduler.activeCount(), 1);
+
+    let stopped = false;
+    const drain = scheduler.stopAndDrain().then(() => { stopped = true; });
+    await Promise.resolve();
+    assert.equal(stopped, false);
+    assert.equal(scheduler.run(() => {}, 'late-work'), undefined);
+
+    release();
+    await Promise.all([execution, drain]);
+    assert.equal(stopped, true);
+    assert.equal(scheduler.activeCount(), 0);
+});
+
+test('tracked cron contains handler and error-reporter failures', async () => {
+    let callback;
+    const fakeCron = {
+        validate: () => true,
+        schedule(expression, handler) {
+            callback = handler;
+            return { stop() {} };
+        },
+    };
+    const expected = new Error('scheduled failure');
+    const scheduler = createTrackedCronScheduler(fakeCron, {
+        onError() {
+            throw new Error('reporter failure');
+        },
+    });
+    scheduler.schedule('* * * * *', async () => { throw expected; }, 'failure-test');
+    await callback();
+    assert.equal(scheduler.activeCount(), 0);
+    await scheduler.stopAndDrain();
+});
+
 test('platform retry control honors Retry-After and adds bounded jitter', () => {
     assert.equal(parseRetryAfterSeconds('120', 0), 120);
     assert.equal(parseRetryAfterSeconds('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120);
@@ -1181,6 +1270,8 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /jobId: `rescue-\$\{shopId\}-\$\{rescueMinute\}`/);
     assert.match(serverSource, /enqueueReschedulableJob\(/);
     assert.match(workerSource, /enqueueReschedulableJob\(/);
+    assert.match(workerSource, /if \(shuttingDown \|\| workerHeartbeatInFlight\) return workerHeartbeatInFlight/);
+    assert.match(workerSource, /if \(workerHeartbeatInFlight\) await workerHeartbeatInFlight/);
     assert.match(queueSource, /const state = await job\.getState\(\)/);
     assert.match(queueSource, /LIVE_JOB_STATES\.has\(state\)/);
     assert.match(serverSource, /cleanupExpiredOperationalData/);
@@ -1242,7 +1333,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /shopify_reconcile_state/);
     assert.match(serverSource, /FOR UPDATE SKIP LOCKED/);
     assert.match(serverSource, /res\.status\(200\)\.json\(\{ success: true, accepted: true, durable: true/);
-    assert.match(serverSource, /setImmediate\(\(\) => void drainShopifyWebhookInbox/);
+    assert.match(serverSource, /setImmediate\(\(\) => backgroundScheduler\.run/);
     assert.match(serverSource, /app\.post\('\/api\/webhook\/customers\/data_request'/);
     assert.match(serverSource, /app\.post\('\/api\/webhook\/customers\/redact'/);
     assert.match(serverSource, /app\.post\('\/api\/webhook\/shop\/redact'/);
@@ -1252,7 +1343,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /DISTRIBUTED_RATE_LIMIT_SCRIPT/);
     assert.match(serverSource, /rate:pixel:\$\{digest\}/);
     assert.match(serverSource, /Recovered invalid cursor/);
-    assert.match(serverSource, /for \(const task of scheduledTasks\) task\.stop\(\)/);
+    assert.match(serverSource, /const scheduledDrain = backgroundScheduler\.stopAndDrain\(\)/);
+    assert.match(serverSource, /await scheduledDrain/);
+    assert.match(serverSource, /backgroundScheduler\.run\([\s\S]*?shopify-webhook-immediate-drain/);
+    assert.match(serverSource, /lock:shopify_webhook_audit/);
 });
 
 test('runtime config rejects weak encryption keys and malformed CORS origins', () => {
