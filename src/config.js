@@ -86,9 +86,9 @@ function readJsonLimit() {
 }
 
 function readFacebookApiVersion() {
-    const value = String(process.env.FB_API_VERSION || 'v25.0').trim();
+    const value = String(process.env.FB_API_VERSION || 'v26.0').trim();
     if (!/^v\d+\.\d+$/.test(value)) {
-        throw new Error('FB_API_VERSION must look like v25.0');
+        throw new Error('FB_API_VERSION must look like v26.0');
     }
     return value;
 }

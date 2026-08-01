@@ -172,7 +172,7 @@ PORT=3000
 DATABASE_URL=postgres://capi_saas:这里填写真实数据库密码@127.0.0.1:5432/capi_saas
 REDIS_URL=redis://127.0.0.1:6379
 
-FB_API_VERSION=v25.0
+FB_API_VERSION=v26.0
 
 AES_SECRET_KEY=第一组64位随机字符
 INGEST_TOKEN_SECRET=第二组不同的64位随机字符

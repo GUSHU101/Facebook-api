@@ -431,7 +431,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         assert.equal(deliveredEvents.filter(event => event.event_name === 'ViewContent').length, 1);
         assert.equal(deliveredEvents.filter(event => event.event_name === 'Purchase').length, 1);
         assert.ok(metaRequests.every(request => request.authorization === `Bearer ${metaToken}`));
-        assert.ok(metaRequests.every(request => request.url === `/v25.0/${metaPixelId}/events`));
+        assert.ok(metaRequests.every(request => request.url === `/v26.0/${metaPixelId}/events`));
         assert.ok(metaRequests.every(request => request.body.test_event_code === 'TEST-E2E'));
     } catch (error) {
         let ledgerDiagnostics = [];

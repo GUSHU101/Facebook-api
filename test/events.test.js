@@ -1250,7 +1250,7 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
 
     const malformedApiVersion = probeConfig({ FB_API_VERSION: '../latest' });
     assert.notEqual(malformedApiVersion.status, 0);
-    assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v25\.0/);
+    assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v26\.0/);
 
     const productionMetaProxy = probeConfig({
         NODE_ENV: 'production',
