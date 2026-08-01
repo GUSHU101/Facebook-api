@@ -248,6 +248,20 @@ worker restarted.
 63. Worker health heartbeats are single-flight and a graceful Worker shutdown
     waits for the current heartbeat before closing Redis. A slow Redis command
     cannot create overlapping heartbeat promises or race connection teardown.
+64. Dataset Quality requests use Meta's current `fields=web{...}` contract.
+    Official `event_match_quality.composite_score` and its feedback objects are
+    retained; a valid v26 response cannot be misclassified as empty merely
+    because the parser expected a legacy score property.
+65. `partner_agent` is emitted only at the CAPI request-body root and only when
+    an operator configures the identifier agreed with Meta. Dataset Quality's
+    optional `agent_name` filter is separately validated and normalized.
+66. Shopify customer lifecycle is mapped only to Meta's documented
+    `custom_data.customer_segmentation` values. Unknown lifecycle values and
+    invalid segmentation enums are removed before transport.
+67. Browser advanced matching initializes each Dataset once with normalized
+    customer values from Shopify's event/init context. Pixel performs browser
+    hashing; CAPI sends the corresponding SHA-256 values, while tenant-scoped
+    `external_id` prevents cross-shop collision on a shared Dataset.
 
 ## Storefront ingestion abuse boundary
 
@@ -413,6 +427,18 @@ Before production rollout, verify all of the following in a staging stack:
 41. Start Dataset Quality refresh while a shared-Pixel delivery owns the
     credential lease. The refresh must defer rather than bypassing the lease,
     and both paths must honor the same persisted cooldown and usage state.
+42. Return a Dataset Quality v26 payload whose only EMQ score property is
+    `event_match_quality.composite_score`. The snapshot must be `SUCCESS`, must
+    retain feedback/coverage/freshness/ACR, and must not fall back to `EMPTY`.
+43. Configure `META_PARTNER_AGENT` and inspect a real Meta transport request.
+    It must appear once beside `data`, never inside a ServerEvent; with the
+    variable empty, the property must be absent.
+44. Trigger a first-order checkout with customer fields. Browser Pixel init
+    must receive normalized advanced-matching values, CAPI must receive their
+    hashes, and both channels must share the identical store-scoped event ID.
+45. Trigger AddToCart, InitiateCheckout, PageView, and Search. Browser and CAPI
+    must retain `num_items` only for InitiateCheckout and `search_string` only
+    for Search.
 
 ## Official references used
 
@@ -428,6 +454,12 @@ Before production rollout, verify all of the following in a staging stack:
   https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/customer-information-parameters
 - Meta custom data parameters:
   https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/custom-data
+- Meta Dataset Quality API:
+  https://developers.facebook.com/documentation/ads-commerce/conversions-api/dataset-quality-api
+- Meta platform setup and `partner_agent`:
+  https://developers.facebook.com/documentation/ads-commerce/conversions-api/set-up-conversions-api-as-a-platform
+- Meta Pixel advanced matching:
+  https://developers.facebook.com/docs/facebook-pixel/advanced/advanced-matching
 - Meta fbp/fbc parameters:
   https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/fbp-and-fbc
 - Meta Graph API rate limits:

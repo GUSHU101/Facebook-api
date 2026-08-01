@@ -53,6 +53,13 @@ function tenantScopedExternalId(tenantId, externalId) {
         .digest('hex');
 }
 
+function metaCustomerSegmentation(customerLifecycle) {
+    const normalized = String(customerLifecycle || '').trim().toLowerCase();
+    if (normalized === 'new_customer') return 'new_customer_to_business';
+    if (normalized === 'existing_customer') return 'existing_customer_to_business';
+    return undefined;
+}
+
 function buildCustomData(payload = {}, commerceItemLimit = 1000) {
     const itemLimit = Math.max(1, Number(commerceItemLimit) || 1000);
     const contents = Array.isArray(payload.contents)
@@ -99,6 +106,8 @@ function buildCustomData(payload = {}, commerceItemLimit = 1000) {
             payload.order_id,
         ),
         search_string: payload.search_string,
+        // Meta documents this inside custom_data, not at the ServerEvent root.
+        customer_segmentation: metaCustomerSegmentation(payload.customer_lifecycle),
     });
 }
 
@@ -122,6 +131,7 @@ module.exports = {
     compactObject,
     firstPresent,
     missingCommerceSignals,
+    metaCustomerSegmentation,
     normalizeEventId,
     normalizeShopifyId,
     stripPrivateFields,

@@ -14,6 +14,7 @@ process.env.ADMIN_PASSWORD ||= 'password';
 
 const {
     buildCustomData,
+    metaCustomerSegmentation,
     missingCommerceSignals,
     normalizeEventId,
     stripPrivateFields,
@@ -46,6 +47,10 @@ const {
     sanitizeMetaUserData,
     validateMetaEvent,
 } = require('../src/platforms/meta');
+const {
+    buildMetaQualityRequestParams,
+    summarizeMetaQuality,
+} = require('../src/platforms/meta-quality');
 const {
     classifyFacebookError,
     metaRateControlFromHeaders,
@@ -114,6 +119,49 @@ test('external IDs are stable within a shop and isolated across shops sharing a 
         tenantScopedIdentifier('alpha.myshopify.com', 'same-event'),
         tenantScopedIdentifier('beta.myshopify.com', 'same-event'),
     );
+});
+
+test('Meta Dataset Quality requests and composite scores follow the current official contract', () => {
+    assert.deepEqual(buildMetaQualityRequestParams('1234567890'), {
+        dataset_id: '1234567890',
+        fields: 'web{event_name,event_match_quality,event_coverage,dedup_key_feedback,data_freshness,acr}',
+    });
+    assert.deepEqual(buildMetaQualityRequestParams('1234567890', 'DataPartner'), {
+        dataset_id: '1234567890',
+        fields: 'web{event_name,event_match_quality,event_coverage,dedup_key_feedback,data_freshness,acr}',
+        agent_name: 'datapartner',
+    });
+
+    const summary = summarizeMetaQuality({
+        web: [{
+            event_name: 'Purchase',
+            event_match_quality: {
+                composite_score: 8.7,
+                match_key_feedback: [{ match_key: 'em', status: 'GOOD' }],
+            },
+            event_coverage: { coverage: 0.91 },
+            dedup_key_feedback: { event_id: 'GOOD' },
+            data_freshness: { delay_seconds: 4 },
+            acr: { score: 0.8 },
+        }],
+    });
+    assert.equal(summary.average_score, 8.7);
+    assert.equal(summary.events[0].event_name, 'Purchase');
+    assert.equal(summary.events[0].score, 8.7);
+    assert.deepEqual(summary.events[0].match_key_feedback, [{ match_key: 'em', status: 'GOOD' }]);
+    assert.deepEqual(summary.events[0].dedup_key_feedback, { event_id: 'GOOD' });
+});
+
+test('customer lifecycle is sent only as Meta custom_data customer_segmentation', () => {
+    assert.equal(metaCustomerSegmentation('new_customer'), 'new_customer_to_business');
+    assert.equal(metaCustomerSegmentation('existing_customer'), 'existing_customer_to_business');
+    assert.equal(metaCustomerSegmentation('unknown'), undefined);
+    assert.equal(buildCustomData({ customer_lifecycle: 'new_customer' }).customer_segmentation, 'new_customer_to_business');
+    assert.equal(
+        sanitizeMetaCustomData({ customer_segmentation: 'existing_customer_to_business' }, 'Purchase').customer_segmentation,
+        'existing_customer_to_business',
+    );
+    assert.equal(sanitizeMetaCustomData({ customer_segmentation: 'invented' }, 'Purchase').customer_segmentation, undefined);
 });
 
 test('attribution cache cannot leak customer or checkout identity across browser sessions', () => {
@@ -1278,7 +1326,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
     assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
     assert.match(serverSource, /tenant_id: shopDomain/);
-    assert.doesNotMatch(serverSource, /customer_segmentation/);
+    assert.match(serverSource, /buildCustomData\(enrichedPayload, config\.commerceItemLimit\)/);
     assert.match(serverSource, /customer_lifecycle: enrichedPayload\.customer_lifecycle/);
     assert.match(serverSource, /order_identity: eventName === 'Purchase'/);
     assert.match(serverSource, /GROUP BY shop_id, order_identity/);
@@ -1410,6 +1458,14 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
     const malformedApiVersion = probeConfig({ FB_API_VERSION: '../latest' });
     assert.notEqual(malformedApiVersion.status, 0);
     assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v26\.0/);
+
+    const malformedPartnerAgent = probeConfig({ META_PARTNER_AGENT: 'not allowed/value' });
+    assert.notEqual(malformedPartnerAgent.status, 0);
+    assert.match(malformedPartnerAgent.stderr, /META_PARTNER_AGENT must contain 1-100/);
+
+    const normalizedQualityAgent = probeConfig({ META_QUALITY_AGENT_NAME: 'DataPartner' });
+    assert.equal(normalizedQualityAgent.status, 0, normalizedQualityAgent.stderr);
+    assert.equal(JSON.parse(normalizedQualityAgent.stdout).metaQualityAgentName, 'datapartner');
 
     const productionMetaProxy = probeConfig({
         NODE_ENV: 'production',
@@ -1568,6 +1624,7 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.equal(generated.includes('MAX_BATCH_EVENTS'), true);
     assert.equal(generated.includes('requeueFailedEvents'), true);
     assert.equal(generated.includes('sendDualChannelEvent'), true);
+    assert.equal(generated.includes('metaBrowserAdvancedMatching'), true);
     assert.equal(generated.includes('sendGatewayEvent'), false);
     assert.equal(generated.includes('trackSingleCustom'), true);
     assert.equal(generated.includes("var options = { eventID: String(eventId) }"), true);
@@ -1854,7 +1911,7 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v17');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v18');
     assert.equal(sentEvents[0].source_provider, 'shopify_web_pixels');
     assert.equal(sentEvents[0].source_event_id, 'shopify-event-1');
     assert.equal(generated.includes('getOrCreateTtp'), false);
@@ -1896,6 +1953,10 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     const metaInitCalls = metaQueue.filter(call => call[0] === 'init');
     const metaTrackCalls = metaQueue.filter(call => call[0] === 'trackSingle' || call[0] === 'trackSingleCustom');
     assert.deepEqual(metaInitCalls.map(call => call[1]).sort(), ['1234567890', '2222222222']);
+    assert.ok(metaInitCalls.every(call => call.length === 3));
+    assert.ok(metaInitCalls.every(call => call[2].em === 'buyer@example.com'));
+    assert.ok(metaInitCalls.every(call => call[2].ph === '12125551212'));
+    assert.ok(metaInitCalls.every(call => call[2].external_id === 'demo.myshopify.com:client-1'));
     assert.equal(metaTrackCalls.length, 10);
     assert.deepEqual([...new Set(metaTrackCalls.map(call => call[1]))].sort(), ['1234567890', '2222222222']);
     metaTrackCalls.forEach(call => {
@@ -1906,6 +1967,12 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.ok(browserPurchase.every(call => call[0] === 'trackSingle'));
     assert.ok(browserPurchase.every(call => call[3].value === 46 && call[3].currency === 'USD'));
     assert.ok(browserPurchase.every(call => call[3].order_id === 'demo.myshopify.com:987'));
+    assert.ok(browserPurchase.every(call => call[3].customer_segmentation === 'new_customer_to_business'));
+    assert.ok(browserPurchase.every(call => call[3].num_items === undefined));
+    assert.equal(sandbox.metaBrowserCustomData({ num_items: 3 }, 'AddToCart').num_items, undefined);
+    assert.equal(sandbox.metaBrowserCustomData({ num_items: 3 }, 'InitiateCheckout').num_items, 3);
+    assert.equal(sandbox.metaBrowserCustomData({ search_string: 'boots' }, 'PageView').search_string, undefined);
+    assert.equal(sandbox.metaBrowserCustomData({ search_string: 'boots' }, 'Search').search_string, 'boots');
     const browserCheckoutContact = metaTrackCalls.filter(call => call[2] === 'CheckoutContactInfoSubmitted');
     assert.ok(browserCheckoutContact.every(call => call[0] === 'trackSingleCustom'));
 
@@ -2392,6 +2459,8 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(installer, /DB_PASSWORD is required when FORCE_ENV_REWRITE=1/);
     assert.match(installer, /AES_SECRET_KEY is required when FORCE_ENV_REWRITE=1/);
     assert.match(installer, /SHOPIFY_APP_SECRET="\$\{SHOPIFY_APP_SECRET:-\}"/);
+    assert.match(installer, /META_PARTNER_AGENT="\$\{META_PARTNER_AGENT:-\}"/);
+    assert.match(installer, /META_QUALITY_AGENT_NAME=\$\{META_QUALITY_AGENT_NAME\}/);
     assert.match(installer, /SHOPIFY_PRIVACY_RETENTION_DAYS=30/);
     assert.match(installer, /ALTER DATABASE .* OWNER TO/);
     assert.match(installer, /ALTER TABLE %I\.%I OWNER TO %I/);

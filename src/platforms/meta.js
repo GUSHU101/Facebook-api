@@ -7,6 +7,10 @@ const ACTION_SOURCES = new Set([
     'email', 'website', 'app', 'phone_call', 'chat', 'physical_store',
     'system_generated', 'business_messaging', 'other',
 ]);
+const CUSTOMER_SEGMENTATION_VALUES = new Set([
+    'new_customer_to_business',
+    'existing_customer_to_business',
+]);
 function normalizeMetaCookie(value) {
     const normalized = String(value || '').trim();
     return META_COOKIE_PATTERN.test(normalized) ? normalized : undefined;
@@ -60,6 +64,9 @@ function sanitizeMetaCustomData(customData = {}, eventName) {
 
     if (eventName !== 'InitiateCheckout') delete output.num_items;
     if (eventName !== 'Search') delete output.search_string;
+    if (!CUSTOMER_SEGMENTATION_VALUES.has(output.customer_segmentation)) {
+        delete output.customer_segmentation;
+    }
     return output;
 }
 

@@ -93,6 +93,15 @@ function readFacebookApiVersion() {
     return value;
 }
 
+function readOptionalMetaIdentifier(name, { lowercase = false } = {}) {
+    const raw = String(process.env[name] || '').trim();
+    if (!raw) return '';
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(raw)) {
+        throw new Error(`${name} must contain 1-100 letters, numbers, dots, underscores, or hyphens`);
+    }
+    return lowercase ? raw.toLowerCase() : raw;
+}
+
 function readFacebookGraphBaseUrl(isProduction) {
     const raw = String(process.env.FB_GRAPH_BASE_URL || 'https://graph.facebook.com').trim();
     let parsed;
@@ -210,6 +219,10 @@ module.exports = {
     shopifyReconcileMaxOrders: readBoundedInt('SHOPIFY_RECONCILE_MAX_ORDERS', 1000, 10000),
     shopifyReconcileMaxLineItemPages: readBoundedInt('SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES', 100, 1000),
     fbApiVersion: readFacebookApiVersion(),
+    // Use only an identifier agreed with Meta. Leaving this empty omits the
+    // platform attribution field instead of inventing an unrecognized agent.
+    metaPartnerAgent: readOptionalMetaIdentifier('META_PARTNER_AGENT'),
+    metaQualityAgentName: readOptionalMetaIdentifier('META_QUALITY_AGENT_NAME', { lowercase: true }),
     facebookGraphBaseUrl: readFacebookGraphBaseUrl(production),
     corsOrigin: readCorsOrigin(),
     jsonLimit: readJsonLimit(),
