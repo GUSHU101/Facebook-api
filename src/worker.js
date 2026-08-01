@@ -624,7 +624,7 @@ async function postFacebookBatch(pixel, token, dbEvents) {
     const requestBody = { data: finalEvents };
     if (pixel.test_event_code) requestBody.test_event_code = pixel.test_event_code;
 
-    const url = `https://graph.facebook.com/${config.fbApiVersion}/${pixel.pixel_id}/events`;
+    const url = `${config.facebookGraphBaseUrl}/${config.fbApiVersion}/${pixel.pixel_id}/events`;
     await reserveCredentialRequest(pixel.credential_scope);
     const response = await axios.post(
         url,

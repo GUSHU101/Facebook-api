@@ -1252,6 +1252,19 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
     assert.notEqual(malformedApiVersion.status, 0);
     assert.match(malformedApiVersion.stderr, /FB_API_VERSION must look like v25\.0/);
 
+    const productionMetaProxy = probeConfig({
+        NODE_ENV: 'production',
+        ADMIN_PASSWORD: 'production-password-strong',
+        INGEST_TOKEN_SECRET: 'separate-ingest-secret-with-32-characters',
+        FB_GRAPH_BASE_URL: 'http://127.0.0.1:39999',
+    });
+    assert.notEqual(productionMetaProxy.status, 0);
+    assert.match(productionMetaProxy.stderr, /official HTTPS endpoint in production/);
+
+    const testMetaLoopback = probeConfig({ FB_GRAPH_BASE_URL: 'http://127.0.0.1:39999/' });
+    assert.equal(testMetaLoopback.status, 0, testMetaLoopback.stderr);
+    assert.equal(JSON.parse(testMetaLoopback.stdout).facebookGraphBaseUrl, 'http://127.0.0.1:39999');
+
     const malformedShopifyVersion = probeConfig({ SHOPIFY_API_VERSION: 'latest' });
     assert.notEqual(malformedShopifyVersion.status, 0);
     assert.match(malformedShopifyVersion.stderr, /SHOPIFY_API_VERSION must look like 2026-07/);

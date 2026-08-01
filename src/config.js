@@ -93,6 +93,27 @@ function readFacebookApiVersion() {
     return value;
 }
 
+function readFacebookGraphBaseUrl(isProduction) {
+    const raw = String(process.env.FB_GRAPH_BASE_URL || 'https://graph.facebook.com').trim();
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    } catch (error) {
+        throw new Error('FB_GRAPH_BASE_URL must be a valid URL');
+    }
+    const loopback = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
+    const officialProductionEndpoint = parsed.protocol === 'https:'
+        && parsed.hostname === 'graph.facebook.com'
+        && (!parsed.port || parsed.port === '443');
+    if (parsed.username || parsed.password || parsed.search || parsed.hash
+        || (isProduction && !officialProductionEndpoint)
+        || (!isProduction && parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback))) {
+        throw new Error('FB_GRAPH_BASE_URL must use the official HTTPS endpoint in production; tests may use HTTP loopback');
+    }
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+    return parsed.toString().replace(/\/$/, '');
+}
+
 function readShopifyApiVersion() {
     const value = String(process.env.SHOPIFY_API_VERSION || '2026-07').trim();
     if (!/^\d{4}-(01|04|07|10)$/.test(value)) {
@@ -189,6 +210,7 @@ module.exports = {
     shopifyReconcileMaxOrders: readBoundedInt('SHOPIFY_RECONCILE_MAX_ORDERS', 1000, 10000),
     shopifyReconcileMaxLineItemPages: readBoundedInt('SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES', 100, 1000),
     fbApiVersion: readFacebookApiVersion(),
+    facebookGraphBaseUrl: readFacebookGraphBaseUrl(production),
     corsOrigin: readCorsOrigin(),
     jsonLimit: readJsonLimit(),
     commerceItemLimit: readBoundedInt('COMMERCE_ITEM_LIMIT', 1000, 5000),

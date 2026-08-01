@@ -3963,9 +3963,9 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
              )
              SELECT shop_id,
                     $2,
-                    $3,
+                    $3::varchar(100),
                     CASE
-                        WHEN $3::text IS NOT NULL
+                        WHEN $3::varchar(100) IS NOT NULL
                             THEN NOW() + ($4::int * INTERVAL '1 minute')
                         ELSE NULL
                     END

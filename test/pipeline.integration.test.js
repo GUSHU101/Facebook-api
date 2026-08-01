@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const http = require('node:http');
 const { spawn } = require('node:child_process');
 const { Pool } = require('pg');
 
@@ -35,6 +36,291 @@ async function waitForStatus(url, expectedStatus, child) {
     }
     throw new Error(`server did not return HTTP ${expectedStatus}`);
 }
+
+async function waitForCondition(check, description, timeoutMs = 20_000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastValue;
+    while (Date.now() < deadline) {
+        lastValue = await check();
+        if (lastValue) return lastValue;
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error(`timed out waiting for ${description}; last value=${JSON.stringify(lastValue)}`);
+}
+
+async function stopChild(child) {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGTERM');
+    await Promise.race([
+        new Promise(resolve => child.once('exit', resolve)),
+        new Promise(resolve => setTimeout(resolve, 5000)),
+    ]);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+}
+
+test('storefront ingestion reaches the real worker, Meta transport, ledger, and paid Purchase merge', { skip: !enabled }, async () => {
+    const apiPort = Number(process.env.INTEGRATION_DELIVERY_PORT || 39093);
+    const apiOrigin = `http://127.0.0.1:${apiPort}`;
+    const suffix = crypto.randomUUID();
+    const shopDomain = `delivery-${suffix}.myshopify.com`;
+    const appSecret = `delivery_webhook_secret_${crypto.randomBytes(18).toString('hex')}`;
+    const metaPixelId = `9${Date.now()}${Math.floor(Math.random() * 10000)}`;
+    const metaToken = `integration-meta-token-${suffix}`;
+    const metaRequests = [];
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const fakeMeta = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const rawBody = Buffer.concat(chunks).toString('utf8');
+            const body = JSON.parse(rawBody || '{}');
+            metaRequests.push({
+                method: req.method,
+                url: req.url,
+                authorization: req.headers.authorization,
+                body,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                events_received: Array.isArray(body.data) ? body.data.length : 0,
+                fbtrace_id: `trace-${metaRequests.length}`,
+            }));
+        });
+    });
+    await new Promise((resolve, reject) => {
+        fakeMeta.once('error', reject);
+        fakeMeta.listen(0, '127.0.0.1', resolve);
+    });
+    const metaPort = fakeMeta.address().port;
+    const runtimeEnv = {
+        ...process.env,
+        NODE_ENV: 'test',
+        PORT: String(apiPort),
+        FB_GRAPH_BASE_URL: `http://127.0.0.1:${metaPort}`,
+        REQUIRE_WORKER_HEARTBEAT: 'false',
+        PURCHASE_SETTLE_MS: '50',
+        BATCH_CRON: '*/1 * * * * *',
+        WATCHDOG_CRON: '*/1 * * * * *',
+        SHOPIFY_WEBHOOK_INBOX_CRON: '*/1 * * * * *',
+        SHOP_CONTINUATION_DELAY_MS: '25',
+    };
+    const cwd = require('node:path').join(__dirname, '..');
+    const server = spawn(process.execPath, ['src/server.js'], {
+        cwd,
+        env: runtimeEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const worker = spawn(process.execPath, ['src/worker.js'], {
+        cwd,
+        env: runtimeEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let diagnostics = '';
+    for (const child of [server, worker]) {
+        child.stdout.on('data', chunk => { diagnostics += chunk.toString(); });
+        child.stderr.on('data', chunk => { diagnostics += chunk.toString(); });
+    }
+    const authorization = `Basic ${Buffer.from(
+        `${process.env.ADMIN_USERNAME}:${process.env.ADMIN_PASSWORD}`,
+    ).toString('base64')}`;
+    const adminHeaders = {
+        Authorization: authorization,
+        'Content-Type': 'application/json',
+        'X-CAPI-Admin-Request': '1',
+    };
+    let shopId;
+    let pixelId;
+    try {
+        await waitForReady(`${apiOrigin}/readyz`, server);
+
+        const rejectedAdminMutation = await fetch(`${apiOrigin}/api/admin/shops`, {
+            method: 'POST',
+            headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ shop_domain: shopDomain, app_secret: appSecret }),
+        });
+        assert.equal(rejectedAdminMutation.status, 403);
+
+        const shopResponse = await fetch(`${apiOrigin}/api/admin/shops`, {
+            method: 'POST',
+            headers: adminHeaders,
+            body: JSON.stringify({ shop_domain: shopDomain, app_secret: appSecret }),
+        });
+        assert.equal(shopResponse.status, 201, await shopResponse.text());
+        const shopsResponse = await fetch(`${apiOrigin}/api/admin/shops`, {
+            headers: { Authorization: authorization },
+        });
+        const shopsBody = await shopsResponse.json();
+        assert.equal(shopsResponse.status, 200, JSON.stringify(shopsBody));
+        const shop = shopsBody.find(item => item.shop_domain === shopDomain);
+        assert.ok(shop?.id);
+        assert.match(shop.ingest_token, /^[a-f0-9]{64}$/);
+        shopId = Number(shop.id);
+
+        const pixelResponse = await fetch(`${apiOrigin}/api/admin/pixels`, {
+            method: 'POST',
+            headers: adminHeaders,
+            body: JSON.stringify({
+                shop_id: shopId,
+                shop_ids: [shopId],
+                platform: 'facebook',
+                name: 'integration-meta',
+                pixel_id: metaPixelId,
+                access_token: metaToken,
+                test_event_code: 'TEST-E2E',
+            }),
+        });
+        assert.equal(pixelResponse.ok, true, await pixelResponse.text());
+        ({ rows: [{ id: pixelId }] } = await pool.query(
+            'SELECT id FROM pixels WHERE platform = $1 AND pixel_id = $2',
+            ['facebook', metaPixelId],
+        ));
+
+        const eventHeaders = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'CAPI-E2E/1.0',
+            'X-CAPI-Ingest-Token': shop.ingest_token,
+        };
+        const commonEvent = {
+            shop_domain: shopDomain,
+            schema_version: '2.0',
+            source_version: 'shopify-pixel-v17',
+            source_provider: 'shopify_web_pixels',
+            timestamp: new Date().toISOString(),
+            url: `https://${shopDomain}/products/integration?utm_source=e2e&email=remove@example.com`,
+            client_id: `client-${suffix}`,
+        };
+        const invalidMapping = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST',
+            headers: eventHeaders,
+            body: JSON.stringify({
+                ...commonEvent,
+                event_name: 'AddToCart',
+                event_id: `${shopDomain}:invalid-mapping`,
+                source_event_name: 'page_viewed',
+            }),
+        });
+        assert.equal(invalidMapping.status, 422, await invalidMapping.text());
+
+        const pageViewId = `${shopDomain}:page-${suffix}`;
+        const pageViewPayload = {
+            ...commonEvent,
+            event_name: 'PageView',
+            event_id: pageViewId,
+            source_event_name: 'page_viewed',
+            source_event_id: `source-page-${suffix}`,
+        };
+        const firstIngest = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST', headers: eventHeaders, body: JSON.stringify(pageViewPayload),
+        });
+        assert.equal(firstIngest.status, 202, await firstIngest.text());
+        const duplicateIngest = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST', headers: eventHeaders, body: JSON.stringify(pageViewPayload),
+        });
+        assert.ok([200, 202].includes(duplicateIngest.status), await duplicateIngest.text());
+
+        const pageViewLedger = await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT event.status, event.request_payload, delivery.status AS delivery_status,
+                        delivery.response_payload
+                 FROM event_store event
+                 JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 WHERE event.shop_id = $1 AND event.event_name = 'PageView' AND event.event_id = $2`,
+                [shopId, pageViewId],
+            );
+            return rows[0]?.status === 'SUCCESS' ? rows[0] : null;
+        }, 'PageView SUCCESS ledger');
+        assert.equal(pageViewLedger.delivery_status, 'SUCCESS');
+        assert.equal(pageViewLedger.response_payload.accepted_event, true);
+        assert.doesNotMatch(pageViewLedger.request_payload.event_source_url, /email=/i);
+
+        const checkoutToken = `checkout-${suffix}`;
+        const purchaseId = `${shopDomain}:${checkoutToken}`;
+        const browserPurchase = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST',
+            headers: eventHeaders,
+            body: JSON.stringify({
+                ...commonEvent,
+                event_name: 'Purchase',
+                event_id: purchaseId,
+                source_event_name: 'checkout_completed',
+                source_event_id: `source-purchase-${suffix}`,
+                checkout_token: checkoutToken,
+                order_id: `${shopDomain}:90071992547409931234`,
+                value: 12.5,
+                currency: 'USD',
+                content_ids: ['variant-2'],
+                contents: [{ id: 'variant-2', quantity: 1, item_price: 12.5 }],
+                content_type: 'product',
+            }),
+        });
+        const browserPurchaseBody = await browserPurchase.json();
+        assert.equal(browserPurchase.status, 202, JSON.stringify(browserPurchaseBody));
+        assert.equal(browserPurchaseBody.awaiting_payment_confirmation, true);
+
+        const paidPayload = Buffer.from(JSON.stringify({
+            id: '90071992547409931234',
+            name: '#E2E',
+            source_name: 'web',
+            financial_status: 'paid',
+            processed_at: new Date().toISOString(),
+            checkout_token: checkoutToken,
+            total_price: '12.50',
+            currency: 'USD',
+            line_items: [{ id: '1', variant_id: '2', quantity: 1, price: '12.50' }],
+        }));
+        const paidHeaders = {
+            'Content-Type': 'application/json',
+            'X-Shopify-Shop-Domain': shopDomain,
+            'X-Shopify-Hmac-Sha256': crypto.createHmac('sha256', appSecret).update(paidPayload).digest('base64'),
+            'X-Shopify-Topic': 'orders/paid',
+            'X-Shopify-Webhook-Id': `paid-${suffix}`,
+            'X-Shopify-Triggered-At': new Date().toISOString(),
+        };
+        for (let replay = 0; replay < 2; replay += 1) {
+            const paidResponse = await fetch(`${apiOrigin}/api/webhook/orders/paid`, {
+                method: 'POST', headers: paidHeaders, body: paidPayload,
+            });
+            assert.equal(paidResponse.status, 200, await paidResponse.text());
+        }
+
+        const purchaseLedger = await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT event.status, event.request_payload, delivery.status AS delivery_status,
+                        delivery.response_payload
+                 FROM event_store event
+                 JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 WHERE event.shop_id = $1 AND event.event_name = 'Purchase' AND event.event_id = $2`,
+                [shopId, purchaseId],
+            );
+            return rows[0]?.status === 'SUCCESS' ? rows[0] : null;
+        }, 'paid Purchase SUCCESS ledger', 30_000);
+        assert.equal(purchaseLedger.delivery_status, 'SUCCESS');
+        assert.equal(purchaseLedger.request_payload._payment_confirmed, true);
+        assert.equal(purchaseLedger.response_payload.accepted_event, true);
+
+        const deliveredEvents = metaRequests.flatMap(request => request.body.data || []);
+        assert.equal(deliveredEvents.filter(event => event.event_name === 'PageView').length, 1);
+        assert.equal(deliveredEvents.filter(event => event.event_name === 'Purchase').length, 1);
+        assert.ok(metaRequests.every(request => request.authorization === `Bearer ${metaToken}`));
+        assert.ok(metaRequests.every(request => request.url === `/v25.0/${metaPixelId}/events`));
+        assert.ok(metaRequests.every(request => request.body.test_event_code === 'TEST-E2E'));
+    } catch (error) {
+        error.message = `${error.message}\nRuntime diagnostics:\n${diagnostics}\nMeta requests:\n${JSON.stringify(metaRequests, null, 2)}`;
+        throw error;
+    } finally {
+        await stopChild(server);
+        await stopChild(worker);
+        await new Promise(resolve => fakeMeta.close(resolve));
+        if (shopId) {
+            await pool.query('DELETE FROM event_store WHERE shop_id = $1', [shopId]).catch(() => {});
+            await pool.query('DELETE FROM shopify_webhook_inbox WHERE shop_id = $1', [shopId]).catch(() => {});
+            await pool.query('DELETE FROM shop_pixel_routes WHERE shop_id = $1', [shopId]).catch(() => {});
+        }
+        if (pixelId) await pool.query('DELETE FROM pixels WHERE id = $1', [pixelId]).catch(() => {});
+        if (shopId) await pool.query('DELETE FROM shops WHERE id = $1', [shopId]).catch(() => {});
+        await pool.end().catch(() => {});
+    }
+});
 
 test('HTTP webhook replay is durably deduplicated before BullMQ dispatch', { skip: !enabled }, async () => {
     const port = Number(process.env.INTEGRATION_TEST_PORT || 39091);
