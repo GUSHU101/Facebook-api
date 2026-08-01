@@ -329,6 +329,31 @@
                             </tbody>
                         </table>
                     </div></div>
+                    <div class="mt-4">
+                        <div class="font-semibold">Facebook 逐 Pixel 收件对账</div>
+                        <div class="text-xs text-slate-500 mt-1">每一行只比较同一店铺、同一 Facebook Pixel 和同一 Shopify 动作。应投递与 API 收件应最终达到 1:1；这里不把浏览器+CAPI 去重前总量或广告归因数混入。</div>
+                        <div class="table-shell mt-3"><div class="table-scroll">
+                            <table class="data-table text-xs">
+                                <thead class="text-left"><tr><th>店铺</th><th>Pixel</th><th>事件</th><th>应投递</th><th>API 收件</th><th>等待</th><th>缺失账本</th><th>永久失败</th><th>本地校验</th><th>差额</th><th>收件率</th></tr></thead>
+                                <tbody>
+                                    <tr v-for="item in summary.last24h?.meta_receipt_reconciliation || []" :key="[item.shop_id, item.pixel_id, item.event_name].join(':')">
+                                        <td class="font-mono">{{ item.shop_domain }}</td>
+                                        <td><span class="font-semibold">{{ item.pixel_name }}</span><br><span class="font-mono text-slate-500">{{ item.pixel_id }}</span></td>
+                                        <td class="font-mono font-semibold">{{ item.event_name }}</td>
+                                        <td>{{ item.expected_deliveries || 0 }}</td>
+                                        <td class="font-semibold text-emerald-700">{{ item.receipt_acknowledged || 0 }}</td>
+                                        <td :class="Number(item.pending_deliveries || 0) ? 'text-amber-700 font-semibold' : 'text-slate-500'">{{ item.pending_deliveries || 0 }}</td>
+                                        <td :class="Number(item.missing_delivery_ledger || 0) ? 'text-red-600 font-semibold' : 'text-slate-500'">{{ item.missing_delivery_ledger || 0 }}</td>
+                                        <td :class="Number(item.failed_deliveries || 0) ? 'text-red-600 font-semibold' : 'text-slate-500'">{{ item.failed_deliveries || 0 }}</td>
+                                        <td :class="Number(item.locally_invalid_deliveries || 0) ? 'text-red-600 font-semibold' : 'text-slate-500'">{{ item.locally_invalid_deliveries || 0 }}</td>
+                                        <td :class="Number(item.receipt_gap || 0) ? (Number(item.failed_deliveries || 0) ? 'text-red-600 font-semibold' : 'text-amber-700 font-semibold') : 'text-emerald-700 font-semibold'">{{ item.receipt_gap || 0 }}</td>
+                                        <td>{{ formatPercent(item.receipt_rate) }}</td>
+                                    </tr>
+                                    <tr v-if="!(summary.last24h?.meta_receipt_reconciliation || []).length"><td colspan="11" class="table-empty">最近 24 小时没有可对账的 Facebook 漏斗路由。</td></tr>
+                                </tbody>
+                            </table>
+                        </div></div>
+                    </div>
                     <div class="grid md:grid-cols-3 xl:grid-cols-6 gap-3 mt-4">
                         <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">Shopify 已付款订单</div><div class="text-xl font-semibold">{{ summary.last24h?.shopify_paid_orders?.observed_paid_orders || 0 }}</div></div>
                         <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">符合网站来源</div><div class="text-xl font-semibold text-emerald-700">{{ summary.last24h?.shopify_paid_orders?.eligible_web_paid_orders || 0 }}</div></div>

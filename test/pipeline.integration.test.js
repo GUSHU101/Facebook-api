@@ -443,6 +443,23 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         assert.ok(metaRequests.every(request => request.url === `/v26.0/${metaPixelId}/events`));
         assert.ok(metaRequests.every(request => request.body.test_event_code === 'TEST-E2E'));
         assert.ok(metaRequests.every(request => request.body.partner_agent === 'capi_saas_hub_test'));
+
+        const summaryResponse = await fetch(`${apiOrigin}/api/admin/summary?shop_id=${shopId}`, {
+            headers: { Authorization: authorization },
+        });
+        const summaryBody = await summaryResponse.json();
+        assert.equal(summaryResponse.status, 200, JSON.stringify(summaryBody));
+        const purchaseReceipt = summaryBody.last24h.meta_receipt_reconciliation.find(item => (
+            item.event_name === 'Purchase' && item.pixel_id === metaPixelId
+        ));
+        assert.ok(purchaseReceipt, JSON.stringify(summaryBody.last24h.meta_receipt_reconciliation));
+        assert.equal(purchaseReceipt.expected_deliveries, 1);
+        assert.equal(purchaseReceipt.receipt_acknowledged, 1);
+        assert.equal(purchaseReceipt.pending_deliveries, 0);
+        assert.equal(purchaseReceipt.missing_delivery_ledger, 0);
+        assert.equal(purchaseReceipt.failed_deliveries, 0);
+        assert.equal(purchaseReceipt.receipt_gap, 0);
+        assert.equal(purchaseReceipt.receipt_rate, 100);
     } catch (error) {
         let ledgerDiagnostics = [];
         if (shopId) {
