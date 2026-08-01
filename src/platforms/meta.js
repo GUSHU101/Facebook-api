@@ -1,4 +1,5 @@
 const net = require('node:net');
+const { FUNNEL_EVENT_NAME_SET } = require('../events/funnel');
 
 const HASHED_USER_FIELDS = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'];
 const META_COOKIE_PATTERN = /^fb\.\d+\.\d{13}\.[^\s]+$/;
@@ -6,18 +7,6 @@ const ACTION_SOURCES = new Set([
     'email', 'website', 'app', 'phone_call', 'chat', 'physical_store',
     'system_generated', 'business_messaging', 'other',
 ]);
-const CUSTOMER_SEGMENTS = new Set([
-    'new_customer_to_business',
-    'new_customer_to_business_line',
-    'new_customer_to_product_area',
-    'new_customer_to_medium',
-    'existing_customer_to_business',
-    'existing_customer_to_business_line',
-    'existing_customer_to_product_area',
-    'existing_customer_to_medium',
-    'customer_in_loyalty_program',
-]);
-
 function normalizeMetaCookie(value) {
     const normalized = String(value || '').trim();
     return META_COOKIE_PATTERN.test(normalized) ? normalized : undefined;
@@ -88,10 +77,6 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
     if (!String(event.event_name || '').trim()) errors.push('event_name is required');
     if (!String(event.event_id || '').trim()) errors.push('event_id is required');
     if (!ACTION_SOURCES.has(event.action_source)) errors.push('action_source is required and must be valid');
-    if (event.customer_segmentation !== undefined
-        && !CUSTOMER_SEGMENTS.has(event.customer_segmentation)) {
-        errors.push('customer_segmentation must be a supported Meta segment');
-    }
     if (event.opt_out !== undefined && typeof event.opt_out !== 'boolean') {
         errors.push('opt_out must be boolean');
     }
@@ -149,8 +134,7 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
         }
     }
 
-    const commerceEvents = new Set(['AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase']);
-    if (commerceEvents.has(event.event_name)) {
+    if (FUNNEL_EVENT_NAME_SET.has(event.event_name)) {
         const hasValue = event.custom_data?.value !== undefined
             && event.custom_data?.value !== null
             && event.custom_data?.value !== '';

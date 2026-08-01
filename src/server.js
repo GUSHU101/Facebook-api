@@ -39,7 +39,12 @@ const {
     tenantScopedExternalId,
     tenantScopedIdentifier,
 } = require('./events/common');
-const { buildShopifyOrderPurchasePayload, paidOrderIgnoreReason } = require('./events/shopify');
+const {
+    buildShopifyOrderPurchasePayload,
+    paidOrderIgnoreReason,
+    shopifyPaymentTimestamp,
+} = require('./events/shopify');
+const { FUNNEL_EVENT_NAMES, decorateFunnelSummary } = require('./events/funnel');
 const {
     browserAttributionIdentity,
     sanitizeStoredAttribution,
@@ -110,12 +115,22 @@ app.use('/admin', adminLimiter, authMw, (req, res, next) => {
 });
 app.use('/api/admin', adminLimiter, authMw, (req, res, next) => {
     res.set('Cache-Control', 'private, no-store');
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    // HTTP Basic credentials are attached by browsers before application
+    // JavaScript runs, so Basic Auth alone does not prevent a cross-site form
+    // from triggering a state change. Every admin mutation must carry a
+    // non-simple header set by our same-origin admin client. Cross-origin forms
+    // cannot add this header, and cross-origin fetches require a CORS preflight
+    // which is intentionally not enabled for /api/admin.
+    if (req.get('X-CAPI-Admin-Request') !== '1') {
+        return res.status(403).json({ error: 'Missing admin request verification header' });
+    }
     next();
 });
 // Only storefront pixel endpoints need browser CORS. Keeping CORS off
 // admin routes prevents an unrelated website from reading authenticated admin
 // responses through a browser session that already has Basic Auth credentials.
-app.use(['/api/pixel-event', '/api/pixel-config'], cors({ origin: config.corsOrigin, credentials: false }));
+app.use(['/api/pixel-event', '/api/pixel-config', '/api/pixel-diagnostic'], cors({ origin: config.corsOrigin, credentials: false }));
 app.use(express.json({
     limit: config.jsonLimit,
     verify: (req, res, buf) => {
@@ -218,6 +233,38 @@ async function pixelLimiter(req, res, next) {
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_PIXEL_BATCH_SIZE = 50;
+const SUPPORTED_PIXEL_SCHEMA_VERSION = '2.0';
+const SUPPORTED_PIXEL_SOURCE_VERSIONS = new Set([
+    'shopify-pixel-v14',
+    'shopify-pixel-v15',
+    'shopify-pixel-v16',
+    'shopify-pixel-v17',
+]);
+const SHOPIFY_BROWSER_EVENT_SOURCES = new Map([
+    ['PageView', 'page_viewed'],
+    ['Search', 'search_submitted'],
+    ['CartView', 'cart_viewed'],
+    ['CollectionView', 'collection_viewed'],
+    ['ViewContent', 'product_viewed'],
+    ['AddToCart', 'product_added_to_cart'],
+    ['RemoveFromCart', 'product_removed_from_cart'],
+    ['InitiateCheckout', 'checkout_started'],
+    ['CheckoutContactInfoSubmitted', 'checkout_contact_info_submitted'],
+    ['CheckoutAddressInfoSubmitted', 'checkout_address_info_submitted'],
+    ['CheckoutShippingInfoSubmitted', 'checkout_shipping_info_submitted'],
+    ['AddPaymentInfo', 'payment_info_submitted'],
+    ['Purchase', 'checkout_completed'],
+]);
+const BROWSER_DIAGNOSTIC_CODES = new Set([
+    'QUEUE_OVERFLOW',
+    'RETRY_EXHAUSTED',
+    'RETRY_AGE_EXPIRED',
+    'STORAGE_READ_FAILED',
+    'STORAGE_WRITE_FAILED',
+    'SERVER_BATCH_REJECTED',
+    'SERVER_REQUEST_REJECTED',
+    'META_BROWSER_QUEUE_OVERFLOW',
+]);
 const PIXEL_CONFIG_CACHE_TTL_MS = 5000;
 const MAX_PIXEL_CONFIG_CACHE_ENTRIES = 5000;
 const pixelConfigCache = new Map();
@@ -239,17 +286,6 @@ function invalidatePixelConfigCache(shopIdsOrDomains) {
     }
 }
 const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
-const META_CUSTOMER_SEGMENTS = new Set([
-    'new_customer_to_business',
-    'new_customer_to_business_line',
-    'new_customer_to_product_area',
-    'new_customer_to_medium',
-    'existing_customer_to_business',
-    'existing_customer_to_business_line',
-    'existing_customer_to_product_area',
-    'existing_customer_to_medium',
-    'customer_in_loyalty_program',
-]);
 
 function normalizeShopDomain(domain) {
     return String(domain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -314,6 +350,18 @@ function optionalBoundedString(value, fieldName, maxLength) {
     return normalized;
 }
 
+function requireIanaTimezone(value) {
+    const timezone = requireBoundedString(value || 'UTC', 'reporting_timezone', 64);
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date(0));
+    } catch (error) {
+        const validationError = new Error('reporting_timezone must be a valid IANA timezone such as America/Los_Angeles');
+        validationError.statusCode = 400;
+        throw validationError;
+    }
+    return timezone;
+}
+
 function readOptionalShopId(req) {
     const raw = req.query.shop_id;
     if (raw === undefined || raw === null || raw === '') return null;
@@ -371,11 +419,6 @@ function normalizeActionSource(value) {
     return allowed.has(normalized) ? normalized : 'website';
 }
 
-function normalizeCustomerSegmentation(value) {
-    const normalized = String(value || '').trim().toLowerCase();
-    return META_CUSTOMER_SEGMENTS.has(normalized) ? normalized : undefined;
-}
-
 function normalizeUrl(value) {
     try {
         const parsed = new URL(String(value || '').trim());
@@ -383,9 +426,46 @@ function normalizeUrl(value) {
         parsed.username = '';
         parsed.password = '';
         parsed.hash = '';
+        // Checkout URLs and arbitrary query strings can contain customer data,
+        // session secrets or access tokens. Attribution identifiers such as
+        // fbclid/UTM parameters remain intact; known sensitive keys do not.
+        parsed.pathname = parsed.pathname.replace(/\/checkouts\/[^/]+/i, '/checkouts/redacted');
+        for (const key of [...parsed.searchParams.keys()]) {
+            if (/(?:^|_)(?:access_?token|auth|email|phone|password|secret|session|customer|first_?name|last_?name|address)(?:$|_)/i.test(key)) {
+                parsed.searchParams.delete(key);
+            }
+        }
         return parsed.toString();
     } catch (error) {
         return undefined;
+    }
+}
+
+function validateShopifyBrowserPayload(payload) {
+    const eventName = requireBoundedString(payload?.event_name, 'event_name', 50);
+    const expectedSourceEvent = SHOPIFY_BROWSER_EVENT_SOURCES.get(eventName);
+    if (!expectedSourceEvent) {
+        const error = new Error(`Unsupported storefront event_name: ${eventName}`);
+        error.statusCode = 422;
+        throw error;
+    }
+    if (payload?.source_provider !== 'shopify_web_pixels') {
+        const error = new Error('source_provider must be shopify_web_pixels');
+        error.statusCode = 422;
+        throw error;
+    }
+    if (String(payload?.source_event_name || '').trim() !== expectedSourceEvent) {
+        const error = new Error(`source_event_name must be ${expectedSourceEvent} for ${eventName}`);
+        error.statusCode = 422;
+        throw error;
+    }
+    const sourceVersion = String(payload?.source_version || '').trim();
+    const schemaVersion = String(payload?.schema_version || '').trim();
+    if (!SUPPORTED_PIXEL_SOURCE_VERSIONS.has(sourceVersion)
+        || schemaVersion !== SUPPORTED_PIXEL_SCHEMA_VERSION) {
+        const error = new Error('Unsupported storefront pixel source/schema version');
+        error.statusCode = 426;
+        throw error;
     }
 }
 
@@ -438,22 +518,56 @@ function shopDomainFromPixelBody(body) {
     return body?.shop_domain;
 }
 
+function boundedDiagnosticEventCounts(value) {
+    if (!isPayloadObject(value)) return {};
+    const result = {};
+    for (const [rawName, rawCount] of Object.entries(value).slice(0, 20)) {
+        const name = String(rawName || '').trim();
+        const count = Number(rawCount);
+        if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) continue;
+        if (!Number.isInteger(count) || count <= 0 || count > 10000) continue;
+        result[name] = count;
+    }
+    return result;
+}
+
+function boundedClientTimestamp(value) {
+    if (!value) return null;
+    const timestamp = new Date(value);
+    const milliseconds = timestamp.getTime();
+    if (!Number.isFinite(milliseconds)) return null;
+    const now = Date.now();
+    if (milliseconds < now - (7 * 24 * 60 * 60 * 1000) || milliseconds > now + (5 * 60 * 1000)) return null;
+    return timestamp;
+}
+
 function durableAliasEntries(eventName, eventId, payload) {
     if (eventName !== 'Purchase') return [];
-    const entries = [
+    const candidates = [
         ['id', eventId],
         ['checkout', payload.checkout_token],
         ['order', payload.order_id],
+        // The browser can know the immutable Shopify Order ID while its
+        // checkout token is absent. Store that ID under the same semantic
+        // alias type as order_id so a later paid webhook can bridge them.
+        ['order', payload._shopify_order_id],
         ['shopify_order', payload._shopify_order_id],
         ['cart', payload.cart_token],
     ];
+    const tenantPrefix = `${normalizeShopDomain(firstPresent(payload.tenant_id, payload.shop_domain))}:`;
+    const entries = candidates.flatMap(([type, rawValue]) => {
+        const normalized = cleanKeyPart(normalizeEventId(rawValue) || rawValue);
+        if (!normalized) return [];
+        const unscoped = tenantPrefix !== ':' && normalized.toLowerCase().startsWith(tenantPrefix)
+            ? normalized.slice(tenantPrefix.length)
+            : normalized;
+        // Keep the old scoped form as a compatibility alias so purchases
+        // already waiting in a pre-v16 deployment still merge after upgrade.
+        return [...new Set([unscoped, normalized])].map(value => ({ type, value }));
+    });
 
     const seen = new Set();
-    return entries.map(([type, rawValue]) => ({
-        type,
-        value: cleanKeyPart(normalizeEventId(rawValue) || rawValue),
-    })).filter(entry => {
-        if (!entry.value) return false;
+    return entries.filter(entry => {
         const key = `${entry.type}:${entry.value}`;
         if (seen.has(key)) return false;
         seen.add(key);
@@ -792,8 +906,17 @@ function summarizeMetaQuality(rawPayload) {
     };
 }
 
-async function insertMetaQualitySnapshot(pixel, shopId, status, rawPayload, errorMessage = null) {
-    const summary = status === 'SUCCESS' ? summarizeMetaQuality(rawPayload) : null;
+async function insertMetaQualitySnapshot(
+    pixel,
+    shopId,
+    status,
+    rawPayload,
+    errorMessage = null,
+    precomputedSummary = null,
+) {
+    const summary = precomputedSummary || (status === 'SUCCESS' || status === 'EMPTY'
+        ? summarizeMetaQuality(rawPayload)
+        : null);
     await pool.query(
         `INSERT INTO meta_quality_snapshots
             (pixel_route_id, shop_id, dataset_id, status, metric_type, summary_payload, raw_payload, error_message)
@@ -887,11 +1010,22 @@ async function refreshMetaQualityForPixel(pixel) {
                 pixel.credential_scope,
             ],
         );
-        let summary;
+        const summary = summarizeMetaQuality(rawPayload);
+        const snapshotStatus = summary.events.length ? 'SUCCESS' : 'EMPTY';
+        const emptyMessage = snapshotStatus === 'EMPTY'
+            ? 'Meta Dataset Quality returned no event-level metrics; use local signal coverage while permissions and data availability are verified'
+            : null;
         for (const shopId of shopIds) {
-            summary = await insertMetaQualitySnapshot(pixel, shopId, 'SUCCESS', rawPayload);
+            await insertMetaQualitySnapshot(
+                pixel,
+                shopId,
+                snapshotStatus,
+                rawPayload,
+                emptyMessage,
+                summary,
+            );
         }
-        return { pixel_id: pixel.pixel_id, status: 'SUCCESS', summary };
+        return { pixel_id: pixel.pixel_id, status: snapshotStatus, summary };
     } catch (error) {
         const responsePayload = error.response?.data || null;
         const classification = classifyFacebookError(error);
@@ -1369,7 +1503,37 @@ async function cleanupExpiredOperationalData() {
          WHERE target.id = expired.id`,
         config.qualityRetentionDays,
     );
-    return { eventStore, aliases, webhookInbox, privacyInbox, deadLetters, qualitySnapshots };
+    const browserDiagnostics = await deleteRetentionBatches(
+        `WITH expired AS (
+             SELECT id
+             FROM browser_delivery_diagnostics
+             WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')
+             ORDER BY created_at ASC, id ASC
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+         )
+         DELETE FROM browser_delivery_diagnostics target
+         USING expired
+         WHERE target.id = expired.id`,
+        config.browserDiagnosticRetentionDays,
+    );
+    const expiredTestCodes = await pool.query(
+        `UPDATE shop_pixel_routes
+         SET test_event_code = NULL,
+             test_event_code_expires_at = NULL
+         WHERE test_event_code IS NOT NULL
+           AND (test_event_code_expires_at IS NULL OR test_event_code_expires_at <= NOW())`,
+    );
+    return {
+        eventStore,
+        aliases,
+        webhookInbox,
+        privacyInbox,
+        deadLetters,
+        qualitySnapshots,
+        browserDiagnostics,
+        expiredTestCodes: expiredTestCodes.rowCount,
+    };
 }
 
 async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
@@ -1377,6 +1541,31 @@ async function insertMalformedQueuedEvent(shopId, rawPayload, reason) {
         `INSERT INTO dead_letters (shop_id, payload, error_reason)
          VALUES ($1, $2, $3)`,
         [shopId, JSON.stringify([{ raw_payload: rawPayload }]), reason],
+    );
+}
+
+async function insertBrowserIngestionRejection(shopId, payload, error) {
+    const diagnostic = compactObject({
+        event_name: payload?.event_name,
+        event_id: payload?.event_id,
+        source_provider: payload?.source_provider,
+        source_event_name: payload?.source_event_name,
+        source_event_id: payload?.source_event_id,
+        source_version: payload?.source_version,
+        schema_version: payload?.schema_version,
+        trace_id: payload?.trace_id,
+        supplied_fields: payload && typeof payload === 'object'
+            ? Object.keys(payload).filter(key => !['ingest_token', 'email', 'phone'].includes(key)).sort()
+            : [],
+    });
+    await pool.query(
+        `INSERT INTO dead_letters (shop_id, payload, error_reason)
+         VALUES ($1, $2, $3)`,
+        [
+            shopId,
+            JSON.stringify([{ ingestion_rejection: diagnostic }]),
+            `Browser ingestion rejected: ${String(error?.message || error).slice(0, 3900)}`,
+        ],
     );
 }
 
@@ -1528,8 +1717,20 @@ async function persistOutboxEvent(shopId, payload) {
                  LIMIT 1`,
                 [existing.id],
             )).rowCount > 0;
-        const reopenForDelivery = paymentUnlocked || recoverableValidationFailure;
         const mergedPayload = mergePersistedEventPayload(existing.request_payload, purePayload);
+        const mergedValidationErrors = validateMetaEvent(
+            prepareMetaEvent(stripPrivateFields({ ...mergedPayload })),
+        );
+        mergedPayload._quality = {
+            ...(mergedPayload._quality || {}),
+            local_validation_errors: mergedValidationErrors,
+        };
+        // A duplicate only reopens a locally-invalid delivery when the merged
+        // payload actually repairs every validation error. Otherwise repeated
+        // browser retries would create an endless fail/reopen loop.
+        const validationRepaired = recoverableValidationFailure
+            && mergedValidationErrors.length === 0;
+        const reopenForDelivery = paymentUnlocked || validationRepaired;
         const emqCandidates = [
             existing.emq_estimate,
             emqEstimate,
@@ -1549,7 +1750,7 @@ async function persistOutboxEvent(shopId, payload) {
                        emq_estimate, status, fb_response`,
             [existing.id, reopenForDelivery, mergedEmq, JSON.stringify(mergedPayload)],
         );
-        if (recoverableValidationFailure) {
+        if (validationRepaired) {
             await client.query(
                 `UPDATE event_deliveries
                  SET status = 'PENDING',
@@ -1662,7 +1863,6 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         event_id: eventId,
         event_source_url: eventSourceUrlForPayload(req, enrichedPayload),
         referrer_url: normalizeUrl(enrichedPayload.referrer),
-        customer_segmentation: normalizeCustomerSegmentation(enrichedPayload.customer_segmentation),
         opt_out: typeof enrichedPayload.opt_out === 'boolean' ? enrichedPayload.opt_out : undefined,
         user_data: userData,
         custom_data: customData,
@@ -1676,6 +1876,25 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
                     && enrichedPayload.content_ids.length > config.commerceItemLimit),
         },
         _platform_data: buildPlatformData(enrichedPayload),
+        _source: compactObject({
+            provider: enrichedPayload.source_provider || 'shopify_web_pixels',
+            event_name: enrichedPayload.source_event_name,
+            event_id: enrichedPayload.source_event_id,
+            sequence: enrichedPayload.source_event_seq,
+            source_version: enrichedPayload.source_version,
+            api_version: enrichedPayload.source_api_version,
+            customer_lifecycle: enrichedPayload.customer_lifecycle,
+            // Private, shop-scoped audit key. This never leaves the service,
+            // but lets the dashboard reconcile each paid Shopify order to its
+            // durable Purchase and Meta delivery without comparing display
+            // names or collapsing identical IDs from different shops.
+            order_identity: eventName === 'Purchase' ? firstPresent(
+                enrichedPayload.checkout_token,
+                enrichedPayload.cart_token,
+                enrichedPayload._shopify_order_id,
+                enrichedPayload.order_id,
+            ) : undefined,
+        }),
         _requires_payment_confirmation: requiresPaymentConfirmation,
         _payment_confirmed: paymentConfirmed,
         _attribution_enriched: Object.keys(attribution).length > 0,
@@ -1685,11 +1904,12 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
     const validationErrors = validateMetaEvent(
         prepareMetaEvent(stripPrivateFields({ ...fbEventData })),
     );
-    if (validationErrors.length > 0) {
-        const error = new Error(`Event validation failed: ${validationErrors.join('; ')}`);
-        error.statusCode = 422;
-        throw error;
-    }
+    // Persist first so a complementary browser/webhook duplicate can merge
+    // missing UA, identifiers or commerce parameters before the worker's
+    // authoritative pre-send validation. If no duplicate repairs the event,
+    // the worker records LOCAL_VALIDATION in the delivery ledger and DLQ;
+    // the conversion is observable instead of disappearing at ingestion.
+    fbEventData._quality.local_validation_errors = validationErrors;
 
     const dbEvent = await persistOutboxEvent(shopId, fbEventData);
     if (!dbEvent) {
@@ -1786,20 +2006,51 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
         return res.status(400).json({ error: 'Batch events must belong to one shop_domain' });
     }
 
+    // The per-shop token identifies the configured tenant but is embedded in
+    // public storefront code. Validate the expected Shopify event mapping as
+    // an additional integrity boundary so typos, stale snippets and generic
+    // clients cannot silently create arbitrary Meta funnel events.
+    for (const payload of normalizedPayloads) validateShopifyBrowserPayload(payload);
+
     const { rows } = await pool.query(
         'SELECT id FROM shops WHERE shop_domain = $1 AND status = $2',
         [shopDomain, 'active'],
     );
     if (rows.length === 0) return res.status(401).json({ error: 'Shop inactive' });
 
+    const observedSourceVersion = String(normalizedPayloads[0].source_version).trim();
+    const observedSchemaVersion = String(normalizedPayloads[0].schema_version).trim();
+    await pool.query(
+            `INSERT INTO shopify_pixel_runtime_status
+                (shop_id, source_version, schema_version, first_seen_at, last_seen_at, updated_at)
+             VALUES ($1, $2, NULLIF($3, ''), NOW(), NOW(), NOW())
+             ON CONFLICT (shop_id) DO UPDATE
+             SET source_version = EXCLUDED.source_version,
+                 schema_version = EXCLUDED.schema_version,
+                 last_seen_at = NOW(),
+                 updated_at = NOW()
+             WHERE shopify_pixel_runtime_status.source_version IS DISTINCT FROM EXCLUDED.source_version
+                OR shopify_pixel_runtime_status.schema_version IS DISTINCT FROM EXCLUDED.schema_version
+                OR shopify_pixel_runtime_status.last_seen_at < NOW() - INTERVAL '15 minutes'`,
+        [rows[0].id, observedSourceVersion, observedSchemaVersion],
+    );
+
     if (normalizedPayloads.length === 1) {
-        return queueForOutbox(
-            req,
-            res,
-            { ...normalizedPayloads[0], shop_domain: shopDomain, tenant_id: shopDomain },
-            rows[0].id,
-            { allowRequestIdentifiers: true, requirePaymentConfirmation: true },
-        );
+        try {
+            return await queueForOutbox(
+                req,
+                res,
+                { ...normalizedPayloads[0], shop_domain: shopDomain, tenant_id: shopDomain },
+                rows[0].id,
+                { allowRequestIdentifiers: true, requirePaymentConfirmation: true },
+            );
+        } catch (error) {
+            const statusCode = Number(error.statusCode || 500);
+            if (statusCode >= 400 && statusCode < 500) {
+                await insertBrowserIngestionRejection(rows[0].id, normalizedPayloads[0], error);
+            }
+            throw error;
+        }
     }
 
     const results = [];
@@ -1819,6 +2070,7 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
             // durable. Infrastructure failures abort the request; the browser
             // then retries the whole batch with stable IDs.
             if (statusCode >= 500) throw error;
+            await insertBrowserIngestionRejection(rows[0].id, payload, error);
             results.push({
                 success: false,
                 rejected: true,
@@ -1832,7 +2084,7 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
     const deduplicated = results.filter(result => result.deduplicated).length;
     const rejected = results.filter(result => result.rejected).length;
     return res.status(queued > 0 ? 202 : 200).json({
-        success: true,
+        success: rejected === 0,
         batch: true,
         received: normalizedPayloads.length,
         queued,
@@ -1840,6 +2092,103 @@ app.post('/api/pixel-event', pixelLimiter, asyncHandler(async (req, res) => {
         rejected,
         results,
     });
+}));
+
+app.post('/api/pixel-diagnostic', pixelLimiter, asyncHandler(async (req, res) => {
+    const shopDomain = requireMyshopifyDomain(req.body?.shop_domain);
+    const suppliedIngestToken = String(
+        req.headers['x-capi-ingest-token'] || req.body?.ingest_token || '',
+    ).trim();
+    if (!validShopIngestToken(shopDomain, suppliedIngestToken)) {
+        return res.status(401).json({ error: 'Invalid shop ingest token' });
+    }
+
+    const sourceVersion = requireBoundedString(req.body?.source_version, 'source_version', 64);
+    const schemaVersion = optionalBoundedString(req.body?.schema_version, 'schema_version', 32);
+    if (!SUPPORTED_PIXEL_SOURCE_VERSIONS.has(sourceVersion)
+        || schemaVersion !== SUPPORTED_PIXEL_SCHEMA_VERSION) {
+        return res.status(426).json({ error: 'Unsupported storefront pixel source/schema version' });
+    }
+    const diagnosticType = String(req.body?.type || 'heartbeat').trim().toLowerCase();
+    if (!['heartbeat', 'delivery_loss'].includes(diagnosticType)) {
+        return res.status(400).json({ error: 'Unsupported diagnostic type' });
+    }
+
+    const { rows } = await pool.query(
+        `SELECT id FROM shops WHERE shop_domain = $1 AND status = 'active'`,
+        [shopDomain],
+    );
+    if (rows.length === 0) return res.status(401).json({ error: 'Shop inactive' });
+    const shopId = Number(rows[0].id);
+
+    if (diagnosticType === 'heartbeat') {
+        await pool.query(
+            `INSERT INTO shopify_pixel_runtime_status
+                (shop_id, source_version, schema_version, first_seen_at, last_seen_at, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW(), NOW())
+             ON CONFLICT (shop_id) DO UPDATE
+             SET source_version = EXCLUDED.source_version,
+                 schema_version = EXCLUDED.schema_version,
+                 last_seen_at = NOW(),
+                 updated_at = NOW()`,
+            [shopId, sourceVersion, schemaVersion],
+        );
+        return res.status(202).json({ success: true, recorded: 'heartbeat' });
+    }
+
+    const code = requireBoundedString(req.body?.code, 'code', 64).toUpperCase();
+    if (!BROWSER_DIAGNOSTIC_CODES.has(code)) {
+        return res.status(400).json({ error: 'Unsupported diagnostic code' });
+    }
+    const droppedCount = Number(req.body?.dropped_count || 0);
+    if (!Number.isInteger(droppedCount) || droppedCount <= 0 || droppedCount > 10000) {
+        return res.status(400).json({ error: 'dropped_count must be an integer from 1 to 10000' });
+    }
+    const eventCounts = boundedDiagnosticEventCounts(req.body?.event_counts);
+    const clientFirstAt = boundedClientTimestamp(req.body?.client_first_at);
+    const clientLastAt = boundedClientTimestamp(req.body?.client_last_at);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query(
+            `INSERT INTO browser_delivery_diagnostics
+                (shop_id, code, dropped_count, event_counts, source_version, schema_version,
+                 client_first_at, client_last_at)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)`,
+            [
+                shopId,
+                code,
+                droppedCount,
+                JSON.stringify(eventCounts),
+                sourceVersion,
+                schemaVersion,
+                clientFirstAt,
+                clientLastAt,
+            ],
+        );
+        await client.query(
+            `INSERT INTO shopify_pixel_runtime_status
+                (shop_id, source_version, schema_version, first_seen_at, last_seen_at,
+                 last_diagnostic_at, diagnostic_count, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW(), NOW(), 1, NOW())
+             ON CONFLICT (shop_id) DO UPDATE
+             SET source_version = EXCLUDED.source_version,
+                 schema_version = EXCLUDED.schema_version,
+                 last_seen_at = NOW(),
+                 last_diagnostic_at = NOW(),
+                 diagnostic_count = shopify_pixel_runtime_status.diagnostic_count + 1,
+                 updated_at = NOW()`,
+            [shopId, sourceVersion, schemaVersion],
+        );
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+    return res.status(202).json({ success: true, recorded: 'delivery_loss' });
 }));
 
 app.post('/api/pixel-config', asyncHandler(async (req, res) => {
@@ -1934,10 +2283,34 @@ async function processShopifyWebhookInboxRow(row) {
         ...payload,
         shop_domain: row.shop_domain,
         tenant_id: row.shop_domain,
+        source_provider: row.webhook_id?.startsWith('reconcile:')
+            ? 'shopify_admin_graphql'
+            : 'shopify_webhook',
+        source_event_name: row.topic,
+        source_event_id: row.webhook_id,
+        source_api_version: row.shopify_api_version,
     }, Number(row.shop_id), {
         allowRequestIdentifiers: false,
         paymentConfirmed: true,
     });
+}
+
+async function failExhaustedShopifyWebhookInboxRows() {
+    const { rowCount } = await pool.query(
+        `UPDATE shopify_webhook_inbox
+         SET status = 'FAILED_PERMANENT',
+             lease_expires_at = NULL,
+             processed_at = COALESCE(processed_at, NOW()),
+             error_message = COALESCE(
+                 NULLIF(error_message, ''),
+                 'Processing lease expired after the maximum attempt count'
+             )
+         WHERE status = 'PROCESSING'
+           AND lease_expires_at < NOW()
+           AND attempt_count >= $1`,
+        [config.shopifyWebhookInboxMaxAttempts],
+    );
+    return rowCount;
 }
 
 async function claimShopifyWebhookInboxRow() {
@@ -1946,6 +2319,7 @@ async function claimShopifyWebhookInboxRow() {
              SELECT id
              FROM shopify_webhook_inbox
              WHERE next_attempt_at <= NOW()
+               AND attempt_count < $2
                AND (
                    status IN ('PENDING', 'RETRYABLE_FAILED')
                    OR (status = 'PROCESSING' AND lease_expires_at < NOW())
@@ -1958,12 +2332,16 @@ async function claimShopifyWebhookInboxRow() {
          SET status = 'PROCESSING',
              attempt_count = attempt_count + 1,
              lease_expires_at = NOW() + ($1::int * INTERVAL '1 second'),
-             error_message = NULL
+             error_message = CASE
+                 WHEN inbox.status = 'PROCESSING'
+                     THEN 'Previous processing lease expired; retrying'
+                 ELSE NULL
+             END
          FROM candidate
          WHERE inbox.id = candidate.id
          RETURNING inbox.*,
                    (SELECT shop_domain FROM shops WHERE id = inbox.shop_id) AS shop_domain`,
-        [config.shopifyWebhookInboxLeaseSeconds],
+        [config.shopifyWebhookInboxLeaseSeconds, config.shopifyWebhookInboxMaxAttempts],
     );
     return rows[0] || null;
 }
@@ -1974,11 +2352,23 @@ async function drainShopifyWebhookInbox(limit = config.shopifyWebhookInboxBatchS
     drainingShopifyInbox = true;
     let processed = 0;
     try {
+        const exhausted = await failExhaustedShopifyWebhookInboxRows();
+        if (exhausted > 0) {
+            console.error(`[ShopifyInbox] marked ${exhausted} expired paid-order rows permanently failed`);
+        }
         while (processed < limit) {
             const row = await claimShopifyWebhookInboxRow();
             if (!row) break;
             try {
-                await processShopifyWebhookInboxRow(row);
+                const processTimeoutMs = Math.min(
+                    config.shopifyWebhookProcessTimeoutMs,
+                    Math.max(1000, (config.shopifyWebhookInboxLeaseSeconds * 1000) - 5000),
+                );
+                await withTimeout(
+                    processShopifyWebhookInboxRow(row),
+                    processTimeoutMs,
+                    `Shopify paid-order webhook ${row.id}`,
+                );
                 await pool.query(
                     `UPDATE shopify_webhook_inbox
                      SET status = 'SUCCESS', processed_at = NOW(), lease_expires_at = NULL, error_message = NULL
@@ -2021,6 +2411,9 @@ const SHOPIFY_RECONCILE_QUERY = `
                     currentSubtotalLineItemsQuantity
                     displayFinancialStatus
                     currentTotalPriceSet { shopMoney { amount currencyCode } }
+                    transactions(first: 100) {
+                        id kind status createdAt processedAt test
+                    }
                     billingAddress {
                         firstName lastName phone city province provinceCode zip country countryCodeV2
                     }
@@ -2072,6 +2465,191 @@ const SHOPIFY_ACCESS_SCOPES_QUERY = `
     }
 `;
 
+const SHOPIFY_PAID_WEBHOOK_SUBSCRIPTIONS_QUERY = `
+    query AuditOrdersPaidSubscriptions {
+        webhookSubscriptions(first: 100, topics: [ORDERS_PAID]) {
+            nodes { id topic uri }
+        }
+    }
+`;
+
+const SHOPIFY_PAID_WEBHOOK_SUBSCRIPTION_CREATE = `
+    mutation EnsureOrdersPaidSubscription(
+        $topic: WebhookSubscriptionTopic!,
+        $webhookSubscription: WebhookSubscriptionInput!
+    ) {
+        webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+            webhookSubscription { id topic uri }
+            userErrors { field message }
+        }
+    }
+`;
+
+function expectedPaidWebhookUri() {
+    return config.publicBaseUrl ? `${config.publicBaseUrl}/api/webhook/orders/paid` : '';
+}
+
+async function writePaidWebhookAuditState(shopId, state, db = pool) {
+    await db.query(
+        `INSERT INTO shopify_webhook_subscription_state
+            (shop_id, status, expected_uri, observed_uris, managed_subscription_id,
+             shopify_api_version, last_checked_at, last_repaired_at, last_error, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, NOW(), $7, $8, NOW())
+         ON CONFLICT (shop_id) DO UPDATE
+         SET status = EXCLUDED.status,
+             expected_uri = EXCLUDED.expected_uri,
+             observed_uris = EXCLUDED.observed_uris,
+             managed_subscription_id = EXCLUDED.managed_subscription_id,
+             shopify_api_version = EXCLUDED.shopify_api_version,
+             last_checked_at = NOW(),
+             last_repaired_at = COALESCE(EXCLUDED.last_repaired_at,
+                                         shopify_webhook_subscription_state.last_repaired_at),
+             last_error = EXCLUDED.last_error,
+             updated_at = NOW()`,
+        [
+            shopId,
+            state.status,
+            state.expectedUri || null,
+            JSON.stringify(state.observedUris || []),
+            state.managedSubscriptionId || null,
+            state.shopifyApiVersion || config.shopifyApiVersion,
+            state.repaired ? new Date() : null,
+            state.error ? String(state.error).slice(0, 4000) : null,
+        ],
+    );
+}
+
+async function auditPaidWebhookSubscriptionForShop(shop, options = {}) {
+    const expectedUri = expectedPaidWebhookUri();
+    if (!expectedUri) {
+        const state = {
+            status: 'CONFIG_ERROR',
+            expectedUri: '',
+            observedUris: [],
+            error: 'PUBLIC_BASE_URL is required to audit the ORDERS_PAID webhook URI',
+        };
+        await writePaidWebhookAuditState(shop.id, state);
+        return state;
+    }
+    if (!shop.admin_access_token) {
+        const state = {
+            status: 'NO_ADMIN_TOKEN',
+            expectedUri,
+            observedUris: [],
+            error: 'Shopify Admin API token is not configured',
+        };
+        await writePaidWebhookAuditState(shop.id, state);
+        return state;
+    }
+
+    const token = decryptTokenIfPossible(shop.admin_access_token);
+    const url = `https://${shop.shop_domain}/admin/api/${config.shopifyApiVersion}/graphql.json`;
+    try {
+        const queryResponse = await axios.post(url, { query: SHOPIFY_PAID_WEBHOOK_SUBSCRIPTIONS_QUERY }, {
+            timeout: config.fbRequestTimeoutMs,
+            headers: {
+                'X-Shopify-Access-Token': token,
+                'Content-Type': 'application/json',
+            },
+        });
+        const servedApiVersion = auditShopifyApiVersion(
+            queryResponse,
+            `ORDERS_PAID webhook audit for ${shop.shop_domain}`,
+        );
+        if (Array.isArray(queryResponse.data?.errors) && queryResponse.data.errors.length > 0) {
+            throw new Error(`Shopify GraphQL: ${queryResponse.data.errors.map(item => item.message).join('; ')}`);
+        }
+        await waitForShopifyGraphqlThrottle(queryResponse.data);
+        const subscriptions = queryResponse.data?.data?.webhookSubscriptions?.nodes || [];
+        const observedUris = [...new Set(subscriptions.map(item => String(item?.uri || '').trim()).filter(Boolean))];
+        const matching = subscriptions.filter(item => String(item?.uri || '').trim() === expectedUri);
+
+        if (matching.length === 0 && options.repair === true) {
+            const createResponse = await axios.post(url, {
+                query: SHOPIFY_PAID_WEBHOOK_SUBSCRIPTION_CREATE,
+                variables: {
+                    topic: 'ORDERS_PAID',
+                    webhookSubscription: { uri: expectedUri, format: 'JSON' },
+                },
+            }, {
+                timeout: config.fbRequestTimeoutMs,
+                headers: {
+                    'X-Shopify-Access-Token': token,
+                    'Content-Type': 'application/json',
+                },
+            });
+            auditShopifyApiVersion(createResponse, `ORDERS_PAID webhook repair for ${shop.shop_domain}`);
+            if (Array.isArray(createResponse.data?.errors) && createResponse.data.errors.length > 0) {
+                throw new Error(`Shopify GraphQL: ${createResponse.data.errors.map(item => item.message).join('; ')}`);
+            }
+            await waitForShopifyGraphqlThrottle(createResponse.data);
+            const mutation = createResponse.data?.data?.webhookSubscriptionCreate;
+            const userErrors = mutation?.userErrors || [];
+            if (userErrors.length > 0) {
+                throw new Error(`Shopify webhook create: ${userErrors.map(item => item.message).join('; ')}`);
+            }
+            const created = mutation?.webhookSubscription;
+            if (!created?.id || String(created.uri || '').trim() !== expectedUri) {
+                throw new Error('Shopify did not return the expected ORDERS_PAID webhook subscription');
+            }
+            const repairedState = {
+                status: observedUris.length > 0 ? 'HEALTHY_WITH_ALTERNATES' : 'HEALTHY',
+                expectedUri,
+                observedUris: [...new Set(observedUris.concat([expectedUri]))],
+                managedSubscriptionId: created.id,
+                shopifyApiVersion: servedApiVersion,
+                repaired: true,
+            };
+            await writePaidWebhookAuditState(shop.id, repairedState);
+            return repairedState;
+        }
+
+        const status = matching.length > 0
+            ? (observedUris.some(uri => uri !== expectedUri) || matching.length > 1
+                ? 'HEALTHY_WITH_ALTERNATES'
+                : 'HEALTHY')
+            : (observedUris.length > 0 ? 'URI_MISMATCH' : 'MISSING');
+        const state = {
+            status,
+            expectedUri,
+            observedUris,
+            managedSubscriptionId: matching[0]?.id,
+            shopifyApiVersion: servedApiVersion,
+        };
+        await writePaidWebhookAuditState(shop.id, state);
+        return state;
+    } catch (error) {
+        const state = {
+            status: 'ERROR',
+            expectedUri,
+            observedUris: [],
+            error: error.message,
+        };
+        await writePaidWebhookAuditState(shop.id, state).catch(() => {});
+        throw error;
+    }
+}
+
+async function auditPaidWebhookSubscriptions() {
+    if (shuttingDown || fs.existsSync(config.maintenanceFile)) return [];
+    const { rows: shops } = await pool.query(
+        `SELECT id, shop_domain, admin_access_token
+         FROM shops
+         WHERE status = 'active'
+         ORDER BY id`,
+    );
+    const results = [];
+    for (const shop of shops) {
+        try {
+            results.push({ shop_id: shop.id, ...(await auditPaidWebhookSubscriptionForShop(shop)) });
+        } catch (error) {
+            console.error(`[ShopifyWebhookAudit] ${shop.shop_domain}:`, error.message);
+            results.push({ shop_id: shop.id, status: 'ERROR', error: error.message });
+        }
+    }
+    return results;
+}
+
 function graphqlAddress(address) {
     if (!address) return undefined;
     return compactObject({
@@ -2099,6 +2677,21 @@ async function waitForShopifyGraphqlThrottle(responseData) {
     }
 }
 
+function observedShopifyApiVersion(response) {
+    const value = String(response?.headers?.['x-shopify-api-version'] || '').trim();
+    return /^\d{4}-\d{2}$/.test(value) ? value : null;
+}
+
+function auditShopifyApiVersion(response, context) {
+    const observed = observedShopifyApiVersion(response);
+    if (observed && observed !== config.shopifyApiVersion) {
+        console.warn(
+            `[ShopifyAPI] ${context} requested ${config.shopifyApiVersion} but Shopify served ${observed}`,
+        );
+    }
+    return observed || config.shopifyApiVersion;
+}
+
 async function shopifyAccessScopes(url, token) {
     try {
         const response = await axios.post(url, { query: SHOPIFY_ACCESS_SCOPES_QUERY }, {
@@ -2108,6 +2701,7 @@ async function shopifyAccessScopes(url, token) {
                 'Content-Type': 'application/json',
             },
         });
+        auditShopifyApiVersion(response, 'access scopes');
         if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) return new Set();
         await waitForShopifyGraphqlThrottle(response.data);
         return new Set(
@@ -2141,6 +2735,7 @@ async function hydrateAllShopifyLineItems(node, url, token) {
                 'Content-Type': 'application/json',
             },
         });
+        auditShopifyApiVersion(response, 'line item pagination');
         if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
             throw new Error(`Shopify GraphQL: ${response.data.errors.map(item => item.message).join('; ')}`);
         }
@@ -2196,6 +2791,7 @@ function reconciledGraphqlOrder(node) {
             quantity: item.quantity,
             discountedUnitPriceAfterAllDiscountsSet: item.discountedUnitPriceAfterAllDiscountsSet,
         })),
+        transactions: node.transactions || [],
     };
 }
 
@@ -2225,6 +2821,7 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
     let after = state.rows[0].after_cursor || null;
     let received = 0;
     let cursorRestarted = false;
+    let servedApiVersion = config.shopifyApiVersion;
     while (true) {
         const first = Math.min(100, config.shopifyReconcileMaxOrders - received);
         if (first <= 0) break;
@@ -2246,6 +2843,10 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
                 'Content-Type': 'application/json',
             },
         });
+        servedApiVersion = auditShopifyApiVersion(
+            response,
+            `paid order reconciliation for ${shop.shop_domain}`,
+        );
         if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
             const errorMessage = response.data.errors.map(item => item.message).join('; ');
             // Shopify cursors can become invalid after retention or index
@@ -2279,13 +2880,14 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
                 .digest('hex');
             await db.query(
                 `INSERT INTO shopify_webhook_inbox
-                    (shop_id, webhook_id, topic, triggered_at, payload)
-                 VALUES ($1, $2, 'orders/paid', $3, $4::jsonb)
+                    (shop_id, webhook_id, topic, shopify_api_version, triggered_at, payload)
+                 VALUES ($1, $2, 'orders/paid', $3, $4, $5::jsonb)
                  ON CONFLICT (shop_id, webhook_id) DO NOTHING`,
                 [
                     shop.id,
                     `reconcile:${identity}`,
-                    node.processedAt || node.createdAt || scanCutoff,
+                    servedApiVersion,
+                    shopifyPaymentTimestamp(node) || scanCutoff,
                     JSON.stringify(payload),
                 ],
             );
@@ -2445,28 +3047,60 @@ const PRIVACY_MATCH_SQL = `
         )
     )`;
 
-async function buildPrivacyDataReport(shop, payload) {
+const PRIVACY_REPORT_PAGE_SIZE = 500;
+
+async function loadPrivacyEventPage(shop, payload, { afterId = 0, limit = PRIVACY_REPORT_PAGE_SIZE } = {}) {
     const identity = privacyMatchIdentity(shop.shop_domain, payload);
+    const boundedAfterId = Number.isInteger(Number(afterId)) && Number(afterId) >= 0 ? Number(afterId) : 0;
+    const boundedLimit = Math.min(1000, Math.max(1, Number(limit) || PRIVACY_REPORT_PAGE_SIZE));
     const { rows } = await pool.query(
         `SELECT event.id, event.event_name, event.event_id, event.status,
                 event.timestamp, event.emq_estimate,
                 event.request_payload->'custom_data'->>'order_id' AS order_id
          FROM event_store event
          WHERE ${PRIVACY_MATCH_SQL}
+           AND event.id > $6
          ORDER BY event.id
-         LIMIT 10001`,
+         LIMIT $7`,
+        [
+            shop.id,
+            identity.externalIdHash,
+            identity.emailHash,
+            identity.phoneHash,
+            identity.orderIds,
+            boundedAfterId,
+            boundedLimit + 1,
+        ],
+    );
+    const hasMore = rows.length > boundedLimit;
+    const events = rows.slice(0, boundedLimit);
+    return {
+        events,
+        has_more: hasMore,
+        next_after_id: hasMore ? Number(events[events.length - 1].id) : null,
+    };
+}
+
+async function buildPrivacyDataReport(shop, payload) {
+    const identity = privacyMatchIdentity(shop.shop_domain, payload);
+    const { rows: [countRow] } = await pool.query(
+        `SELECT COUNT(*)::bigint AS stored_event_count
+         FROM event_store event
+         WHERE ${PRIVACY_MATCH_SQL}`,
         [shop.id, identity.externalIdHash, identity.emailHash, identity.phoneHash, identity.orderIds],
     );
-    const truncated = rows.length > 10000;
+    const page = await loadPrivacyEventPage(shop, payload);
     return {
         generated_at: new Date().toISOString(),
         shop_domain: shop.shop_domain,
         customer_id: identity.customer.id,
         orders_requested: identity.orderIds,
-        stored_event_count: Math.min(rows.length, 10000),
-        truncated,
-        events: rows.slice(0, 10000),
-        note: 'Customer matching values are stored as one-way hashes; this report contains only retained event metadata.',
+        stored_event_count: Number(countRow.stored_event_count || 0),
+        page_size: PRIVACY_REPORT_PAGE_SIZE,
+        next_after_id: page.next_after_id,
+        truncated: page.has_more,
+        events: page.events,
+        note: 'Customer matching values are stored as one-way hashes. This first page contains retained event metadata; follow next_after_id through the authenticated privacy events endpoint until has_more is false.',
     };
 }
 
@@ -2745,12 +3379,22 @@ async function handleShopifyPurchaseWebhook(req, res) {
     const suppliedWebhookId = String(req.headers['x-shopify-webhook-id'] || '').trim();
     const webhookId = (suppliedWebhookId || crypto.createHash('sha256').update(req.rawBody).digest('hex')).slice(0, 255);
     const triggeredAt = Number.isFinite(Date.parse(triggeredAtHeader)) ? triggeredAtHeader : null;
+    const suppliedApiVersion = String(req.headers['x-shopify-api-version'] || '').trim();
+    const shopifyApiVersion = /^\d{4}-\d{2}$/.test(suppliedApiVersion) ? suppliedApiVersion : null;
     const insert = await pool.query(
-        `INSERT INTO shopify_webhook_inbox (shop_id, webhook_id, topic, triggered_at, payload)
-         VALUES ($1, $2, $3, $4, $5::jsonb)
+        `INSERT INTO shopify_webhook_inbox
+            (shop_id, webhook_id, topic, shopify_api_version, triggered_at, payload)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
          ON CONFLICT (shop_id, webhook_id) DO NOTHING
          RETURNING id`,
-        [rows[0].id, webhookId, webhookTopic, triggeredAt, JSON.stringify(precisePayload || {})],
+        [
+            rows[0].id,
+            webhookId,
+            webhookTopic,
+            shopifyApiVersion,
+            triggeredAt,
+            JSON.stringify(precisePayload || {}),
+        ],
     );
     res.status(200).json({ success: true, accepted: true, durable: true, duplicate: insert.rowCount === 0 });
     setImmediate(() => void drainShopifyWebhookInbox().catch(error => {
@@ -2768,21 +3412,36 @@ app.get('/healthz', (req, res) => {
 app.get('/readyz', asyncHandler(async (req, res) => {
     await pool.query('SELECT 1');
     let redisState = 'degraded';
+    let workerState = config.requireWorkerHeartbeat ? 'missing' : 'not_required';
     if (redis.status === 'ready') {
         try {
             redisState = await withTimeout(redis.ping(), 1000, 'Redis readiness') === 'PONG'
                 ? 'ready'
                 : 'degraded';
+            if (redisState === 'ready' && config.requireWorkerHeartbeat) {
+                const heartbeat = Number(await withTimeout(
+                    redis.get('health:capi-worker'),
+                    1000,
+                    'Worker heartbeat readiness',
+                ));
+                const maxAgeMs = config.workerHeartbeatTtlSeconds * 1000;
+                workerState = Number.isFinite(heartbeat) && heartbeat > 0 && Date.now() - heartbeat <= maxAgeMs
+                    ? 'ready'
+                    : 'missing';
+            }
         } catch (error) {
             redisState = 'degraded';
+            workerState = config.requireWorkerHeartbeat ? 'missing' : 'not_required';
         }
     }
-    res.status(redisState === 'ready' ? 200 : 503).json({
-        status: redisState === 'ready' ? 'ready' : 'degraded',
+    const ready = redisState === 'ready' && ['ready', 'not_required'].includes(workerState);
+    res.status(ready ? 200 : 503).json({
+        status: ready ? 'ready' : 'degraded',
         postgres: 'ready',
         redis: redisState,
+        worker: workerState,
         durable_ingestion: true,
-        immediate_dispatch: redisState === 'ready',
+        immediate_dispatch: ready,
     });
 }));
 
@@ -2809,6 +3468,18 @@ scheduleCron(config.shopifyReconcileCron, async () => {
         if (reconciled > 0) console.warn(`[ShopifyReconcile] queued ${reconciled} paid orders`);
     } catch (error) {
         console.error('[ShopifyReconcile] scheduled run failed:', error);
+    }
+});
+
+scheduleCron(config.shopifyWebhookAuditCron, async () => {
+    try {
+        const results = await auditPaidWebhookSubscriptions();
+        const unhealthy = results.filter(item => !['HEALTHY', 'HEALTHY_WITH_ALTERNATES'].includes(item.status));
+        if (unhealthy.length > 0) {
+            console.warn(`[ShopifyWebhookAudit] ${unhealthy.length} shop(s) need ORDERS_PAID webhook attention`);
+        }
+    } catch (error) {
+        console.error('[ShopifyWebhookAudit] scheduled run failed:', error);
     }
 });
 
@@ -3017,10 +3688,23 @@ app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ind
 
 app.get('/api/admin/shops', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(
-        `SELECT id, shop_domain, status, created_at,
-                (admin_access_token IS NOT NULL AND admin_access_token <> '') AS has_admin_access_token
-         FROM shops
-         ORDER BY id DESC`,
+        `SELECT shop.id, shop.shop_domain, shop.reporting_timezone, shop.status, shop.created_at,
+                (shop.admin_access_token IS NOT NULL AND shop.admin_access_token <> '') AS has_admin_access_token,
+                subscription.status AS paid_webhook_subscription_status,
+                subscription.expected_uri AS paid_webhook_expected_uri,
+                subscription.observed_uris AS paid_webhook_observed_uris,
+                subscription.last_checked_at AS paid_webhook_last_checked_at,
+                subscription.last_repaired_at AS paid_webhook_last_repaired_at,
+                subscription.last_error AS paid_webhook_last_error,
+                runtime.source_version AS pixel_source_version,
+                runtime.schema_version AS pixel_schema_version,
+                runtime.last_seen_at AS pixel_last_seen_at,
+                runtime.last_diagnostic_at AS pixel_last_diagnostic_at,
+                runtime.diagnostic_count AS pixel_diagnostic_count
+         FROM shops shop
+         LEFT JOIN shopify_webhook_subscription_state subscription ON subscription.shop_id = shop.id
+         LEFT JOIN shopify_pixel_runtime_status runtime ON runtime.shop_id = shop.id
+         ORDER BY shop.id DESC`,
     );
     res.json(rows.map(row => ({ ...row, ingest_token: shopIngestToken(row.shop_domain) })));
 }));
@@ -3029,17 +3713,74 @@ app.post('/api/admin/shops', asyncHandler(async (req, res) => {
     const shopDomain = requireMyshopifyDomain(req.body.shop_domain);
     const appSecret = requireBoundedString(req.body.app_secret, 'app_secret', 2048);
     const adminAccessToken = optionalBoundedString(req.body.admin_access_token, 'admin_access_token', 10000);
+    const reportingTimezone = req.body.reporting_timezone === undefined
+        ? null
+        : requireIanaTimezone(req.body.reporting_timezone);
 
     await pool.query(
-        `INSERT INTO shops (shop_domain, app_secret, admin_access_token)
-         VALUES ($1, $2, $3)
+        `INSERT INTO shops (shop_domain, app_secret, admin_access_token, reporting_timezone)
+         VALUES ($1, $2, $3, COALESCE($4, 'UTC'))
          ON CONFLICT (shop_domain) DO UPDATE
          SET app_secret = EXCLUDED.app_secret,
              admin_access_token = COALESCE(EXCLUDED.admin_access_token, shops.admin_access_token),
+             reporting_timezone = COALESCE($4, shops.reporting_timezone),
              status = 'active'`,
-        [shopDomain, encryptToken(appSecret), adminAccessToken ? encryptToken(adminAccessToken) : null],
+        [shopDomain, encryptToken(appSecret), adminAccessToken ? encryptToken(adminAccessToken) : null, reportingTimezone],
     );
     res.status(201).json({ success: true });
+}));
+
+app.patch('/api/admin/shops/:id/reporting-timezone', asyncHandler(async (req, res) => {
+    const shopId = readPositiveId(req.params.id, 'shop_id');
+    const reportingTimezone = requireIanaTimezone(req.body?.reporting_timezone);
+    const { rows } = await pool.query(
+        `UPDATE shops
+         SET reporting_timezone = $2
+         WHERE id = $1 AND status = 'active'
+         RETURNING id, shop_domain, reporting_timezone`,
+        [shopId, reportingTimezone],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Shop not found' });
+    return res.json({ success: true, shop: rows[0] });
+}));
+
+app.post('/api/admin/shops/:id/audit-paid-webhook', asyncHandler(async (req, res) => {
+    const shopId = readPositiveId(req.params.id, 'shop_id');
+    const { rows } = await pool.query(
+        `SELECT id, shop_domain, admin_access_token
+         FROM shops
+         WHERE id = $1 AND status = 'active'`,
+        [shopId],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Shop not found' });
+    const state = await auditPaidWebhookSubscriptionForShop(rows[0]);
+    return res.json({ success: true, shop_id: shopId, ...state });
+}));
+
+app.post('/api/admin/shops/:id/ensure-paid-webhook', asyncHandler(async (req, res) => {
+    const shopId = readPositiveId(req.params.id, 'shop_id');
+    const { rows } = await pool.query(
+        `SELECT id, shop_domain, admin_access_token
+         FROM shops
+         WHERE id = $1 AND status = 'active'`,
+        [shopId],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Shop not found' });
+    if (!rows[0].admin_access_token) {
+        return res.status(409).json({ error: 'Shopify Admin API token is required to repair the ORDERS_PAID webhook' });
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('SELECT pg_advisory_lock(hashtext($1))', [`capi-saas-pro:paid-webhook-repair:${shopId}`]);
+        const state = await auditPaidWebhookSubscriptionForShop(rows[0], { repair: true });
+        return res.json({ success: true, shop_id: shopId, ...state });
+    } finally {
+        await client.query(
+            'SELECT pg_advisory_unlock(hashtext($1))',
+            [`capi-saas-pro:paid-webhook-repair:${shopId}`],
+        ).catch(() => {});
+        client.release();
+    }
 }));
 
 app.delete('/api/admin/shops/:id', asyncHandler(async (req, res) => {
@@ -3062,7 +3803,11 @@ app.get('/api/admin/pixels', asyncHandler(async (req, res) => {
                            'route_id', r.id,
                            'shop_id', s.id,
                            'shop_domain', s.shop_domain,
-                           'test_event_code', r.test_event_code,
+                           'test_event_code', CASE
+                               WHEN r.test_event_code_expires_at > NOW() THEN r.test_event_code
+                               ELSE NULL
+                           END,
+                           'test_event_code_expires_at', r.test_event_code_expires_at,
                            'status', r.status
                        )
                        ORDER BY s.shop_domain
@@ -3097,6 +3842,12 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     const rateLimitGroup = optionalBoundedString(req.body.rate_limit_group, 'rate_limit_group', 100);
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
+    if (platform === 'facebook' && !config.allowSharedFacebookDatasetRoutes && shopIds.length > 1) {
+        return res.status(409).json({
+            error: 'A Meta Dataset can be bound to only one shop. Create a separate Dataset for each Shopify shop.',
+            code: 'SHARED_FACEBOOK_DATASET_BLOCKED',
+        });
+    }
 
     if (!shopIds.includes(shopId)) shopIds.unshift(shopId);
     const shopResult = await pool.query(
@@ -3181,6 +3932,25 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
             );
             credentialId = inserted.rows[0].id;
         }
+        if (platform === 'facebook' && !config.allowSharedFacebookDatasetRoutes) {
+            const activeRouteShops = await client.query(
+                `SELECT shop_id
+                 FROM shop_pixel_routes
+                 WHERE pixel_id = $1 AND status = 'active'
+                 FOR UPDATE`,
+                [credentialId],
+            );
+            const effectiveShopIds = new Set([
+                ...activeRouteShops.rows.map(row => Number(row.shop_id)),
+                ...shopIds,
+            ]);
+            if (effectiveShopIds.size > 1) {
+                const conflict = new Error('This Meta Dataset is already active for another shop. Use a separate Dataset ID and token.');
+                conflict.statusCode = 409;
+                conflict.code = 'SHARED_FACEBOOK_DATASET_BLOCKED';
+                throw conflict;
+            }
+        }
         for (const routedShopId of [...shopIds].sort((left, right) => left - right)) {
             await client.query(
                 'SELECT pg_advisory_xact_lock(hashtext($1))',
@@ -3188,13 +3958,23 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
             );
         }
         await client.query(
-            `INSERT INTO shop_pixel_routes (shop_id, pixel_id, test_event_code)
-             SELECT shop_id, $2, $3
+            `INSERT INTO shop_pixel_routes (
+                 shop_id, pixel_id, test_event_code, test_event_code_expires_at
+             )
+             SELECT shop_id,
+                    $2,
+                    $3,
+                    CASE
+                        WHEN $3::text IS NOT NULL
+                            THEN NOW() + ($4::int * INTERVAL '1 minute')
+                        ELSE NULL
+                    END
              FROM UNNEST($1::int[]) AS requested(shop_id)
              ON CONFLICT (shop_id, pixel_id) DO UPDATE
              SET status = 'active',
-                 test_event_code = EXCLUDED.test_event_code`,
-            [shopIds, credentialId, testEventCode || null],
+                 test_event_code = EXCLUDED.test_event_code,
+                 test_event_code_expires_at = EXCLUDED.test_event_code_expires_at`,
+            [shopIds, credentialId, testEventCode || null, config.testEventCodeTtlMinutes],
         );
         if (tokenChanged) {
             const reopened = await client.query(
@@ -3267,12 +4047,21 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
     try {
         await client.query('BEGIN');
         const pixelResult = await client.query(
-            "SELECT id FROM pixels WHERE id = $1 AND status = 'active' FOR UPDATE",
+            "SELECT id, platform FROM pixels WHERE id = $1 AND status = 'active' FOR UPDATE",
             [pixelId],
         );
         if (pixelResult.rowCount === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Pixel not found' });
+        }
+        if (pixelResult.rows[0].platform === 'facebook'
+            && !config.allowSharedFacebookDatasetRoutes
+            && shopIds.length > 1) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                error: 'A Meta Dataset can be bound to only one shop. Create a separate Dataset for each Shopify shop.',
+                code: 'SHARED_FACEBOOK_DATASET_BLOCKED',
+            });
         }
         const routeShopResult = await client.query(
             `SELECT route.shop_id, shop.shop_domain
@@ -3321,7 +4110,8 @@ app.put('/api/admin/pixels/:id/routes', asyncHandler(async (req, res) => {
         await client.query(
             `UPDATE shop_pixel_routes
              SET status = 'inactive',
-                 test_event_code = NULL
+                  test_event_code = NULL,
+                  test_event_code_expires_at = NULL
              WHERE pixel_id = $1
                AND NOT (shop_id = ANY($2::int[]))
                AND status <> 'inactive'`,
@@ -3435,7 +4225,8 @@ app.delete('/api/admin/pixels/:id', asyncHandler(async (req, res) => {
         await client.query(
             `UPDATE shop_pixel_routes
              SET status = 'inactive',
-                 test_event_code = NULL
+                 test_event_code = NULL,
+                 test_event_code_expires_at = NULL
              WHERE pixel_id = $1
                AND status <> 'inactive'`,
             [pixelId],
@@ -3514,7 +4305,10 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
     const { rows } = await pool.query(`
         SELECT e.id, s.shop_domain, e.event_name, e.event_id, e.status, e.emq_estimate,
                e.delivery_route_snapshot,
-               e.request_payload->'_quality' AS quality, e.fb_response, e.timestamp,
+               e.request_payload->'_quality' AS quality,
+               e.request_payload->'_source' AS source,
+               e.request_payload->'custom_data' AS custom_data,
+               e.fb_response, e.timestamp,
                COALESCE(d.deliveries, '[]'::jsonb) AS route_deliveries
         FROM event_store e
         JOIN shops s ON e.shop_id = s.id
@@ -3528,6 +4322,16 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
                     'attempt_count', ed.attempt_count,
                     'next_attempt_at', ed.next_attempt_at,
                     'delivered_at', ed.delivered_at,
+                    'accepted_event', CASE
+                        WHEN ed.platform_response->>'accepted_event' IN ('true', 'false')
+                            THEN (ed.platform_response->>'accepted_event')::boolean
+                        ELSE ed.status = 'SUCCESS'
+                    END,
+                    'fbtrace_id', COALESCE(
+                        ed.platform_response->>'fbtrace_id',
+                        ed.platform_response #>> '{results,0,fbtrace_id}'
+                    ),
+                    'platform_response', ed.platform_response,
                     'error_code', ed.error_code,
                     'error_message', ed.error_message
                 )
@@ -3629,6 +4433,41 @@ app.get('/api/admin/privacy/:id/report', asyncHandler(async (req, res) => {
     return res.json(rows[0]);
 }));
 
+app.get('/api/admin/privacy/:id/events', asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const afterId = Number(req.query.after_id || 0);
+    const limit = Number(req.query.limit || PRIVACY_REPORT_PAGE_SIZE);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid privacy request ID' });
+    if (!Number.isInteger(afterId) || afterId < 0) return res.status(400).json({ error: 'after_id must be a non-negative integer' });
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+        return res.status(400).json({ error: 'limit must be an integer from 1 to 1000' });
+    }
+    const { rows } = await pool.query(
+        `SELECT inbox.status, inbox.payload, shop.id AS shop_id, shop.shop_domain
+         FROM shopify_privacy_inbox inbox
+         JOIN shops shop ON shop.shop_domain = inbox.shop_domain
+         WHERE inbox.id = $1`,
+        [id],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Privacy request not found' });
+    if (rows[0].status !== 'ACTION_REQUIRED' || !rows[0].payload) {
+        return res.status(409).json({ error: 'This privacy request has no retained customer data report' });
+    }
+    const page = await loadPrivacyEventPage(
+        { id: rows[0].shop_id, shop_domain: rows[0].shop_domain },
+        rows[0].payload,
+        { afterId, limit },
+    );
+    res.set('Cache-Control', 'private, no-store');
+    return res.json({
+        privacy_request_id: id,
+        shop_domain: rows[0].shop_domain,
+        after_id: afterId,
+        limit,
+        ...page,
+    });
+}));
+
 app.post('/api/admin/privacy/:id/complete', asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid privacy request ID' });
@@ -3676,17 +4515,41 @@ app.post('/api/admin/privacy/:id/retry', asyncHandler(async (req, res) => {
 app.get('/api/admin/summary', asyncHandler(async (req, res) => {
     const shopId = readOptionalShopId(req);
     const params = shopId ? [shopId] : [];
+    const funnelParams = shopId ? [shopId, FUNNEL_EVENT_NAMES] : [FUNNEL_EVENT_NAMES];
+    const funnelNamesParam = shopId ? '$2' : '$1';
+    const storeTodayParams = shopId ? [shopId, FUNNEL_EVENT_NAMES] : [FUNNEL_EVENT_NAMES];
+    const storeTodayNamesParam = shopId ? '$2' : '$1';
+    const orderReconciliationParams = shopId
+        ? [shopId, config.shopifyWebOrderSources]
+        : [config.shopifyWebOrderSources];
+    const shopifyVersionParams = shopId
+        ? [config.shopifyApiVersion, shopId]
+        : [config.shopifyApiVersion];
+    const allowedOrderSourcesParam = shopId ? '$2' : '$1';
     const eventShopFilter = shopId ? ' AND shop_id = $1' : '';
     const shopFilter = shopId ? ' AND id = $1' : '';
     const dlqShopFilter = shopId ? ' AND shop_id = $1' : '';
+    const occurredInLast24Hours = `
+        CASE
+            WHEN COALESCE(request_payload->>'event_time', '') ~ '^\\d+$'
+                THEN (request_payload->>'event_time')::bigint
+            ELSE EXTRACT(EPOCH FROM timestamp)::bigint
+        END >= EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours')::bigint`;
     const [
         statusResult,
         emqResult,
         signalResult,
+        funnelResult,
+        storeTodayFunnelResult,
+        storeTodayWebhookResult,
+        sharedFacebookResult,
+        shopifyApiVersionResult,
+        orderReconciliationResult,
         officialQualityResult,
         dlqResult,
         shopsResult,
         pixelsResult,
+        testModeResult,
         integrityResult,
         backlogResult,
         privacyResult,
@@ -3696,14 +4559,14 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         pool.query(`
             SELECT status, COUNT(*)::int AS count
             FROM event_store
-            WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
+            WHERE ${occurredInLast24Hours}${eventShopFilter}
             GROUP BY status
         `, params),
         pool.query(`
             SELECT COUNT(*)::int AS total_events,
                    ROUND(AVG(emq_estimate)::numeric, 2) AS avg_emq
             FROM event_store
-            WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
+            WHERE ${occurredInLast24Hours}${eventShopFilter}
         `, params),
         pool.query(`
             SELECT COUNT(*)::int AS total_events,
@@ -3715,8 +4578,229 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                    COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'client_ip_address', false))::int AS client_ip_address,
                    COUNT(*) FILTER (WHERE COALESCE((request_payload->'user_data') ? 'client_user_agent', false))::int AS client_user_agent
             FROM event_store
-            WHERE timestamp >= NOW() - INTERVAL '24 hours'${eventShopFilter}
+            WHERE ${occurredInLast24Hours}${eventShopFilter}
         `, params),
+        pool.query(`
+            WITH recent_funnel AS (
+                SELECT event_name, event_id, status, emq_estimate, request_payload
+                FROM event_store
+                WHERE ${occurredInLast24Hours}
+                  AND event_name = ANY(${funnelNamesParam}::text[])${eventShopFilter}
+            ), event_stats AS (
+                SELECT event_name,
+                       COUNT(*)::int AS total_events,
+                       COUNT(DISTINCT event_id)::int AS unique_events,
+                       COUNT(*) FILTER (WHERE status = 'SUCCESS')::int AS successful_events,
+                       COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending_events,
+                       COUNT(*) FILTER (WHERE status = 'AWAITING_PAYMENT')::int AS awaiting_payment_events,
+                       COUNT(*) FILTER (WHERE status IN ('FAILED', 'PARTIAL_FAILED'))::int AS failed_events,
+                       COUNT(*) FILTER (
+                           WHERE COALESCE(
+                               jsonb_array_length(request_payload->'_quality'->'missing_event_parameters'),
+                               0
+                           ) > 0
+                       )::int AS missing_parameter_events,
+                       COUNT(*) FILTER (
+                           WHERE COALESCE(
+                               jsonb_array_length(request_payload->'_quality'->'local_validation_errors'),
+                               0
+                           ) > 0
+                       )::int AS locally_invalid_events,
+                       ROUND(AVG(emq_estimate)::numeric, 2) AS avg_emq
+                FROM recent_funnel
+                GROUP BY event_name
+            ), currency_totals AS (
+                SELECT event_name,
+                       UPPER(request_payload->'custom_data'->>'currency') AS currency,
+                       ROUND(SUM((request_payload->'custom_data'->>'value')::numeric), 2) AS total_value
+                FROM recent_funnel
+                WHERE jsonb_typeof(request_payload->'custom_data'->'value') = 'number'
+                  AND UPPER(COALESCE(request_payload->'custom_data'->>'currency', '')) ~ '^[A-Z]{3}$'
+                GROUP BY event_name, UPPER(request_payload->'custom_data'->>'currency')
+            ), currency_breakdowns AS (
+                SELECT event_name, jsonb_object_agg(currency, total_value) AS value_by_currency
+                FROM currency_totals
+                GROUP BY event_name
+            )
+            SELECT event_stats.*,
+                   COALESCE(currency_breakdowns.value_by_currency, '{}'::jsonb) AS value_by_currency
+            FROM event_stats
+            LEFT JOIN currency_breakdowns USING (event_name)
+        `, funnelParams),
+        pool.query(`
+            WITH scoped_shops AS (
+                SELECT id, shop_domain, reporting_timezone,
+                       date_trunc('day', NOW() AT TIME ZONE reporting_timezone)
+                           AT TIME ZONE reporting_timezone AS day_start_utc,
+                       (date_trunc('day', NOW() AT TIME ZONE reporting_timezone) + INTERVAL '1 day')
+                           AT TIME ZONE reporting_timezone AS day_end_utc
+                FROM shops
+                WHERE status = 'active'${shopId ? ' AND id = $1' : ''}
+            )
+            SELECT shop.id AS shop_id,
+                   shop.shop_domain,
+                   shop.reporting_timezone,
+                   shop.day_start_utc,
+                   shop.day_end_utc,
+                   event.event_name,
+                   COUNT(event.id)::int AS total_events,
+                   COUNT(DISTINCT event.event_id)::int AS unique_events,
+                   COUNT(event.id) FILTER (WHERE event.status = 'SUCCESS')::int AS successful_events,
+                   COUNT(event.id) FILTER (WHERE event.status = 'PENDING')::int AS pending_events,
+                   COUNT(event.id) FILTER (WHERE event.status = 'AWAITING_PAYMENT')::int AS awaiting_payment_events,
+                   COUNT(event.id) FILTER (WHERE event.status IN ('FAILED', 'PARTIAL_FAILED'))::int AS failed_events,
+                   ROUND(AVG(event.emq_estimate)::numeric, 2) AS avg_emq
+            FROM scoped_shops shop
+            LEFT JOIN event_store event
+              ON event.shop_id = shop.id
+             AND event.event_name = ANY(${storeTodayNamesParam}::text[])
+             AND COALESCE(
+                    CASE
+                        WHEN COALESCE(event.request_payload->>'event_time', '') ~ '^\\d+$'
+                            THEN to_timestamp((event.request_payload->>'event_time')::double precision)
+                    END,
+                    event.timestamp AT TIME ZONE 'UTC'
+                 ) >= shop.day_start_utc
+             AND COALESCE(
+                    CASE
+                        WHEN COALESCE(event.request_payload->>'event_time', '') ~ '^\\d+$'
+                            THEN to_timestamp((event.request_payload->>'event_time')::double precision)
+                    END,
+                    event.timestamp AT TIME ZONE 'UTC'
+                 ) < shop.day_end_utc
+            GROUP BY shop.id, shop.shop_domain, shop.reporting_timezone,
+                     shop.day_start_utc, shop.day_end_utc, event.event_name
+            ORDER BY shop.id, event.event_name
+        `, storeTodayParams),
+        pool.query(`
+            WITH scoped_shops AS (
+                SELECT id, reporting_timezone,
+                       date_trunc('day', NOW() AT TIME ZONE reporting_timezone)
+                           AT TIME ZONE reporting_timezone AS day_start_utc,
+                       (date_trunc('day', NOW() AT TIME ZONE reporting_timezone) + INTERVAL '1 day')
+                           AT TIME ZONE reporting_timezone AS day_end_utc
+                FROM shops
+                WHERE status = 'active'${shopId ? ' AND id = $1' : ''}
+            )
+            SELECT shop.id AS shop_id,
+                   COUNT(inbox.id)::int AS paid_webhooks,
+                   COUNT(inbox.id) FILTER (WHERE inbox.status = 'SUCCESS')::int AS successful_paid_webhooks,
+                   COUNT(inbox.id) FILTER (
+                       WHERE inbox.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')
+                   )::int AS outstanding_paid_webhooks,
+                   COUNT(inbox.id) FILTER (WHERE inbox.status = 'FAILED_PERMANENT')::int AS permanently_failed_paid_webhooks
+            FROM scoped_shops shop
+            LEFT JOIN shopify_webhook_inbox inbox
+              ON inbox.shop_id = shop.id
+             AND inbox.topic = 'orders/paid'
+             AND COALESCE(inbox.triggered_at, inbox.created_at) >= shop.day_start_utc
+             AND COALESCE(inbox.triggered_at, inbox.created_at) < shop.day_end_utc
+            GROUP BY shop.id
+            ORDER BY shop.id
+        `, shopId ? [shopId] : []),
+        pool.query(`
+            SELECT pixel.id, pixel.name, pixel.pixel_id,
+                   COUNT(DISTINCT route.shop_id)::int AS shop_count,
+                   ARRAY_AGG(DISTINCT shop.shop_domain ORDER BY shop.shop_domain) AS shop_domains
+            FROM pixels pixel
+            JOIN shop_pixel_routes route
+              ON route.pixel_id = pixel.id AND route.status = 'active'
+            JOIN shops shop
+              ON shop.id = route.shop_id AND shop.status = 'active'
+            WHERE pixel.platform = 'facebook'
+              AND pixel.status = 'active'
+            GROUP BY pixel.id, pixel.name, pixel.pixel_id
+            HAVING COUNT(DISTINCT route.shop_id) > 1
+               ${shopId ? 'AND BOOL_OR(route.shop_id = $1)' : ''}
+            ORDER BY shop_count DESC, pixel.id
+        `, shopId ? [shopId] : []),
+        pool.query(`
+            SELECT COALESCE(shopify_api_version, 'unknown') AS version,
+                   COUNT(*)::int AS deliveries,
+                   COUNT(*) FILTER (
+                       WHERE shopify_api_version IS NOT NULL
+                         AND shopify_api_version <> $1
+                   )::int AS mismatched
+            FROM shopify_webhook_inbox
+            WHERE created_at >= NOW() - INTERVAL '7 days'
+              ${shopId ? 'AND shop_id = $2' : ''}
+            GROUP BY COALESCE(shopify_api_version, 'unknown')
+            ORDER BY deliveries DESC, version
+        `, shopifyVersionParams),
+        pool.query(`
+            WITH paid_order_observations AS (
+                SELECT shop_id,
+                       webhook_id,
+                       COALESCE(
+                           NULLIF(payload->>'checkout_token', ''),
+                           NULLIF(payload->>'cart_token', ''),
+                           NULLIF(payload->>'token', ''),
+                           NULLIF(payload->>'id', ''),
+                           NULLIF(payload->>'name', ''),
+                           webhook_id
+                       ) AS order_identity,
+                       LOWER(COALESCE(payload->>'source_name', payload->>'sourceName', '')) AS source_name,
+                       COALESCE((payload->>'test')::boolean, false) AS is_test,
+                       status
+                FROM shopify_webhook_inbox
+                WHERE topic = 'orders/paid'
+                  AND COALESCE(triggered_at, created_at) >= NOW() - INTERVAL '24 hours'
+                  ${shopId ? 'AND shop_id = $1' : ''}
+            ), paid_orders AS (
+                SELECT shop_id,
+                       order_identity,
+                       BOOL_OR(is_test) AS is_test,
+                       BOOL_OR(source_name = ANY(${allowedOrderSourcesParam}::text[])) AS is_allowed_source,
+                       BOOL_OR(source_name = '') AS has_missing_source,
+                       BOOL_OR(status = 'FAILED_PERMANENT') AS has_permanent_failure,
+                       BOOL_OR(status = 'SUCCESS') AS processed_successfully
+                FROM paid_order_observations
+                GROUP BY shop_id, order_identity
+            ), purchase_ledger AS (
+                SELECT event.shop_id,
+                       event.request_payload #>> '{_source,order_identity}' AS order_identity,
+                       BOOL_OR(delivery.status = 'SUCCESS') FILTER (
+                           WHERE pixel.platform = 'facebook'
+                       ) AS meta_delivered,
+                       BOOL_OR(delivery.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')) FILTER (
+                           WHERE pixel.platform = 'facebook'
+                       ) AS meta_pending,
+                       BOOL_OR(delivery.status = 'FAILED_PERMANENT') FILTER (
+                           WHERE pixel.platform = 'facebook'
+                       ) AS meta_failed,
+                       BOOL_OR(
+                           pixel.platform = 'facebook'
+                           AND delivery.status = 'FAILED_PERMANENT'
+                           AND delivery.error_code = 'LOCAL_VALIDATION'
+                       ) AS locally_invalid
+                FROM event_store event
+                LEFT JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                LEFT JOIN shop_pixel_routes route ON route.id = delivery.route_id
+                LEFT JOIN pixels pixel ON pixel.id = route.pixel_id
+                WHERE event.event_name = 'Purchase'
+                  AND event.request_payload #>> '{_source,order_identity}' IS NOT NULL
+                  AND ${occurredInLast24Hours}
+                  ${shopId ? 'AND event.shop_id = $1' : ''}
+                GROUP BY event.shop_id, event.request_payload #>> '{_source,order_identity}'
+            )
+            SELECT COUNT(*)::int AS observed_paid_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source)::int AS eligible_web_paid_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND processed_successfully)::int AS inbox_processed_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND ledger.order_identity IS NOT NULL)::int AS purchase_ledger_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND COALESCE(ledger.meta_delivered, false))::int AS meta_delivered_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND COALESCE(ledger.meta_pending, false) AND NOT COALESCE(ledger.meta_delivered, false))::int AS meta_pending_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND COALESCE(ledger.meta_failed, false) AND NOT COALESCE(ledger.meta_delivered, false))::int AS meta_failed_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND COALESCE(ledger.locally_invalid, false))::int AS locally_invalid_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND is_allowed_source AND ledger.order_identity IS NULL)::int AS unledgered_eligible_orders,
+                   COUNT(*) FILTER (WHERE is_test)::int AS ignored_test_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND NOT is_allowed_source AND NOT has_missing_source)::int AS ignored_non_web_orders,
+                   COUNT(*) FILTER (WHERE NOT is_test AND NOT is_allowed_source AND has_missing_source)::int AS missing_source_orders,
+                   COUNT(*) FILTER (WHERE has_permanent_failure AND NOT processed_successfully)::int AS permanently_failed_orders
+            FROM paid_orders
+            LEFT JOIN purchase_ledger ledger
+              ON ledger.shop_id = paid_orders.shop_id
+             AND ledger.order_identity = paid_orders.order_identity
+        `, orderReconciliationParams),
         pool.query(`
             SELECT DISTINCT ON (m.pixel_route_id, m.shop_id)
                    m.pixel_route_id,
@@ -3725,10 +4809,23 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                    p.name,
                    p.pixel_id,
                    m.fetched_at,
-                   m.status,
+                   CASE
+                       WHEN m.status = 'SUCCESS'
+                        AND COALESCE(jsonb_array_length(m.summary_payload->'events'), 0) = 0
+                       THEN 'EMPTY'
+                       ELSE m.status
+                   END AS status,
                    m.metric_type,
                    m.summary_payload,
-                   m.error_message
+                   CASE
+                       WHEN m.status = 'SUCCESS'
+                        AND COALESCE(jsonb_array_length(m.summary_payload->'events'), 0) = 0
+                       THEN COALESCE(
+                           m.error_message,
+                           'Meta Dataset Quality returned no event-level metrics; use local signal coverage while permissions and data availability are verified'
+                       )
+                       ELSE m.error_message
+                   END AS error_message
             FROM meta_quality_snapshots m
             JOIN pixels p ON p.id = m.pixel_route_id
             JOIN shops s ON s.id = m.shop_id
@@ -3744,6 +4841,21 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
              WHERE r.status = 'active'
              ${shopId ? 'AND r.shop_id = $1' : ''}
              GROUP BY p.platform`,
+            params,
+        ),
+        pool.query(
+            `SELECT
+                 COUNT(*) FILTER (
+                     WHERE r.test_event_code IS NOT NULL
+                       AND r.test_event_code_expires_at > NOW()
+                 )::int AS active_routes,
+                 COUNT(*) FILTER (
+                     WHERE r.test_event_code IS NOT NULL
+                       AND (r.test_event_code_expires_at IS NULL OR r.test_event_code_expires_at <= NOW())
+                 )::int AS expired_routes
+             FROM shop_pixel_routes r
+             WHERE r.status = 'active'
+             ${shopId ? 'AND r.shop_id = $1' : ''}`,
             params,
         ),
         pool.query(`
@@ -3947,12 +5059,72 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         };
     });
 
+    const storeTodayWebhooks = new Map(
+        storeTodayWebhookResult.rows.map(row => [Number(row.shop_id), row]),
+    );
+    const storeTodayByShop = new Map();
+    for (const row of storeTodayFunnelResult.rows) {
+        const shopKey = Number(row.shop_id);
+        if (!storeTodayByShop.has(shopKey)) {
+            storeTodayByShop.set(shopKey, {
+                shop_id: shopKey,
+                shop_domain: row.shop_domain,
+                reporting_timezone: row.reporting_timezone,
+                day_start_utc: row.day_start_utc,
+                day_end_utc: row.day_end_utc,
+                event_rows: [],
+            });
+        }
+        if (row.event_name) storeTodayByShop.get(shopKey).event_rows.push(row);
+    }
+    const storeToday = [...storeTodayByShop.values()].map(shop => {
+        const webhook = storeTodayWebhooks.get(shop.shop_id) || {};
+        return {
+            shop_id: shop.shop_id,
+            shop_domain: shop.shop_domain,
+            reporting_timezone: shop.reporting_timezone,
+            day_start_utc: shop.day_start_utc,
+            day_end_utc: shop.day_end_utc,
+            funnel_events: decorateFunnelSummary(shop.event_rows),
+            paid_webhooks: Number(webhook.paid_webhooks || 0),
+            successful_paid_webhooks: Number(webhook.successful_paid_webhooks || 0),
+            outstanding_paid_webhooks: Number(webhook.outstanding_paid_webhooks || 0),
+            permanently_failed_paid_webhooks: Number(webhook.permanently_failed_paid_webhooks || 0),
+        };
+    });
+
     res.json({
         last24h: {
             total_events: emqResult.rows[0]?.total_events || 0,
             avg_emq: emqResult.rows[0]?.avg_emq || null,
             by_status: statusResult.rows,
             emq_signals: emqSignals,
+            funnel_events: decorateFunnelSummary(funnelResult.rows),
+            shopify_paid_orders: orderReconciliationResult.rows[0] || {},
+        },
+        store_today: {
+            definition: 'Calendar day in each shop reporting_timezone using event occurrence time',
+            generated_at_utc: new Date().toISOString(),
+            shops: storeToday,
+        },
+        routing_health: {
+            shared_facebook_datasets: sharedFacebookResult.rowCount,
+            shared_facebook_details: sharedFacebookResult.rows,
+            shared_facebook_routes_allowed: config.allowSharedFacebookDatasetRoutes,
+            test_mode: {
+                ttl_minutes: config.testEventCodeTtlMinutes,
+                active_routes: Number(testModeResult.rows[0]?.active_routes || 0),
+                expired_routes: Number(testModeResult.rows[0]?.expired_routes || 0),
+            },
+        },
+        shopify_api_health: {
+            configured_version: config.shopifyApiVersion,
+            observation_window_days: 7,
+            observed_versions: shopifyApiVersionResult.rows,
+            mismatched_deliveries: shopifyApiVersionResult.rows.reduce(
+                (sum, row) => sum + Number(row.mismatched || 0),
+                0,
+            ),
         },
         official_meta_quality: officialQualityResult.rows.map(row => ({
             shop_domain: row.shop_domain,
@@ -3993,6 +5165,25 @@ app.post('/api/admin/meta-quality/refresh', asyncHandler(async (req, res) => {
         failed: results.filter(result => result?.status === 'FAILED').length,
         results,
     });
+}));
+
+app.get('/api/admin/browser-diagnostics', asyncHandler(async (req, res) => {
+    const shopId = readOptionalShopId(req);
+    const params = shopId ? [shopId] : [];
+    const filter = shopId ? 'WHERE diagnostic.shop_id = $1' : '';
+    const { rows } = await pool.query(
+        `SELECT diagnostic.id, diagnostic.shop_id, shop.shop_domain, diagnostic.code,
+                diagnostic.dropped_count, diagnostic.event_counts,
+                diagnostic.source_version, diagnostic.schema_version,
+                diagnostic.client_first_at, diagnostic.client_last_at, diagnostic.created_at
+         FROM browser_delivery_diagnostics diagnostic
+         JOIN shops shop ON shop.id = diagnostic.shop_id
+         ${filter}
+         ORDER BY diagnostic.id DESC
+         LIMIT 200`,
+        params,
+    );
+    return res.json(rows);
 }));
 
 app.get('/api/admin/dlq', asyncHandler(async (req, res) => {
