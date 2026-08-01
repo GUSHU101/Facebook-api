@@ -152,7 +152,7 @@
                                     <div class="mt-1 text-xs text-slate-500">{{ s.paid_webhook_last_checked_at ? formatTime(s.paid_webhook_last_checked_at) : '等待审计' }}</div>
                                 </td>
                                 <td>
-                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v19' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
+                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v20' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
                                     <div class="mt-1 text-xs text-slate-500">客户端自报：{{ s.pixel_last_seen_at ? formatTime(s.pixel_last_seen_at) : '新版首个事件进入后显示' }} · 自报丢失诊断 {{ s.pixel_diagnostic_count || 0 }}</div>
                                 </td>
                                 <td>{{ formatTime(s.created_at) }}</td>
@@ -727,7 +727,7 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v19";
+const SOURCE_VERSION = "shopify-pixel-v20";
 const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
 const META_STANDARD_BROWSER_EVENTS = new Set([
     'PageView', 'ViewContent', 'Search', 'AddToCart',
@@ -1958,10 +1958,13 @@ async function flushEventQueueOnce() {
                 var responsePayload;
                 try { responsePayload = response && await response.json(); } catch (error) {}
                 if (responsePayload && responsePayload.batch && Array.isArray(responsePayload.results)) {
-                    var rejectedEvents = batch.filter(function (event, resultIndex) {
+                    var rejectedEvents = [];
+                    for (var resultIndex = 0; resultIndex < batch.length; resultIndex += 1) {
                         var result = responsePayload.results[resultIndex];
-                        return result && (result.rejected === true || result.success === false);
-                    });
+                        if (result && (result.rejected === true || result.success === false)) {
+                            rejectedEvents.push(batch[resultIndex]);
+                        }
+                    }
                     if (rejectedEvents.length) {
                         queueClientDiagnostic('SERVER_BATCH_REJECTED', rejectedEvents, rejectedEvents.length);
                         console.warn('CAPI gateway permanently rejected ' + rejectedEvents.length + ' event(s) inside an accepted batch');

@@ -210,7 +210,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         const commonEvent = {
             shop_domain: shopDomain,
             schema_version: '2.0',
-            source_version: 'shopify-pixel-v19',
+            source_version: 'shopify-pixel-v20',
             source_provider: 'shopify_web_pixels',
             timestamp: new Date().toISOString(),
             url: `https://${shopDomain}/products/integration?utm_source=e2e&email=remove@example.com`,
