@@ -210,7 +210,7 @@ async function markDeliverySuccess(routeId, claims, responseForEvent) {
 }
 
 async function markDeliveryFailure(routeId, claims, classification, expectedCredentialVersion = null) {
-    if (claims.length === 0) return [];
+    if (claims.length === 0) return { eventStoreIds: [], retryDelaySeconds: 0 };
     const retryDelay = retryDelayWithJitterSeconds(
         classification.attempt,
         config.deliveryRetryBaseSeconds,
@@ -261,7 +261,10 @@ async function markDeliveryFailure(routeId, claims, classification, expectedCred
             expectedCredentialVersion,
         ],
     );
-    return rows.map(row => String(row.event_store_id));
+    return {
+        eventStoreIds: rows.map(row => String(row.event_store_id)),
+        retryDelaySeconds: classification.retryable ? retryDelay : 0,
+    };
 }
 
 async function deferRouteEvents(routeId, eventIds, delaySeconds, code, message) {
@@ -1056,7 +1059,7 @@ async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliv
         const failureClaims = claimsForEvents(failedDbEvents, claimedEvents);
         const maxAttempt = Math.max(1, ...failureClaims.map(item => item.attemptCount));
         const normalizedFailure = { ...failure, route_id: pixel.route_id, status: 'FAILED' };
-        const updatedIds = await markDeliveryFailure(pixel.route_id, failureClaims, {
+        const { eventStoreIds: updatedIds } = await markDeliveryFailure(pixel.route_id, failureClaims, {
             retryable: false,
             code: failure.code,
             message: failure.message,
@@ -1310,12 +1313,13 @@ const worker = new Worker('capi-events', async job => {
                 Number(classification.retryAfterSeconds || 0),
                 credentialDelay,
             );
-            let updatedIds = await markDeliveryFailure(
+            let failureUpdate = await markDeliveryFailure(
                 pixel.route_id,
                 claims,
                 classification,
                 pixel.credential_version,
             );
+            let updatedIds = failureUpdate.eventStoreIds;
             if (
                 updatedIds.length === 0
                 && claims.length > 0
@@ -1328,7 +1332,8 @@ const worker = new Worker('capi-events', async job => {
                     retryAfterSeconds: config.credentialBusyDelaySeconds,
                     attempt: maxAttempt,
                 };
-                updatedIds = await markDeliveryFailure(pixel.route_id, claims, classification);
+                failureUpdate = await markDeliveryFailure(pixel.route_id, claims, classification);
+                updatedIds = failureUpdate.eventStoreIds;
             }
             if (updatedIds.length > 0) {
                 deliveries.push({
@@ -1347,7 +1352,9 @@ const worker = new Worker('capi-events', async job => {
                 retryNeeded = true;
                 retryAfterSeconds = Math.max(
                     retryAfterSeconds,
-                    Number(classification.retryAfterSeconds || config.deliveryRetryBaseSeconds),
+                    Number(failureUpdate.retryDelaySeconds
+                        || classification.retryAfterSeconds
+                        || config.deliveryRetryBaseSeconds),
                 );
             }
         } finally {
