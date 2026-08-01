@@ -244,6 +244,7 @@ const SUPPORTED_PIXEL_SOURCE_VERSIONS = new Set([
     'shopify-pixel-v17',
     'shopify-pixel-v18',
     'shopify-pixel-v19',
+    'shopify-pixel-v20',
 ]);
 const SHOPIFY_BROWSER_EVENT_SOURCES = new Map([
     ['PageView', 'page_viewed'],

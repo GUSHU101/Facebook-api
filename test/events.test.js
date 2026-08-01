@@ -1944,7 +1944,9 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v19');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v20');
+    assert.equal(generated.includes('batch.filter(function (event, resultIndex)'), false);
+    assert.match(generated, /for \(var resultIndex = 0; resultIndex < batch\.length; resultIndex \+= 1\)/);
     assert.equal(sentEvents[0].source_provider, 'shopify_web_pixels');
     assert.equal(sentEvents[0].source_event_id, 'shopify-event-1');
     assert.equal(generated.includes('getOrCreateTtp'), false);
