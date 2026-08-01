@@ -207,8 +207,8 @@ test('two shops sharing one Pixel retain isolated routes, test codes, and ledger
                      shop_id, pixel_id, test_event_code, test_event_code_expires_at
                  )
                  VALUES (
-                     $1, $2, $3,
-                     CASE WHEN $3::text IS NOT NULL THEN NOW() + INTERVAL '30 minutes' ELSE NULL END
+                     $1, $2, $3::varchar(100),
+                     CASE WHEN $3::varchar(100) IS NOT NULL THEN NOW() + INTERVAL '30 minutes' ELSE NULL END
                  ) RETURNING id`,
                 [shopIds[index], pixelId, index === 0 ? 'TEST-SHOP-A' : null],
             );
