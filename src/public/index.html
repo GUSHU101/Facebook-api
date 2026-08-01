@@ -152,7 +152,7 @@
                                     <div class="mt-1 text-xs text-slate-500">{{ s.paid_webhook_last_checked_at ? formatTime(s.paid_webhook_last_checked_at) : '等待审计' }}</div>
                                 </td>
                                 <td>
-                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v20' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
+                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v21' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
                                     <div class="mt-1 text-xs text-slate-500">客户端自报：{{ s.pixel_last_seen_at ? formatTime(s.pixel_last_seen_at) : '新版首个事件进入后显示' }} · 自报丢失诊断 {{ s.pixel_diagnostic_count || 0 }}</div>
                                 </td>
                                 <td>{{ formatTime(s.created_at) }}</td>
@@ -657,6 +657,14 @@
 
     <script>
         const { createApp } = Vue;
+
+        function compactGeneratedPixelSource(source) {
+            return String(source || '')
+                .replace(/^[\t ]+/gm, '')
+                .replace(/^\/\/[^\r\n]*(?:\r?\n|$)/gm, '')
+                .replace(/(?:\r?\n){2,}/g, '\n')
+                .trim();
+        }
         createApp({
             data() {
                 return {
@@ -718,7 +726,7 @@
                     return this.summary.official_meta_quality || [];
                 },
                 generatedCode() {
-                    return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
+                    return compactGeneratedPixelSource(`// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
 const CAPI_PIXEL_CONFIG_URL = "${this.apiDomain}/api/pixel-config";
 const CAPI_PIXEL_DIAGNOSTIC_URL = "${this.apiDomain}/api/pixel-diagnostic";
@@ -727,7 +735,7 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v20";
+const SOURCE_VERSION = "shopify-pixel-v21";
 const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
 const META_STANDARD_BROWSER_EVENTS = new Set([
     'PageView', 'ViewContent', 'Search', 'AddToCart',
@@ -2279,7 +2287,7 @@ analytics.subscribe('search_submitted', function (event) {
     var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
     return sendDualChannelEvent('Search', event, { search_string: query });
 });
-`;
+`);
                 },
             },
             methods: {

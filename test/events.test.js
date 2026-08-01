@@ -1619,7 +1619,7 @@ test('commerce events retain multi-page order contents up to the configured safe
 
 test('generated Shopify pixel sends Meta browser and CAPI events with identical dedupe IDs', async () => {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
-    const match = html.match(/generatedCode\(\)\s*{\s*return `([\s\S]*?)`;\s*}\s*,\s*}\s*,\s*methods:/);
+    const match = html.match(/generatedCode\(\)\s*{\s*return compactGeneratedPixelSource\(`([\s\S]*?)`\);\s*}/);
     assert.ok(match, 'generatedCode template should exist');
 
     const renderedTemplate = match[1]
@@ -1631,7 +1631,16 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     // The browser evaluates this as a template literal before presenting the
     // generated pixel. Cook escape sequences here so the VM executes exactly
     // the code a merchant copies from the admin UI.
-    const generated = Function(`return \`${renderedTemplate}\`;`)();
+    const generated = Function(`return \`${renderedTemplate}\`;`)()
+        .replace(/^[\t ]+/gm, '')
+        .replace(/^\/\/[^\r\n]*(?:\r?\n|$)/gm, '')
+        .replace(/(?:\r?\n){2,}/g, '\n')
+        .trim();
+
+    assert.ok(
+        generated.length <= 64_000,
+        `generated Shopify pixel must stay within Shopify's 64,000-character limit; received ${generated.length}`,
+    );
 
     assert.doesNotMatch(
         generated,
@@ -1944,7 +1953,7 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v20');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v21');
     assert.equal(generated.includes('batch.filter(function (event, resultIndex)'), false);
     assert.match(generated, /for \(var resultIndex = 0; resultIndex < batch\.length; resultIndex \+= 1\)/);
     assert.equal(sentEvents[0].source_provider, 'shopify_web_pixels');
