@@ -153,6 +153,12 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
     try {
         await waitForReady(`${apiOrigin}/readyz`, server);
 
+        const queueBoardResponse = await fetch(`${apiOrigin}/admin/queue`, {
+            headers: { Authorization: authorization },
+        });
+        assert.equal(queueBoardResponse.status, 200, await queueBoardResponse.text());
+        assert.match(String(queueBoardResponse.headers.get('content-type')), /text\/html/);
+
         const rejectedAdminMutation = await fetch(`${apiOrigin}/api/admin/shops`, {
             method: 'POST',
             headers: { Authorization: authorization, 'Content-Type': 'application/json' },

@@ -236,6 +236,18 @@ worker restarted.
     no-store`. Unauthenticated oversized bodies cannot consume the full admin
     parser allowance, and browsers/proxies cannot retain operational customer
     data after logout.
+61. Cron maintenance handlers are single-flight within each API process. Cron
+    work, webhook-triggered immediate inbox drains, and manual privacy retries
+    share one tracked background-task group. Graceful shutdown stops new work
+    synchronously and waits for every active handler before closing PostgreSQL,
+    Redis, or BullMQ; the existing shutdown deadline remains the final bound.
+62. The scheduled Shopify webhook audit uses a renewable distributed Redis
+    lock, so horizontally scaled API instances do not duplicate the same Admin
+    API inspection run. Per-shop reconciliation and durable inbox drains retain
+    their PostgreSQL advisory-lock or `SKIP LOCKED` coordination.
+63. Worker health heartbeats are single-flight and a graceful Worker shutdown
+    waits for the current heartbeat before closing Redis. A slow Redis command
+    cannot create overlapping heartbeat promises or race connection teardown.
 
 ## Storefront ingestion abuse boundary
 

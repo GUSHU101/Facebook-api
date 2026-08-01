@@ -12,6 +12,7 @@ Before pushing this project to GitHub:
    - `npm ci`
    - generated admin asset reproducibility check
    - `npm run check`
+   - deployment shell fault-injection tests
    - `npm test`
    - `npm audit --omit=dev --audit-level=moderate`
    - production-only `npm ci --omit=dev` verification

@@ -60,20 +60,17 @@ const { classifyFacebookError, metaRateControlFromHeaders } = require('./platfor
 const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const { parseJsonPreservingLargeIntegers } = require('./utils/json');
 const { enqueueReschedulableJob } = require('./utils/queue');
+const { createTrackedCronScheduler } = require('./utils/scheduler');
 const { consumeWeightedWindow } = require('./utils/weighted-rate-limit');
 
 const app = express();
 let shuttingDown = false;
-const scheduledTasks = [];
+const backgroundScheduler = createTrackedCronScheduler(cron, {
+    onError: (error, label) => console.error(`[Background:${label}] unhandled task failure:`, error),
+});
 
-function scheduleCron(expression, handler) {
-    if (!cron.validate(expression)) throw new Error(`Invalid cron expression: ${expression}`);
-    const task = cron.schedule(expression, () => {
-        if (shuttingDown) return undefined;
-        return handler();
-    });
-    scheduledTasks.push(task);
-    return task;
+function scheduleCron(expression, handler, label) {
+    return backgroundScheduler.schedule(expression, handler, label);
 }
 
 app.set('trust proxy', config.trustProxy);
@@ -3329,9 +3326,10 @@ function shopifyPrivacyHandler(expectedTopic) {
             [shopDomain, shopDomainHash, webhookId, topic, JSON.stringify(payload || {}), payloadDigest],
         );
         res.status(200).json({ success: true, accepted: true, duplicate: insert.rowCount === 0 });
-        setImmediate(() => void drainShopifyPrivacyInbox().catch(error => {
-            console.error('[ShopifyPrivacy] immediate drain failed:', error.message);
-        }));
+        setImmediate(() => backgroundScheduler.run(
+            drainShopifyPrivacyInbox,
+            'shopify-privacy-immediate-drain',
+        ));
     });
 }
 
@@ -3387,9 +3385,10 @@ async function handleShopifyPurchaseWebhook(req, res) {
         ],
     );
     res.status(200).json({ success: true, accepted: true, durable: true, duplicate: insert.rowCount === 0 });
-    setImmediate(() => void drainShopifyWebhookInbox().catch(error => {
-        console.error('[ShopifyInbox] immediate drain failed:', error.message);
-    }));
+    setImmediate(() => backgroundScheduler.run(
+        drainShopifyWebhookInbox,
+        'shopify-webhook-immediate-drain',
+    ));
 }
 
 app.post('/api/webhook/purchase', asyncHandler(handleShopifyPurchaseWebhook));
@@ -3441,7 +3440,7 @@ scheduleCron(config.shopifyWebhookInboxCron, async () => {
     } catch (error) {
         console.error('[ShopifyInbox] scheduled drain failed:', error);
     }
-});
+}, 'shopify-webhook-inbox');
 
 scheduleCron(config.shopifyPrivacyCron, async () => {
     try {
@@ -3450,7 +3449,7 @@ scheduleCron(config.shopifyPrivacyCron, async () => {
     } catch (error) {
         console.error('[ShopifyPrivacy] scheduled drain failed:', error);
     }
-});
+}, 'shopify-privacy-inbox');
 
 scheduleCron(config.shopifyReconcileCron, async () => {
     try {
@@ -3459,10 +3458,16 @@ scheduleCron(config.shopifyReconcileCron, async () => {
     } catch (error) {
         console.error('[ShopifyReconcile] scheduled run failed:', error);
     }
-});
+}, 'shopify-paid-order-reconcile');
 
 scheduleCron(config.shopifyWebhookAuditCron, async () => {
+    const lockKey = 'lock:shopify_webhook_audit';
+    const lockToken = crypto.randomUUID();
+    let stopLockHeartbeat;
     try {
+        const lock = await redis.set(lockKey, lockToken, 'EX', 30 * 60, 'NX');
+        if (!lock) return;
+        stopLockHeartbeat = startRedisLockHeartbeat(lockKey, lockToken, 30 * 60);
         const results = await auditPaidWebhookSubscriptions();
         const unhealthy = results.filter(item => !['HEALTHY', 'HEALTHY_WITH_ALTERNATES'].includes(item.status));
         if (unhealthy.length > 0) {
@@ -3470,8 +3475,11 @@ scheduleCron(config.shopifyWebhookAuditCron, async () => {
         }
     } catch (error) {
         console.error('[ShopifyWebhookAudit] scheduled run failed:', error);
+    } finally {
+        if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
+        await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
-});
+}, 'shopify-webhook-audit');
 
 scheduleCron(config.batchCron, async () => {
     if (!config.legacyRedisDrainEnabled) return;
@@ -3551,7 +3559,7 @@ scheduleCron(config.batchCron, async () => {
     } catch (error) {
         console.error('Outbox pack error:', error);
     }
-});
+}, 'legacy-outbox-pack');
 
 scheduleCron(config.watchdogCron, async () => {
     if (!config.legacyRedisDrainEnabled) return;
@@ -3585,7 +3593,7 @@ scheduleCron(config.watchdogCron, async () => {
     } catch (error) {
         console.error('Watchdog error:', error);
     }
-});
+}, 'legacy-redis-watchdog');
 
 scheduleCron(config.watchdogCron, async () => {
     try {
@@ -3596,7 +3604,7 @@ scheduleCron(config.watchdogCron, async () => {
     } catch (error) {
         console.error('Event aggregate reconciliation error:', error);
     }
-});
+}, 'event-aggregate-reconcile');
 
 scheduleCron(config.watchdogCron, async () => {
     const lockKey = 'lock:stale_pending_rescue';
@@ -3615,7 +3623,7 @@ scheduleCron(config.watchdogCron, async () => {
         if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
         await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
-});
+}, 'stale-pending-rescue');
 
 scheduleCron(config.metaQualityCron, async () => {
     const lockKey = 'lock:meta_quality_refresh';
@@ -3637,7 +3645,7 @@ scheduleCron(config.metaQualityCron, async () => {
         if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
         await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
-});
+}, 'meta-quality-refresh');
 
 scheduleCron(config.cleanupCron, async () => {
     const lockKey = 'lock:operational_data_cleanup';
@@ -3656,7 +3664,7 @@ scheduleCron(config.cleanupCron, async () => {
         if (stopLockHeartbeat) await stopLockHeartbeat().catch(() => {});
         await releaseRedisLock(lockKey, lockToken).catch(() => {});
     }
-});
+}, 'operational-data-cleanup');
 
 app.get('/admin/assets/admin.css', (req, res) => {
     res.set('Cache-Control', 'private, no-cache');
@@ -4496,9 +4504,10 @@ app.post('/api/admin/privacy/:id/retry', asyncHandler(async (req, res) => {
         [id],
     );
     if (rowCount === 0) return res.status(409).json({ error: 'Privacy request is not permanently failed' });
-    setImmediate(() => void drainShopifyPrivacyInbox().catch(error => {
-        console.error('[ShopifyPrivacy] manual retry drain failed:', error.message);
-    }));
+    setImmediate(() => backgroundScheduler.run(
+        drainShopifyPrivacyInbox,
+        'shopify-privacy-manual-retry',
+    ));
     return res.json({ success: true, id, queued: true });
 }));
 
@@ -5266,7 +5275,10 @@ async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`Received ${signal}, shutting down API server`);
-    for (const task of scheduledTasks) task.stop();
+    // stopAndDrain() stops future invocations synchronously, then lets any
+    // already-running maintenance transaction finish before its dependencies
+    // are closed.
+    const scheduledDrain = backgroundScheduler.stopAndDrain();
     const forceTimer = setTimeout(() => {
         console.error('API shutdown deadline exceeded; closing remaining sockets');
         server.closeAllConnections?.();
@@ -5276,6 +5288,7 @@ async function shutdown(signal) {
     server.closeIdleConnections?.();
     server.close(async () => {
         try {
+            await scheduledDrain;
             await capiQueue.close();
             await pool.end();
             await redis.quit();
