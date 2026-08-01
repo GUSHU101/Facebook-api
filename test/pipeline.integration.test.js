@@ -67,6 +67,8 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
     const metaPixelId = `9${Date.now()}${Math.floor(Math.random() * 10000)}`;
     const metaToken = `integration-meta-token-${suffix}`;
     const metaRequests = [];
+    let transientEventId;
+    const transientAttempts = new Map();
     const pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const fakeMeta = http.createServer((req, res) => {
         const chunks = [];
@@ -74,17 +76,30 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         req.on('end', () => {
             const rawBody = Buffer.concat(chunks).toString('utf8');
             const body = JSON.parse(rawBody || '{}');
+            const containsTransientEvent = Array.isArray(body.data)
+                && body.data.some(event => event.event_id === transientEventId);
+            const transientAttempt = containsTransientEvent
+                ? (transientAttempts.get(transientEventId) || 0) + 1
+                : 0;
+            if (containsTransientEvent) transientAttempts.set(transientEventId, transientAttempt);
+            const simulatedStatus = containsTransientEvent && transientAttempt === 1 ? 503 : 200;
             metaRequests.push({
                 method: req.method,
                 url: req.url,
                 authorization: req.headers.authorization,
                 body,
+                simulatedStatus,
             });
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                events_received: Array.isArray(body.data) ? body.data.length : 0,
-                fbtrace_id: `trace-${metaRequests.length}`,
-            }));
+            if (simulatedStatus === 503) {
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+                res.end(JSON.stringify({ error: { message: 'simulated transient Meta outage', code: 2, is_transient: true } }));
+            } else {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    events_received: Array.isArray(body.data) ? body.data.length : 0,
+                    fbtrace_id: `trace-${metaRequests.length}`,
+                }));
+            }
         });
     });
     await new Promise((resolve, reject) => {
@@ -103,6 +118,8 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         WATCHDOG_CRON: '*/1 * * * * *',
         SHOPIFY_WEBHOOK_INBOX_CRON: '*/1 * * * * *',
         SHOP_CONTINUATION_DELAY_MS: '25',
+        DELIVERY_RETRY_BASE_SECONDS: '1',
+        QUEUE_BACKOFF_MS: '100',
     };
     const cwd = require('node:path').join(__dirname, '..');
     const server = spawn(process.execPath, ['src/server.js'], {
@@ -129,6 +146,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         'X-CAPI-Admin-Request': '1',
     };
     let shopId;
+    let secondShopId;
     let pixelId;
     try {
         await waitForReady(`${apiOrigin}/readyz`, server);
@@ -233,6 +251,114 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         assert.equal(pageViewLedger.platform_response.accepted_event, true);
         assert.doesNotMatch(pageViewLedger.request_payload.event_source_url, /email=/i);
 
+        transientEventId = `${shopDomain}:transient-${suffix}`;
+        const transientResponse = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST',
+            headers: eventHeaders,
+            body: JSON.stringify({
+                ...commonEvent,
+                event_name: 'ViewContent',
+                event_id: transientEventId,
+                source_event_name: 'product_viewed',
+                source_event_id: `source-transient-${suffix}`,
+                value: 9.99,
+                currency: 'USD',
+                content_ids: ['variant-transient'],
+                contents: [{ id: 'variant-transient', quantity: 1, item_price: 9.99 }],
+                content_type: 'product',
+            }),
+        });
+        assert.equal(transientResponse.status, 202, await transientResponse.text());
+        const transientLedger = await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT event.status, delivery.status AS delivery_status,
+                        delivery.attempt_count, delivery.platform_response
+                 FROM event_store event
+                 JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 WHERE event.shop_id = $1 AND event.event_name = 'ViewContent' AND event.event_id = $2`,
+                [shopId, transientEventId],
+            );
+            return rows[0]?.status === 'SUCCESS' ? rows[0] : null;
+        }, 'transient Meta failure retry SUCCESS ledger', 30_000);
+        assert.equal(transientLedger.delivery_status, 'SUCCESS');
+        assert.ok(Number(transientLedger.attempt_count) >= 2);
+        assert.equal(transientLedger.platform_response.accepted_event, true);
+        const transientMetaRequests = metaRequests.filter(request => (
+            (request.body.data || []).some(event => event.event_id === transientEventId)
+        ));
+        assert.ok(transientMetaRequests.some(request => request.simulatedStatus === 503));
+        assert.equal(transientMetaRequests.filter(request => request.simulatedStatus === 200).length, 1);
+
+        const secondShopDomain = `delivery-second-${suffix}.myshopify.com`;
+        const secondShopResponse = await fetch(`${apiOrigin}/api/admin/shops`, {
+            method: 'POST',
+            headers: adminHeaders,
+            body: JSON.stringify({
+                shop_domain: secondShopDomain,
+                app_secret: `second_webhook_secret_${crypto.randomBytes(18).toString('hex')}`,
+            }),
+        });
+        assert.equal(secondShopResponse.status, 201, await secondShopResponse.text());
+        const refreshedShopsResponse = await fetch(`${apiOrigin}/api/admin/shops`, {
+            headers: { Authorization: authorization },
+        });
+        const refreshedShops = await refreshedShopsResponse.json();
+        assert.equal(refreshedShopsResponse.status, 200, JSON.stringify(refreshedShops));
+        const secondShop = refreshedShops.find(item => item.shop_domain === secondShopDomain);
+        assert.ok(secondShop?.id);
+        secondShopId = Number(secondShop.id);
+
+        const sharedPixelResponse = await fetch(`${apiOrigin}/api/admin/pixels`, {
+            method: 'POST',
+            headers: adminHeaders,
+            body: JSON.stringify({
+                shop_id: shopId,
+                shop_ids: [shopId, secondShopId],
+                platform: 'facebook',
+                name: 'integration-shared-meta',
+                pixel_id: metaPixelId,
+                access_token: metaToken,
+                test_event_code: 'TEST-E2E',
+            }),
+        });
+        assert.equal(sharedPixelResponse.ok, true, await sharedPixelResponse.text());
+        const secondPageViewId = `${secondShopDomain}:page-${suffix}`;
+        const secondPageResponse = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST',
+            headers: {
+                ...eventHeaders,
+                'X-CAPI-Ingest-Token': secondShop.ingest_token,
+            },
+            body: JSON.stringify({
+                ...commonEvent,
+                shop_domain: secondShopDomain,
+                url: `https://${secondShopDomain}/products/shared`,
+                client_id: `second-client-${suffix}`,
+                event_name: 'PageView',
+                event_id: secondPageViewId,
+                source_event_name: 'page_viewed',
+                source_event_id: `second-source-page-${suffix}`,
+            }),
+        });
+        assert.equal(secondPageResponse.status, 202, await secondPageResponse.text());
+        await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT event.status, delivery.status AS delivery_status
+                 FROM event_store event
+                 JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 WHERE event.shop_id = $1 AND event.event_id = $2`,
+                [secondShopId, secondPageViewId],
+            );
+            return rows[0]?.status === 'SUCCESS' && rows[0]?.delivery_status === 'SUCCESS' ? rows[0] : null;
+        }, 'second shop shared-Pixel PageView SUCCESS ledger');
+        const { rows: [sharedRouteCount] } = await pool.query(
+            `SELECT COUNT(*)::int AS count
+             FROM shop_pixel_routes
+             WHERE pixel_id = $1 AND shop_id = ANY($2::int[]) AND status = 'active'`,
+            [pixelId, [shopId, secondShopId]],
+        );
+        assert.equal(sharedRouteCount.count, 2);
+
         const checkoutToken = `checkout-${suffix}`;
         const purchaseId = `${shopDomain}:${checkoutToken}`;
         const browserPurchase = await fetch(`${apiOrigin}/api/pixel-event`, {
@@ -298,8 +424,11 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         assert.equal(purchaseLedger.request_payload._payment_confirmed, true);
         assert.equal(purchaseLedger.platform_response.accepted_event, true);
 
-        const deliveredEvents = metaRequests.flatMap(request => request.body.data || []);
-        assert.equal(deliveredEvents.filter(event => event.event_name === 'PageView').length, 1);
+        const deliveredEvents = metaRequests
+            .filter(request => request.simulatedStatus === 200)
+            .flatMap(request => request.body.data || []);
+        assert.equal(deliveredEvents.filter(event => event.event_name === 'PageView').length, 2);
+        assert.equal(deliveredEvents.filter(event => event.event_name === 'ViewContent').length, 1);
         assert.equal(deliveredEvents.filter(event => event.event_name === 'Purchase').length, 1);
         assert.ok(metaRequests.every(request => request.authorization === `Bearer ${metaToken}`));
         assert.ok(metaRequests.every(request => request.url === `/v25.0/${metaPixelId}/events`));
@@ -311,13 +440,14 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         await stopChild(server);
         await stopChild(worker);
         await new Promise(resolve => fakeMeta.close(resolve));
-        if (shopId) {
-            await pool.query('DELETE FROM event_store WHERE shop_id = $1', [shopId]).catch(() => {});
-            await pool.query('DELETE FROM shopify_webhook_inbox WHERE shop_id = $1', [shopId]).catch(() => {});
-            await pool.query('DELETE FROM shop_pixel_routes WHERE shop_id = $1', [shopId]).catch(() => {});
+        const cleanupShopIds = [shopId, secondShopId].filter(Boolean);
+        if (cleanupShopIds.length) {
+            await pool.query('DELETE FROM event_store WHERE shop_id = ANY($1::int[])', [cleanupShopIds]).catch(() => {});
+            await pool.query('DELETE FROM shopify_webhook_inbox WHERE shop_id = ANY($1::int[])', [cleanupShopIds]).catch(() => {});
+            await pool.query('DELETE FROM shop_pixel_routes WHERE shop_id = ANY($1::int[])', [cleanupShopIds]).catch(() => {});
         }
         if (pixelId) await pool.query('DELETE FROM pixels WHERE id = $1', [pixelId]).catch(() => {});
-        if (shopId) await pool.query('DELETE FROM shops WHERE id = $1', [shopId]).catch(() => {});
+        if (cleanupShopIds.length) await pool.query('DELETE FROM shops WHERE id = ANY($1::int[])', [cleanupShopIds]).catch(() => {});
         await pool.end().catch(() => {});
     }
 });
