@@ -4462,6 +4462,7 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
         emqResult,
         signalResult,
         funnelResult,
+        metaReceiptReconciliationResult,
         storeTodayFunnelResult,
         storeTodayWebhookResult,
         sharedFacebookResult,
@@ -4548,6 +4549,50 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                    COALESCE(currency_breakdowns.value_by_currency, '{}'::jsonb) AS value_by_currency
             FROM event_stats
             LEFT JOIN currency_breakdowns USING (event_name)
+        `, funnelParams),
+        pool.query(`
+            SELECT event.shop_id,
+                   shop.shop_domain,
+                   event.event_name,
+                   pixel.pixel_id,
+                   pixel.name AS pixel_name,
+                   COUNT(*)::int AS expected_deliveries,
+                   COUNT(*) FILTER (WHERE delivery.status = 'SUCCESS')::int AS receipt_acknowledged,
+                   COUNT(*) FILTER (
+                       WHERE delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')
+                   )::int AS pending_deliveries,
+                   COUNT(*) FILTER (WHERE delivery.id IS NULL)::int AS missing_delivery_ledger,
+                   COUNT(*) FILTER (WHERE delivery.status = 'FAILED_PERMANENT')::int AS failed_deliveries,
+                   COUNT(*) FILTER (
+                       WHERE delivery.status = 'FAILED_PERMANENT'
+                         AND delivery.error_code = 'LOCAL_VALIDATION'
+                   )::int AS locally_invalid_deliveries,
+                   GREATEST(
+                       0,
+                       COUNT(*) - COUNT(*) FILTER (WHERE delivery.status = 'SUCCESS')
+                   )::int AS receipt_gap,
+                   ROUND(
+                       100.0 * COUNT(*) FILTER (WHERE delivery.status = 'SUCCESS')
+                       / NULLIF(COUNT(*), 0),
+                       1
+                   ) AS receipt_rate
+            FROM event_store event
+            JOIN shops shop ON shop.id = event.shop_id
+            JOIN LATERAL UNNEST(event.delivery_route_snapshot)
+                AS expected_route(route_id) ON TRUE
+            JOIN shop_pixel_routes route ON route.id = expected_route.route_id
+            JOIN pixels pixel ON pixel.id = route.pixel_id
+            LEFT JOIN event_deliveries delivery
+              ON delivery.event_store_id = event.id
+             AND delivery.route_id = expected_route.route_id
+            WHERE ${occurredInLast24Hours}
+              AND event.event_name = ANY(${funnelNamesParam}::text[])
+              AND pixel.platform = 'facebook'
+              ${shopId ? 'AND event.shop_id = $1' : ''}
+            GROUP BY event.shop_id, shop.shop_domain, event.event_name,
+                     pixel.pixel_id, pixel.name
+            ORDER BY shop.shop_domain, pixel.pixel_id,
+                     ARRAY_POSITION(${funnelNamesParam}::text[], event.event_name)
         `, funnelParams),
         pool.query(`
             WITH scoped_shops AS (
@@ -4684,7 +4729,7 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
                        BOOL_OR(delivery.status = 'SUCCESS') FILTER (
                            WHERE pixel.platform = 'facebook'
                        ) AS meta_delivered,
-                       BOOL_OR(delivery.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')) FILTER (
+                       BOOL_OR(delivery.status IN ('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED')) FILTER (
                            WHERE pixel.platform = 'facebook'
                        ) AS meta_pending,
                        BOOL_OR(delivery.status = 'FAILED_PERMANENT') FILTER (
@@ -5022,6 +5067,17 @@ app.get('/api/admin/summary', asyncHandler(async (req, res) => {
             by_status: statusResult.rows,
             emq_signals: emqSignals,
             funnel_events: decorateFunnelSummary(funnelResult.rows),
+            meta_receipt_reconciliation: metaReceiptReconciliationResult.rows.map(row => ({
+                ...row,
+                expected_deliveries: Number(row.expected_deliveries || 0),
+                receipt_acknowledged: Number(row.receipt_acknowledged || 0),
+                pending_deliveries: Number(row.pending_deliveries || 0),
+                missing_delivery_ledger: Number(row.missing_delivery_ledger || 0),
+                failed_deliveries: Number(row.failed_deliveries || 0),
+                locally_invalid_deliveries: Number(row.locally_invalid_deliveries || 0),
+                receipt_gap: Number(row.receipt_gap || 0),
+                receipt_rate: row.receipt_rate === null ? null : Number(row.receipt_rate),
+            })),
             shopify_paid_orders: orderReconciliationResult.rows[0] || {},
         },
         store_today: {

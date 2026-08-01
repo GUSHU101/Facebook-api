@@ -1281,6 +1281,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(workerSource, /const responseCode = Number\(response\.data\?\.code \?\? 0\)/);
     assert.doesNotMatch(schema, /ON event_store\(shop_id, event_name, md5\(event_id\)\)/);
     const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
     assert.match(serverSource, /AWAITING_PAYMENT/);
     assert.match(serverSource, /webhookTopic !== 'orders\/paid'/);
     assert.match(serverSource, /paymentConfirmed: true/);
@@ -1357,6 +1358,13 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /GROUP BY shop_id, order_identity/);
     assert.match(serverSource, /ledger\.shop_id = paid_orders\.shop_id/);
     assert.match(serverSource, /meta_delivered_orders/);
+    assert.match(serverSource, /meta_receipt_reconciliation/);
+    assert.match(serverSource, /COUNT\(\*\) FILTER \(WHERE delivery\.status = 'SUCCESS'\)::int AS receipt_acknowledged/);
+    assert.match(serverSource, /delivery\.status IN \('PENDING', 'IN_PROGRESS', 'RETRYABLE_FAILED'\)/);
+    assert.match(serverSource, /JOIN LATERAL UNNEST\(event\.delivery_route_snapshot\)/);
+    assert.match(serverSource, /COUNT\(\*\) FILTER \(WHERE delivery\.id IS NULL\)::int AS missing_delivery_ledger/);
+    assert.match(html, /Facebook 逐 Pixel 收件对账/);
+    assert.match(html, /API 收件应最终达到 1:1/);
     assert.match(serverSource, /unledgered_eligible_orders/);
     assert.match(serverSource, /WHERE platform = \$1 AND pixel_id = \$2/);
     assert.match(serverSource, /credential_version = credential_version \+ CASE WHEN \$8::boolean THEN 1 ELSE 0 END/);
