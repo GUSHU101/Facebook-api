@@ -3765,6 +3765,12 @@ app.post('/api/admin/pixels', asyncHandler(async (req, res) => {
     const rateLimitGroup = optionalBoundedString(req.body.rate_limit_group, 'rate_limit_group', 100);
     if (!Number.isInteger(shopId) || shopId <= 0) return res.status(400).json({ error: 'Invalid shop_id' });
     if (!['facebook', 'tiktok'].includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
+    if (platform === 'facebook' && !/^\d{5,32}$/.test(pixelId)) {
+        return res.status(400).json({
+            error: 'Meta Pixel / Dataset ID must contain 5 to 32 digits.',
+            code: 'INVALID_META_DATASET_ID',
+        });
+    }
     if (platform === 'facebook' && !config.allowSharedFacebookDatasetRoutes && shopIds.length > 1) {
         return res.status(409).json({
             error: 'A Meta Dataset can be bound to only one shop. Create a separate Dataset for each Shopify shop.',

@@ -21,6 +21,7 @@ const {
     shouldIsolateFacebookError,
 } = require('./platforms/rate-control');
 const { buildTikTokPayload } = require('./platforms/tiktok');
+const { summarizePermanentRouteFailures } = require('./platforms/delivery-state');
 
 const capiQueue = new Queue('capi-events', {
     connection: redis,
@@ -1420,7 +1421,7 @@ const worker = new Worker('capi-events', async job => {
         await insertDeadLetter(
             normalizedShopId,
             failedEvents.map(event => ({ ...event, fb_response: fbResponse })),
-            `Permanent route failures: ${permanentFailures.map(item => item.route_id).join(', ')}`,
+            summarizePermanentRouteFailures(permanentFailures),
         );
     }
     if (retryNeeded) {
