@@ -738,7 +738,7 @@ test('route retry backoff is exponential and capped', () => {
     assert.equal(retryDelaySeconds(20, 5, 900), 900);
 });
 
-test('coalesced queue jobs reuse live work but replace retained terminal jobs', async () => {
+test('coalesced queue jobs reuse live work but replace terminal or missing jobs', async () => {
     const liveCalls = [];
     const liveQueue = {
         async add(name, data, options) {
@@ -776,6 +776,27 @@ test('coalesced queue jobs reuse live work but replace retained terminal jobs', 
     assert.equal(terminalCalls.length, 2);
     assert.equal(terminalCalls[1].options.jobId, 'retry-7-100-replacement');
     assert.equal(replacement.id, 'retry-7-100-replacement');
+
+    const missingCalls = [];
+    const missingQueue = {
+        async add(name, data, options) {
+            missingCalls.push({ name, data, options });
+            return {
+                id: options.jobId,
+                getState: async () => missingCalls.length === 1 ? 'unknown' : 'waiting',
+            };
+        },
+    };
+    const raceReplacement = await enqueueReschedulableJob(
+        missingQueue,
+        'send-fb-batch',
+        { shopId: 8 },
+        { jobId: 'dispatch-8-normal-100' },
+        () => 'race-replacement',
+    );
+    assert.equal(missingCalls.length, 2);
+    assert.equal(missingCalls[1].options.jobId, 'dispatch-8-normal-100-race-replacement');
+    assert.equal(raceReplacement.id, 'dispatch-8-normal-100-race-replacement');
 });
 
 test('platform retry control honors Retry-After and adds bounded jitter', () => {
@@ -1161,7 +1182,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /enqueueReschedulableJob\(/);
     assert.match(workerSource, /enqueueReschedulableJob\(/);
     assert.match(queueSource, /const state = await job\.getState\(\)/);
-    assert.match(queueSource, /state !== 'completed' && state !== 'failed'/);
+    assert.match(queueSource, /LIVE_JOB_STATES\.has\(state\)/);
     assert.match(serverSource, /cleanupExpiredOperationalData/);
     assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
     assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
