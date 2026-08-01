@@ -434,7 +434,27 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         assert.ok(metaRequests.every(request => request.url === `/v25.0/${metaPixelId}/events`));
         assert.ok(metaRequests.every(request => request.body.test_event_code === 'TEST-E2E'));
     } catch (error) {
-        error.message = `${error.message}\nRuntime diagnostics:\n${diagnostics}\nMeta requests:\n${JSON.stringify(metaRequests, null, 2)}`;
+        let ledgerDiagnostics = [];
+        if (shopId) {
+            const result = await pool.query(
+                `SELECT event.event_name, event.event_id, event.status AS event_status,
+                        delivery.status AS delivery_status, delivery.attempt_count,
+                        delivery.next_attempt_at, delivery.last_attempt_at,
+                        delivery.error_code, delivery.error_message,
+                        pixel.rate_limit_until, pixel.consecutive_failures
+                 FROM event_store event
+                 LEFT JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 LEFT JOIN shop_pixel_routes route ON route.id = delivery.route_id
+                 LEFT JOIN pixels pixel ON pixel.id = route.pixel_id
+                 WHERE event.shop_id = $1
+                 ORDER BY event.id, delivery.route_id`,
+                [shopId],
+            ).catch(queryError => ({ rows: [{ diagnostic_query_error: queryError.message }] }));
+            ledgerDiagnostics = result.rows;
+        }
+        error.message = `${error.message}\nRuntime diagnostics:\n${diagnostics}`
+            + `\nLedger diagnostics:\n${JSON.stringify(ledgerDiagnostics, null, 2)}`
+            + `\nMeta requests:\n${JSON.stringify(metaRequests, null, 2)}`;
         throw error;
     } finally {
         await stopChild(server);

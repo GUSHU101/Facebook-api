@@ -485,7 +485,7 @@ async function scheduleShopContinuation(shopId) {
 async function scheduleRouteRetry(shopId, retryAfterSeconds) {
     const delayMs = Math.max(1000, Math.ceil(Number(retryAfterSeconds || 1) * 1000));
     const dueSecond = Math.ceil((Date.now() + delayMs) / 1000);
-    await capiQueue.add(
+    const retryJob = await capiQueue.add(
         'send-fb-batch',
         { shopId },
         {
@@ -496,6 +496,8 @@ async function scheduleRouteRetry(shopId, retryAfterSeconds) {
             jobId: `route-retry-${shopId}-${dueSecond}`,
         },
     );
+    console.warn(`[DeliveryRetry] scheduled job=${retryJob.id} shop=${shopId} delay_ms=${delayMs}`);
+    return retryJob.id;
 }
 
 async function insertDeadLetter(shopId, dbEvents, reason) {
@@ -1081,6 +1083,9 @@ const worker = new Worker('capi-events', async job => {
         throw new Error('Invalid job payload');
     }
     const normalizedShopId = Number(shopId);
+    if (String(job.id || '').startsWith('route-retry-')) {
+        console.warn(`[DeliveryRetry] consuming job=${job.id} shop=${normalizedShopId}`);
+    }
     const shopLease = await acquireRedisLease(`lock:delivery-shop:${normalizedShopId}`);
     if (!shopLease) {
         throw new RetryableError('Shop delivery lease is busy', {
@@ -1098,6 +1103,9 @@ const worker = new Worker('capi-events', async job => {
         event.status === 'PENDING' && Number(event.shop_id) === normalizedShopId
     ));
     if (sendableDbEvents.length === 0) {
+        if (String(job.id || '').startsWith('route-retry-')) {
+            console.warn(`[DeliveryRetry] no due PostgreSQL event for job=${job.id} shop=${normalizedShopId}`);
+        }
         if (Array.isArray(dbEvents)) await scheduleShopContinuation(normalizedShopId);
         return;
     }
