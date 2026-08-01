@@ -874,7 +874,17 @@ async function recordCredentialSuccess(credentialScope, rateControl = {}) {
         ],
     );
     if (cooldownSeconds > 0) {
-        await redis.set(`cooldown:delivery-credential:${credentialScope}`, '1', 'EX', cooldownSeconds);
+        await redis.set(
+            `cooldown:delivery-credential:${credentialScope}`,
+            '1',
+            'EX',
+            cooldownSeconds,
+        ).catch(error => {
+            // PostgreSQL rate_limit_until is authoritative. A Redis partition
+            // must not turn an already accepted platform response into a job
+            // failure or prevent the durable delivery ledger from advancing.
+            console.error(`[CredentialCooldown] Redis success cooldown mirror failed scope=${credentialScope}: ${error.message}`);
+        });
     }
 }
 
@@ -916,7 +926,11 @@ async function recordCredentialFailure(credentialScope, classification) {
             '1',
             'EX',
             Math.ceil(cooldownSeconds),
-        );
+        ).catch(error => {
+            // The database cooldown written above remains effective even when
+            // the low-latency Redis mirror is temporarily unavailable.
+            console.error(`[CredentialCooldown] Redis failure cooldown mirror failed scope=${credentialScope}: ${error.message}`);
+        });
     }
     return Math.ceil(cooldownSeconds);
 }
@@ -1419,6 +1433,11 @@ const worker = new Worker('capi-events', async job => {
 
 worker.on('failed', async (job, err) => {
     if (!job) return;
+
+    console.error(
+        `[DeliveryJobFailure] job=${job.id} attempt=${job.attemptsMade}/${job.opts.attempts || 1}`
+        + ` code=${err?.code || 'UNKNOWN'} message=${err?.message || 'Unknown worker failure'}`,
+    );
 
     const attemptsExhausted = job.attemptsMade >= (job.opts.attempts || 1);
     if (attemptsExhausted) {
