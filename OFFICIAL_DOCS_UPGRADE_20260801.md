@@ -1,4 +1,4 @@
-# 官方文档对照与 v18 升级记录
+# 官方文档对照与 v19 升级记录
 
 核对日期：2026-08-01
 
@@ -11,6 +11,7 @@
 - [Meta CAPI Customer Information 参数](https://developers.facebook.com/documentation/ads-commerce/conversions-api/parameters/customer-information-parameters)
 - [Meta Pixel 与 CAPI 去重](https://developers.facebook.com/documentation/ads-commerce/conversions-api/deduplicate-pixel-and-server-events)
 - [Meta CAPI 最佳实践](https://developers.facebook.com/documentation/ads-commerce/conversions-api/best-practices)
+- [Meta CAPI 验证与诊断](https://developers.facebook.com/documentation/ads-commerce/conversions-api/verifying-setup)
 - [Meta Pixel 高级匹配](https://developers.facebook.com/docs/facebook-pixel/advanced/advanced-matching)
 - [Meta Dataset Quality API](https://developers.facebook.com/documentation/ads-commerce/conversions-api/dataset-quality-api)
 - [Shopify API 版本机制](https://shopify.dev/docs/api/usage/versioning)
@@ -21,6 +22,8 @@
 - [Shopify Pixel Privacy](https://shopify.dev/docs/api/web-pixels-api/pixel-privacy)
 - [Shopify Browser API](https://shopify.dev/docs/api/web-pixels-api/standard-api/browser)
 - [Shopify 管理 Webhook 订阅](https://shopify.dev/docs/apps/build/webhooks/subscribe)
+- [Shopify Webhook 可靠性与顺序](https://shopify.dev/docs/apps/build/webhooks)
+- [Shopify Webhook 故障排除](https://shopify.dev/docs/apps/build/webhooks/troubleshoot)
 - [Shopify webhookSubscriptions 查询](https://shopify.dev/docs/api/admin-graphql/latest/queries/webhookSubscriptions)
 - [Shopify webhookSubscriptionCreate 变更](https://shopify.dev/docs/api/admin-graphql/latest/mutations/webhookSubscriptionCreate)
 
@@ -73,6 +76,14 @@
 28. Shopify Pixel v18 在首次具备客户上下文的事件上，用 `fbq('init', pixelId, userData)` 提供官方高级匹配字段。浏览器 Pixel 负责哈希；CAPI 使用同一规范化输入的 SHA-256，且 `external_id` 在两端都加入店铺域名命名空间。
 29. 浏览器和服务端同时限制事件专属参数：`num_items` 只用于 `InitiateCheckout`，`search_string` 只用于 `Search`；新客/老客只进入 `custom_data.customer_segmentation`。
 
+### v19 官方质量闭环与收件语义
+
+30. Dataset Quality v26 显式请求 `event_match_quality{composite_score,match_key_feedback,diagnostics}`。Meta 不保证 `diagnostics` 出现在默认投影里，旧请求虽然能拿到分数，却可能遗漏官方修复建议。
+31. 有覆盖率、去重反馈、数据新鲜度或 ACR、但尚未生成 EMQ 分数的事件不再被解析器丢弃；EMQ 均值只对有分数事件计算，不用零分污染均值。
+32. 后台逐事件显示官方覆盖率、新鲜度与 EMQ 诊断，保留 Meta 文档历史响应里的 `dedup_key_feedback` / `dedupe_key_feedback` 两种拼写兼容。
+33. CAPI HTTP 成功仅记录为“API 收件已确认（非最终计入）”，同时保存 `fbtrace_id`、批次收件数和 Meta `messages`。Meta 官方说明 Events Manager 概览的接收数仍可能在随后因去重、同意控制或政策被丢弃，项目不再把收件回执误称为最终归因。
+34. `custom_data.customer_segmentation` 校验扩展到 Meta 当前公布的全部九个枚举；Shopify 自动映射仍只在能够可靠判断时发送新客/老客，不编造业务线、产品域或忠诚计划状态。
+
 - 多店共享一个 Meta Dataset 时，Meta 端的质量、受众、归因和学习结果必然是合并视图；本项目后台的店铺自然日漏斗用于逐店对账。
-- 每个 Shopify 店铺必须粘贴为该店铺生成的 v18 代码，不能跨店复制采集 Token。
+- 每个 Shopify 店铺必须粘贴为该店铺生成的 v19 代码，不能跨店复制采集 Token。
 - 同一 Dataset 不应同时启用另一套主题 Pixel、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，除非它能复用完全相同的事件名与事件 ID。

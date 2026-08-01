@@ -1,7 +1,10 @@
 const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
 const META_DATASET_QUALITY_FIELDS = [
     'event_name',
-    'event_match_quality',
+    // Diagnostics are not part of every default Graph object projection.
+    // Request them explicitly while retaining the default score and match-key
+    // fields documented for AdsPixelCAPIEMQ.
+    'event_match_quality{composite_score,match_key_feedback,diagnostics}',
     'event_coverage',
     'dedup_key_feedback',
     'data_freshness',
@@ -53,7 +56,13 @@ function officialQualityDetails(value) {
             ? matchQuality.diagnostics
             : undefined,
         event_coverage: value?.event_coverage,
-        dedup_key_feedback: value?.dedup_key_feedback,
+        // Meta's Dataset Quality guide has used both spellings in examples.
+        // The current field selector is dedup_key_feedback, but accepting the
+        // response alias keeps historical snapshots and API variants visible.
+        dedup_key_feedback: firstPresent(
+            value?.dedup_key_feedback,
+            value?.dedupe_key_feedback,
+        ),
         data_freshness: value?.data_freshness,
         acr: value?.acr,
     };
@@ -84,14 +93,17 @@ function extractOfficialEmqEvents(rawPayload) {
             value.emq_score,
             value.score,
         ));
-        if (eventName && score !== null) {
+        const details = compactObject(officialQualityDetails(value));
+        // Coverage, freshness, dedupe feedback and EMQ diagnostics remain
+        // actionable even when Meta has not produced a composite score yet.
+        if (eventName && (score !== null || Object.keys(details).length > 0)) {
             const key = String(eventName);
             if (!seen.has(key)) {
                 seen.add(key);
                 events.push(compactObject({
                     event_name: key,
-                    score: Number(score.toFixed(1)),
-                    ...officialQualityDetails(value),
+                    score: score === null ? undefined : Number(score.toFixed(1)),
+                    ...details,
                 }));
             }
         }
@@ -105,12 +117,18 @@ function extractOfficialEmqEvents(rawPayload) {
 
 function summarizeMetaQuality(rawPayload) {
     const events = extractOfficialEmqEvents(rawPayload);
-    const average = events.length
-        ? Number((events.reduce((sum, item) => sum + Number(item.score || 0), 0) / events.length).toFixed(1))
+    const scoredEvents = events.filter(item => Number.isFinite(Number(item.score)));
+    const average = scoredEvents.length
+        ? Number((scoredEvents.reduce((sum, item) => sum + Number(item.score), 0) / scoredEvents.length).toFixed(1))
         : null;
     return {
         metric_type: META_QUALITY_METRIC_TYPE,
         average_score: average,
+        scored_event_count: scoredEvents.length,
+        diagnostic_count: events.reduce(
+            (sum, item) => sum + (Array.isArray(item.diagnostics) ? item.diagnostics.length : 0),
+            0,
+        ),
         events,
     };
 }

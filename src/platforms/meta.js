@@ -9,7 +9,14 @@ const ACTION_SOURCES = new Set([
 ]);
 const CUSTOMER_SEGMENTATION_VALUES = new Set([
     'new_customer_to_business',
+    'new_customer_to_business_line',
+    'new_customer_to_product_area',
+    'new_customer_to_medium',
     'existing_customer_to_business',
+    'existing_customer_to_business_line',
+    'existing_customer_to_product_area',
+    'existing_customer_to_medium',
+    'customer_in_loyalty_program',
 ]);
 function normalizeMetaCookie(value) {
     const normalized = String(value || '').trim();

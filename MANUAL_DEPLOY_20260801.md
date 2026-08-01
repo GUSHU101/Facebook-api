@@ -159,14 +159,14 @@ Meta 官方质量接口若未返回事件级指标，后台现在显示 `EMPTY`�
 
 完成服务器、HTTPS、进程和数据集修复后：
 
-1. 打开本项目 `/admin`，分别为两个店铺复制最新生成的 `shopify-pixel-v18` 代码。
+1. 打开本项目 `/admin`，分别为两个店铺复制最新生成的 `shopify-pixel-v19` 代码。
 2. Shopify 后台进入 `Settings -> Customer events`。
 3. 在 Custom Pixel 隐私设置中如实声明 Analytics、Marketing 与 Data sale；v18 会读取初始授权并监听后续变化。
 4. 每店只保留一套本项目自定义像素，替换旧版本，不要并行启用 v14-v17 与 v18。
 5. 检查主题 Meta 代码、GTM Meta 标签以及 Facebook & Instagram 应用的数据共享，避免同一数据集收到第二套相同浏览器 Pixel 事件。
 6. 当前自动化读取 Customer Events 页面时触发 Shopify 连接验证，因此像素列表必须由你在部署时人工确认。
 7. 返回项目后台“店铺租户”，逐店点击“检查 Webhook”；状态应为 `HEALTHY`。若为 `MISSING` 或 `URI_MISMATCH`，确认 `PUBLIC_BASE_URL` 与证书正确后点击“修复 Webhook”。
-8. v18 首个真实事件进入网关后，店铺表中的“像素运行版本”应显示 `shopify-pixel-v18` 和最近事件时间；“浏览器投递丢失诊断”正常应为空。
+8. v19 首个真实事件进入网关后，店铺表中的“像素运行版本”应显示 `shopify-pixel-v19` 和最近事件时间；“浏览器投递丢失诊断”正常应为空。
 
 ## 上线验收
 

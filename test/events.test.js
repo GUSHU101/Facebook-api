@@ -124,11 +124,11 @@ test('external IDs are stable within a shop and isolated across shops sharing a 
 test('Meta Dataset Quality requests and composite scores follow the current official contract', () => {
     assert.deepEqual(buildMetaQualityRequestParams('1234567890'), {
         dataset_id: '1234567890',
-        fields: 'web{event_name,event_match_quality,event_coverage,dedup_key_feedback,data_freshness,acr}',
+        fields: 'web{event_name,event_match_quality{composite_score,match_key_feedback,diagnostics},event_coverage,dedup_key_feedback,data_freshness,acr}',
     });
     assert.deepEqual(buildMetaQualityRequestParams('1234567890', 'DataPartner'), {
         dataset_id: '1234567890',
-        fields: 'web{event_name,event_match_quality,event_coverage,dedup_key_feedback,data_freshness,acr}',
+        fields: 'web{event_name,event_match_quality{composite_score,match_key_feedback,diagnostics},event_coverage,dedup_key_feedback,data_freshness,acr}',
         agent_name: 'datapartner',
     });
 
@@ -138,6 +138,7 @@ test('Meta Dataset Quality requests and composite scores follow the current offi
             event_match_quality: {
                 composite_score: 8.7,
                 match_key_feedback: [{ match_key: 'em', status: 'GOOD' }],
+                diagnostics: [{ name: 'Server sending empty IP addresses', percentage: 4.2 }],
             },
             event_coverage: { coverage: 0.91 },
             dedup_key_feedback: { event_id: 'GOOD' },
@@ -146,10 +147,27 @@ test('Meta Dataset Quality requests and composite scores follow the current offi
         }],
     });
     assert.equal(summary.average_score, 8.7);
+    assert.equal(summary.scored_event_count, 1);
+    assert.equal(summary.diagnostic_count, 1);
     assert.equal(summary.events[0].event_name, 'Purchase');
     assert.equal(summary.events[0].score, 8.7);
     assert.deepEqual(summary.events[0].match_key_feedback, [{ match_key: 'em', status: 'GOOD' }]);
     assert.deepEqual(summary.events[0].dedup_key_feedback, { event_id: 'GOOD' });
+
+    const scoreless = summarizeMetaQuality({
+        web: [{
+            event_name: 'AddToCart',
+            event_coverage: { percentage: 62.5, goal_percentage: 75 },
+            dedupe_key_feedback: [{ dedupe_key: 'event_id' }],
+            data_freshness: { upload_frequency: 'real_time' },
+        }],
+    });
+    assert.equal(scoreless.average_score, null);
+    assert.equal(scoreless.scored_event_count, 0);
+    assert.equal(scoreless.events.length, 1);
+    assert.equal(scoreless.events[0].event_name, 'AddToCart');
+    assert.deepEqual(scoreless.events[0].dedup_key_feedback, [{ dedupe_key: 'event_id' }]);
+    assert.equal(scoreless.events[0].event_coverage.percentage, 62.5);
 });
 
 test('customer lifecycle is sent only as Meta custom_data customer_segmentation', () => {
@@ -160,6 +178,10 @@ test('customer lifecycle is sent only as Meta custom_data customer_segmentation'
     assert.equal(
         sanitizeMetaCustomData({ customer_segmentation: 'existing_customer_to_business' }, 'Purchase').customer_segmentation,
         'existing_customer_to_business',
+    );
+    assert.equal(
+        sanitizeMetaCustomData({ customer_segmentation: 'customer_in_loyalty_program' }, 'Purchase').customer_segmentation,
+        'customer_in_loyalty_program',
     );
     assert.equal(sanitizeMetaCustomData({ customer_segmentation: 'invented' }, 'Purchase').customer_segmentation, undefined);
 });
@@ -1249,6 +1271,9 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(workerSource, /CARDINALITY\(active_routes\.route_ids\) > 0/);
     assert.match(workerSource, /successful_event_store_ids/);
     assert.match(workerSource, /accepted_event: true/);
+    assert.match(workerSource, /receipt_acknowledged: true/);
+    assert.match(workerSource, /receipt_finality: 'NOT_FINAL'/);
+    assert.match(workerSource, /meta_messages: batch\?\.messages \|\| \[\]/);
     assert.match(workerSource, /meta_batch_events_received/);
     assert.match(workerSource, /UNNEST\(\$2::bigint\[\], \$3::int\[\], \$4::jsonb\[\]\)/);
     assert.match(workerSource, /r\.test_event_code_expires_at > NOW\(\)/);
@@ -1911,7 +1936,7 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v18');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v19');
     assert.equal(sentEvents[0].source_provider, 'shopify_web_pixels');
     assert.equal(sentEvents[0].source_event_id, 'shopify-event-1');
     assert.equal(generated.includes('getOrCreateTtp'), false);
@@ -2382,6 +2407,9 @@ test('admin page script parses and handles admin action failures', async () => {
                 assert.equal(typeof options.methods.addPixel, 'function');
                 assert.equal(typeof options.methods.formatPercent, 'function');
                 assert.equal(typeof options.methods.officialAverageScore, 'function');
+                assert.equal(typeof options.methods.officialEventCoverage, 'function');
+                assert.equal(typeof options.methods.officialEventFreshness, 'function');
+                assert.equal(typeof options.methods.officialDiagnostics, 'function');
                 return { mount: () => {} };
             },
         },
@@ -2421,6 +2449,22 @@ test('admin page script parses and handles admin action failures', async () => {
     ]);
     assert.equal(appOptions.methods.officialAverageScore({ summary: { average_score: 8.64 } }), '8.6/10');
     assert.equal(appOptions.methods.officialAverageScore({ summary: {} }), '-');
+    assert.equal(appOptions.methods.officialEventScore({ score: 7.24 }), '7.2/10');
+    assert.equal(appOptions.methods.officialEventScore({}), '待生成');
+    assert.equal(appOptions.methods.officialEventCoverage({ event_coverage: { percentage: 62.54 } }), '62.5%');
+    assert.equal(appOptions.methods.officialEventFreshness({ data_freshness: { upload_frequency: 'real_time' } }), '新鲜度 real_time');
+    const officialDiagnostics = appOptions.methods.officialDiagnostics.call({
+        officialEvents: appOptions.methods.officialEvents,
+    }, {
+        summary: {
+            events: [{
+                event_name: 'Purchase',
+                diagnostics: [{ name: 'Missing IP', percentage: 12.5, solution: 'Send shopper IP' }],
+            }],
+        },
+    });
+    assert.equal(officialDiagnostics.length, 1);
+    assert.equal(officialDiagnostics[0].key, 'Purchase:Missing IP');
     assert.deepEqual(JSON.parse(JSON.stringify(appOptions.computed.officialMetaQuality.call({ summary: {} }))), []);
     await appOptions.methods.api('/api/admin/shops', {
         method: 'POST',
