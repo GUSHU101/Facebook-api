@@ -58,18 +58,48 @@ function paidOrderIgnoreReason(order = {}, allowedSources = ['web']) {
     return allowed.has(sourceName) ? undefined : `non_web_order_source:${sourceName}`;
 }
 
-function shopifyCustomerSegmentation(customer = {}) {
+function shopifyCustomerLifecycle(customer = {}) {
     if (customer.isFirstOrder === true || customer.is_first_order === true) {
-        return 'new_customer_to_business';
+        return 'new_customer';
     }
     if (customer.isFirstOrder === false || customer.is_first_order === false) {
-        return 'existing_customer_to_business';
+        return 'existing_customer';
     }
     const orderCount = Number(firstPresent(customer.orders_count, customer.ordersCount));
     if (Number.isInteger(orderCount) && orderCount > 0) {
-        return orderCount === 1 ? 'new_customer_to_business' : 'existing_customer_to_business';
+        return orderCount === 1 ? 'new_customer' : 'existing_customer';
     }
     return undefined;
+}
+
+function shopifyPaymentTimestamp(order = {}) {
+    const rawTransactions = Array.isArray(order.transactions)
+        ? order.transactions
+        : (Array.isArray(order.transactions?.nodes) ? order.transactions.nodes : []);
+    const successfulPaymentTimes = rawTransactions
+        .filter(transaction => {
+            const status = String(transaction?.status || '').trim().toUpperCase();
+            const kind = String(transaction?.kind || '').trim().toUpperCase();
+            return status === 'SUCCESS' && ['SALE', 'CAPTURE'].includes(kind);
+        })
+        .map(transaction => firstPresent(
+            transaction.processed_at,
+            transaction.processedAt,
+            transaction.created_at,
+            transaction.createdAt,
+        ))
+        .map(value => ({ value, timestamp: Date.parse(String(value || '')) }))
+        .filter(item => Number.isFinite(item.timestamp))
+        .sort((left, right) => right.timestamp - left.timestamp);
+    return firstPresent(
+        successfulPaymentTimes[0]?.value,
+        order.updated_at,
+        order.updatedAt,
+        order.processed_at,
+        order.processedAt,
+        order.created_at,
+        order.createdAt,
+    );
 }
 
 function allocatedDiscount(item) {
@@ -103,7 +133,9 @@ function discountedUnitPrice(item, quantity) {
 function buildOrderContents(order) {
     const lineItems = Array.isArray(order.line_items) ? order.line_items : [];
     return lineItems.map(item => {
-        const id = normalizeContentId(firstPresent(item.variant_id, item.product_id, item.sku, item.id));
+        // Shopify Order/LineItem IDs identify a transaction row, not a Meta
+        // Catalog item. Only durable catalog identities are eligible here.
+        const id = normalizeContentId(firstPresent(item.variant_id, item.product_id, item.sku));
         if (!id) return undefined;
         const requestedQuantity = Number(item.quantity);
         const quantity = Number.isFinite(requestedQuantity) && requestedQuantity > 0 ? requestedQuantity : 1;
@@ -173,7 +205,10 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
 
     return {
         event_name: 'Purchase',
-        action_source: order._reconciled === true ? 'system_generated' : 'website',
+        // action_source describes where the conversion happened, not how the
+        // event was recovered. Reconciled Online Store orders still occurred
+        // on the merchant website and must match the browser Pixel semantics.
+        action_source: 'website',
         // Never invent a Purchase ID: a random fallback would turn every
         // Shopify webhook retry into a distinct conversion. The authenticated
         // webhook handler rejects payloads that lack this stable identity.
@@ -215,7 +250,7 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
             ? reportedItemQuantity
             : contents.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
         order_id: orderName,
-        customer_segmentation: shopifyCustomerSegmentation(customer),
+        customer_lifecycle: shopifyCustomerLifecycle(customer),
         source_url: sourceUrl,
         // For orders/paid, the webhook trigger time is the closest available
         // timestamp to the actual payment transition. Checkout creation time
@@ -232,6 +267,7 @@ module.exports = {
     normalizeContentId,
     paidOrderIgnoreReason,
     readOrderAttribute,
-    shopifyCustomerSegmentation,
+    shopifyCustomerLifecycle,
+    shopifyPaymentTimestamp,
     toAbsoluteShopUrl,
 };

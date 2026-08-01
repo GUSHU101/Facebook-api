@@ -40,6 +40,12 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopify_privacy_inbox_retention
     ON shopify_privacy_inbox((COALESCE(completed_at, processed_at, created_at)), id)
     WHERE status IN ('SUCCESS', 'FAILED_PERMANENT');
 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_browser_delivery_diagnostics_retention
+    ON browser_delivery_diagnostics(created_at, id);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopify_webhook_subscription_checked
+    ON shopify_webhook_subscription_state(last_checked_at);
+
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_pixels_platform_external_id
     ON pixels(platform, pixel_id);
 

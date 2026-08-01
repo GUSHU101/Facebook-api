@@ -45,7 +45,7 @@ test('HTTP webhook replay is durably deduplicated before BullMQ dispatch', { ski
     const pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const server = spawn(process.execPath, ['src/server.js'], {
         cwd: require('node:path').join(__dirname, '..'),
-        env: { ...process.env, PORT: String(port) },
+        env: { ...process.env, PORT: String(port), REQUIRE_WORKER_HEARTBEAT: 'false' },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     let diagnostics = '';
@@ -59,7 +59,11 @@ test('HTTP webhook replay is durably deduplicated before BullMQ dispatch', { ski
         ).toString('base64')}`;
         const shopResponse = await fetch(`${origin}/api/admin/shops`, {
             method: 'POST',
-            headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+            headers: {
+                Authorization: authorization,
+                'Content-Type': 'application/json',
+                'X-CAPI-Admin-Request': '1',
+            },
             body: JSON.stringify({ shop_domain: shopDomain, app_secret: appSecret }),
         });
         assert.equal(shopResponse.status, 201, await shopResponse.text());
@@ -199,8 +203,13 @@ test('two shops sharing one Pixel retain isolated routes, test codes, and ledger
         ));
         for (let index = 0; index < shopIds.length; index += 1) {
             const { rows: [{ id: routeId }] } = await pool.query(
-                `INSERT INTO shop_pixel_routes (shop_id, pixel_id, test_event_code)
-                 VALUES ($1, $2, $3) RETURNING id`,
+                `INSERT INTO shop_pixel_routes (
+                     shop_id, pixel_id, test_event_code, test_event_code_expires_at
+                 )
+                 VALUES (
+                     $1, $2, $3,
+                     CASE WHEN $3::text IS NOT NULL THEN NOW() + INTERVAL '30 minutes' ELSE NULL END
+                 ) RETURNING id`,
                 [shopIds[index], pixelId, index === 0 ? 'TEST-SHOP-A' : null],
             );
             routeIds.push(routeId);
@@ -262,6 +271,7 @@ test('Redis outage keeps liveness green but makes readiness fail closed', { skip
             ...process.env,
             PORT: String(port),
             REDIS_URL: 'redis://127.0.0.1:1',
+            REQUIRE_WORKER_HEARTBEAT: 'false',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });

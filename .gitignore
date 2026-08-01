@@ -8,3 +8,7 @@ Thumbs.db
 *.tmp
 *.bak
 .maintenance
+.audit/
+scripts/__pycache__/
+.deploy/*.zip
+.deploy/*.sha256

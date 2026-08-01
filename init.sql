@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS shops (
     shop_domain VARCHAR(255) UNIQUE NOT NULL,
     app_secret TEXT NOT NULL,
     admin_access_token TEXT,
+    reporting_timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
     status VARCHAR(20) DEFAULT 'active',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS shop_pixel_routes (
     shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
     pixel_id INTEGER NOT NULL REFERENCES pixels(id) ON DELETE RESTRICT,
     test_event_code VARCHAR(100),
+    test_event_code_expires_at TIMESTAMPTZ,
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (shop_id, pixel_id)
@@ -67,6 +69,7 @@ CREATE TABLE IF NOT EXISTS shopify_webhook_inbox (
     shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
     webhook_id VARCHAR(255) NOT NULL,
     topic VARCHAR(100) NOT NULL,
+    shopify_api_version VARCHAR(20),
     triggered_at TIMESTAMPTZ,
     payload JSONB NOT NULL,
     status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
@@ -88,6 +91,54 @@ CREATE TABLE IF NOT EXISTS shopify_reconcile_state (
     last_error TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- A shop-specific ORDERS_PAID subscription can drift, be pointed at an old
+-- host, or be removed after repeated delivery failures. Keep the last
+-- read-only audit result so the dashboard and doctor can detect this before
+-- the next paid order depends on the reconciliation safety net.
+CREATE TABLE IF NOT EXISTS shopify_webhook_subscription_state (
+    shop_id INTEGER PRIMARY KEY REFERENCES shops(id) ON DELETE CASCADE,
+    status VARCHAR(30) NOT NULL DEFAULT 'UNKNOWN',
+    expected_uri TEXT,
+    observed_uris JSONB NOT NULL DEFAULT '[]'::jsonb,
+    managed_subscription_id TEXT,
+    shopify_api_version VARCHAR(20),
+    last_checked_at TIMESTAMPTZ,
+    last_repaired_at TIMESTAMPTZ,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Privacy-safe runtime telemetry from the generated Shopify custom pixel.
+-- Heartbeats prove which source version is actually running; incidents store
+-- only bounded event-name counts and never contain customer identifiers.
+CREATE TABLE IF NOT EXISTS shopify_pixel_runtime_status (
+    shop_id INTEGER PRIMARY KEY REFERENCES shops(id) ON DELETE CASCADE,
+    source_version VARCHAR(64) NOT NULL,
+    schema_version VARCHAR(32),
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_diagnostic_at TIMESTAMPTZ,
+    diagnostic_count BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS browser_delivery_diagnostics (
+    id BIGSERIAL PRIMARY KEY,
+    shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+    code VARCHAR(64) NOT NULL,
+    dropped_count INTEGER NOT NULL DEFAULT 0,
+    event_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_version VARCHAR(64) NOT NULL,
+    schema_version VARCHAR(32),
+    client_first_at TIMESTAMPTZ,
+    client_last_at TIMESTAMPTZ,
+    detail VARCHAR(500),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE shopify_webhook_inbox
+    ADD COLUMN IF NOT EXISTS shopify_api_version VARCHAR(20);
 
 -- Shopify privacy deliveries have different retention and failure
 -- semantics from commerce webhooks. Keep them independent so shop erasure can
@@ -116,6 +167,17 @@ ALTER TABLE shopify_reconcile_state
     ADD COLUMN IF NOT EXISTS scan_since TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS scan_cutoff TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS after_cursor TEXT,
+    ADD COLUMN IF NOT EXISTS last_error TEXT,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+ALTER TABLE shopify_webhook_subscription_state
+    ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'UNKNOWN',
+    ADD COLUMN IF NOT EXISTS expected_uri TEXT,
+    ADD COLUMN IF NOT EXISTS observed_uris JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS managed_subscription_id TEXT,
+    ADD COLUMN IF NOT EXISTS shopify_api_version VARCHAR(20),
+    ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_repaired_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_error TEXT,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
 
@@ -224,12 +286,21 @@ CREATE TABLE IF NOT EXISTS meta_quality_snapshots (
 ALTER TABLE shops
     ADD COLUMN IF NOT EXISTS app_secret TEXT,
     ADD COLUMN IF NOT EXISTS admin_access_token TEXT,
+    ADD COLUMN IF NOT EXISTS reporting_timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
     ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active',
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
 ALTER TABLE shops
     ALTER COLUMN app_secret TYPE TEXT,
+    ALTER COLUMN reporting_timezone SET DEFAULT 'UTC',
     ALTER COLUMN status SET DEFAULT 'active';
+
+UPDATE shops
+SET reporting_timezone = 'UTC'
+WHERE reporting_timezone IS NULL OR BTRIM(reporting_timezone) = '';
+
+ALTER TABLE shops
+    ALTER COLUMN reporting_timezone SET NOT NULL;
 
 ALTER TABLE pixels
     ADD COLUMN IF NOT EXISTS platform VARCHAR(50) DEFAULT 'facebook',
@@ -251,7 +322,8 @@ ALTER TABLE pixels
     ALTER COLUMN shop_id DROP NOT NULL;
 
 ALTER TABLE shop_pixel_routes
-    ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100);
+    ADD COLUMN IF NOT EXISTS test_event_code VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS test_event_code_expires_at TIMESTAMPTZ;
 
 DO $$
 BEGIN
@@ -362,6 +434,15 @@ FROM pixels pixel
 WHERE pixel.id = route.pixel_id
   AND route.test_event_code IS NULL
   AND pixel.test_event_code IS NOT NULL;
+
+-- Test codes are diagnostic-only route state. Existing installations had no
+-- expiry column, so disable legacy codes instead of allowing production CAPI
+-- traffic to remain in test mode indefinitely after an upgrade.
+UPDATE shop_pixel_routes
+SET test_event_code = NULL,
+    test_event_code_expires_at = NULL
+WHERE test_event_code IS NOT NULL
+  AND test_event_code_expires_at IS NULL;
 
 -- Remove the legacy credential-wide value after copying it. Leaving it as a
 -- fallback would silently re-enable test mode when one route clears its code.
@@ -505,5 +586,17 @@ CREATE INDEX IF NOT EXISTS idx_meta_quality_snapshots_route_time
 
 CREATE INDEX IF NOT EXISTS idx_meta_quality_snapshots_shop_time
     ON meta_quality_snapshots(shop_id, fetched_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_browser_delivery_diagnostics_shop_time
+    ON browser_delivery_diagnostics(shop_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_browser_delivery_diagnostics_retention
+    ON browser_delivery_diagnostics(created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_shopify_pixel_runtime_last_seen
+    ON shopify_pixel_runtime_status(last_seen_at);
+
+CREATE INDEX IF NOT EXISTS idx_shopify_webhook_subscription_checked
+    ON shopify_webhook_subscription_state(last_checked_at);
 
 COMMIT;

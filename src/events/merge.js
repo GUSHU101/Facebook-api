@@ -96,6 +96,14 @@ function mergePersistedEventPayload(existing = {}, incoming = {}) {
         event_source_url: incomingUrl.length > existingUrl.length
             ? incoming.event_source_url
             : existing.event_source_url,
+        // A paid webhook usually has no browser referrer. Do not let an
+        // undefined authoritative field erase the useful browser observation.
+        referrer_url: firstPresent(incoming.referrer_url, existing.referrer_url),
+        // Once any observation explicitly opts out of ads optimization, a
+        // later duplicate must never downgrade that privacy instruction.
+        opt_out: existing.opt_out === true || incoming.opt_out === true
+            ? true
+            : firstPresent(incoming.opt_out, existing.opt_out),
         user_data: userData,
         custom_data: customData,
         _platform_data: mergePlatformData(preferred.left._platform_data, preferred.right._platform_data),

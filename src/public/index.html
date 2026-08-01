@@ -118,7 +118,7 @@
                             <div class="surface-copy">重复提交同一域名会安全更新 Webhook 密钥并恢复店铺状态。</div>
                         </div>
                     </div>
-                    <div class="grid lg:grid-cols-[1fr_1fr_1fr_auto] gap-3 items-end">
+                    <div class="grid lg:grid-cols-[1fr_1fr_1fr_1fr_auto] gap-3 items-end">
                         <label class="block">
                             <span class="text-sm font-medium">Shopify 域名</span>
                             <input v-model.trim="newShop.shop_domain" placeholder="your-store.myshopify.com" class="mt-1 w-full border rounded-md p-2 font-mono">
@@ -131,21 +131,34 @@
                             <span class="text-sm font-medium">Admin API Token（可选）</span>
                             <input v-model.trim="newShop.admin_access_token" type="password" autocomplete="new-password" placeholder="用于 read_orders 支付对账" class="mt-1 w-full border rounded-md p-2 font-mono">
                         </label>
+                        <label class="block">
+                            <span class="text-sm font-medium">店铺报表时区</span>
+                            <input v-model.trim="newShop.reporting_timezone" placeholder="America/Los_Angeles" class="mt-1 w-full border rounded-md p-2 font-mono">
+                        </label>
                         <button @click="addShop" :disabled="busy.addShop" class="primary-btn px-5 py-2">{{ busy.addShop ? '保存中…' : '保存店铺' }}</button>
                     </div>
                 </div>
                 <div class="table-shell"><div class="table-scroll">
                     <table class="data-table text-sm">
-                        <thead class="text-left"><tr><th>店铺域名</th><th>状态</th><th>支付对账</th><th>创建时间</th><th>操作</th></tr></thead>
+                        <thead class="text-left"><tr><th>店铺域名</th><th>报表时区</th><th>状态</th><th>支付对账</th><th>付款 Webhook</th><th>像素运行版本</th><th>创建时间</th><th>操作</th></tr></thead>
                         <tbody>
                             <tr v-for="s in shops" :key="s.id">
                                 <td class="font-mono font-semibold">{{ s.shop_domain }}</td>
+                                <td class="font-mono">{{ s.reporting_timezone || 'UTC' }}</td>
                                 <td><span class="status-pill ready"><span class="live-dot"></span>{{ s.status }}</span></td>
                                 <td><span :class="['status-pill', s.has_admin_access_token ? 'ready' : 'pending']">{{ s.has_admin_access_token ? '已启用' : '仅 Webhook' }}</span></td>
+                                <td>
+                                    <span :class="['status-pill', ['HEALTHY', 'HEALTHY_WITH_ALTERNATES'].includes(s.paid_webhook_subscription_status) ? 'ready' : 'pending']">{{ s.paid_webhook_subscription_status || '未检查' }}</span>
+                                    <div class="mt-1 text-xs text-slate-500">{{ s.paid_webhook_last_checked_at ? formatTime(s.paid_webhook_last_checked_at) : '等待审计' }}</div>
+                                </td>
+                                <td>
+                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v17' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
+                                    <div class="mt-1 text-xs text-slate-500">客户端自报：{{ s.pixel_last_seen_at ? formatTime(s.pixel_last_seen_at) : '新版首个事件进入后显示' }} · 自报丢失诊断 {{ s.pixel_diagnostic_count || 0 }}</div>
+                                </td>
                                 <td>{{ formatTime(s.created_at) }}</td>
-                                <td><button @click="deleteShop(s)" class="text-action text-red-600 font-medium">删除</button></td>
+                                <td class="space-x-2 whitespace-nowrap"><button @click="auditPaidWebhook(s)" class="text-action text-blue-600 font-medium">检查 Webhook</button><button @click="ensurePaidWebhook(s)" class="text-action text-emerald-700 font-medium">修复 Webhook</button><button @click="editShopTimezone(s)" class="text-action text-blue-600 font-medium">修改时区</button><button @click="deleteShop(s)" class="text-action text-red-600 font-medium">删除</button></td>
                             </tr>
-                            <tr v-if="!shops.length"><td colspan="5" class="table-empty">尚未添加店铺。请先配置 Shopify 域名和 Webhook 密钥。</td></tr>
+                            <tr v-if="!shops.length"><td colspan="8" class="table-empty">尚未添加店铺。请先配置 Shopify 域名和 Webhook 密钥。</td></tr>
                         </tbody>
                     </table>
                 </div></div>
@@ -156,7 +169,7 @@
                     <div>
                         <div class="eyebrow">Routing · Many to Many</div>
                         <h2 class="page-title">Pixel 路由</h2>
-                        <p class="page-description">一个凭据可安全服务多个店铺，一个店铺也可同时投递到多个 Meta Dataset 或 TikTok Pixel。</p>
+                        <p class="page-description">Meta Dataset 支持多店共享学习信号；本项目仍按店铺隔离事件身份、归因、去重、投递账本与诊断。</p>
                     </div>
                     <div class="status-chip"><span class="live-dot"></span>{{ pixels.length }} 个共享凭据</div>
                 </div>
@@ -164,7 +177,7 @@
                     <div class="surface-header">
                         <div>
                             <div class="surface-title">新建或复用 Pixel 凭据</div>
-                            <div class="surface-copy">相同平台与 Pixel ID 只保存一份凭据，所有已选店铺获得各自独立的投递路由。</div>
+                            <div class="surface-copy">相同平台与 Pixel ID 只保存一份凭据。允许多个店铺绑定同一 Meta Dataset；事件身份、归因缓存、投递账本和测试代码仍按店铺隔离。</div>
                         </div>
                     </div>
                     <div class="grid md:grid-cols-2 gap-4">
@@ -202,6 +215,7 @@
                             <span class="text-sm font-medium">测试事件代码（可选）</span>
                             <input v-model.trim="newPixel.test_event_code" placeholder="Meta Test Event Code" class="mt-1 w-full border rounded-md p-2 font-mono">
                             <span class="mt-1 block text-xs text-amber-700">仅应用到本次选中的店铺路由；正式投放前必须清空，避免共享 Pixel 的其他店铺误入测试模式。</span>
+                            <span class="mt-1 block text-xs text-slate-500">测试码默认 30 分钟后自动失效（可由服务配置调整）；生产事件不会长期滞留在测试链路。</span>
                         </label>
                         <label class="block">
                             <span class="text-sm font-medium">平台限流组（可选）</span>
@@ -231,7 +245,7 @@
                             <td>{{ p.has_quality_token ? '已配置' : '—' }}</td>
                             <td class="font-mono text-xs">
                                 <div v-for="route in (p.routes || []).filter(item => item.test_event_code)" :key="'test-' + route.route_id">
-                                    {{ route.shop_domain }}: {{ route.test_event_code }}
+                                    {{ route.shop_domain }}: {{ route.test_event_code }}（至 {{ formatTime(route.test_event_code_expires_at) }}）
                                 </div>
                                 <span v-if="!(p.routes || []).some(item => item.test_event_code)">—</span>
                             </td>
@@ -285,11 +299,93 @@
                         <div class="metric-value text-2xl">{{ formatBytes(summary.storage_health?.webhook_inbox_bytes) }}</div>
                     </div>
                 </div>
+                <div class="surface p-5 text-sm">
+                    <div class="flex flex-wrap items-start justify-between gap-3 mb-3">
+                        <div>
+                            <div class="surface-title">核心漏斗对账（按事件实际发生时间）</div>
+                            <div class="surface-copy">采集数以 Shopify 单次动作 ID 为粒度；Purchase 以订单/checkout 为粒度。成功数代表平台路由全部投递成功，不等同于 Meta 归因转化数。</div>
+                        </div>
+                        <div class="text-xs text-slate-500">最近 24 小时</div>
+                    </div>
+                    <div class="table-shell"><div class="table-scroll">
+                        <table class="data-table text-xs">
+                            <thead class="text-left"><tr><th>事件定义</th><th>采集</th><th>成功</th><th>等待</th><th>失败</th><th>参数缺失</th><th>校验异常</th><th>事件金额</th><th>平均 EMQ</th><th>成功率</th></tr></thead>
+                            <tbody>
+                                <tr v-for="item in summary.last24h?.funnel_events || []" :key="item.event_name">
+                                    <td>
+                                        <b>{{ item.label }} · {{ item.event_name }}</b>
+                                        <div class="font-mono text-slate-500">{{ item.shopify_source }} · {{ item.grain === 'order' ? '订单级' : '动作级' }}</div>
+                                    </td>
+                                    <td class="font-semibold">{{ item.unique_events || 0 }}</td>
+                                    <td class="font-semibold text-emerald-700">{{ item.successful_events || 0 }}</td>
+                                    <td class="font-semibold text-amber-700">{{ Number(item.pending_events || 0) + Number(item.awaiting_payment_events || 0) }}</td>
+                                    <td class="font-semibold" :class="Number(item.failed_events || 0) ? 'text-red-600' : 'text-slate-500'">{{ item.failed_events || 0 }}</td>
+                                    <td class="font-semibold" :class="Number(item.missing_parameter_events || 0) ? 'text-red-600' : 'text-emerald-700'">{{ item.missing_parameter_events || 0 }}</td>
+                                    <td class="font-semibold" :class="Number(item.locally_invalid_events || 0) ? 'text-red-600' : 'text-emerald-700'">{{ item.locally_invalid_events || 0 }}</td>
+                                    <td class="font-mono">{{ formatCurrencyBreakdown(item.value_by_currency) }}</td>
+                                    <td>{{ item.avg_emq ?? '—' }}</td>
+                                    <td>{{ formatPercent(item.success_rate) }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div></div>
+                    <div class="grid md:grid-cols-3 xl:grid-cols-6 gap-3 mt-4">
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">Shopify 已付款订单</div><div class="text-xl font-semibold">{{ summary.last24h?.shopify_paid_orders?.observed_paid_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">符合网站来源</div><div class="text-xl font-semibold text-emerald-700">{{ summary.last24h?.shopify_paid_orders?.eligible_web_paid_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">已进入 Purchase 台账</div><div class="text-xl font-semibold" :class="Number(summary.last24h?.shopify_paid_orders?.purchase_ledger_orders || 0) < Number(summary.last24h?.shopify_paid_orders?.eligible_web_paid_orders || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.last24h?.shopify_paid_orders?.purchase_ledger_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">Meta API 已确认收件</div><div class="text-xl font-semibold text-emerald-700">{{ summary.last24h?.shopify_paid_orders?.meta_delivered_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">Meta 待处理</div><div class="text-xl font-semibold" :class="Number(summary.last24h?.shopify_paid_orders?.meta_pending_orders || 0) ? 'text-amber-600' : 'text-emerald-700'">{{ summary.last24h?.shopify_paid_orders?.meta_pending_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">Meta 永久失败</div><div class="text-xl font-semibold" :class="Number(summary.last24h?.shopify_paid_orders?.meta_failed_orders || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.last24h?.shopify_paid_orders?.meta_failed_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">本地校验异常</div><div class="text-xl font-semibold" :class="Number(summary.last24h?.shopify_paid_orders?.locally_invalid_orders || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.last24h?.shopify_paid_orders?.locally_invalid_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">未进入 Purchase 台账</div><div class="text-xl font-semibold" :class="Number(summary.last24h?.shopify_paid_orders?.unledgered_eligible_orders || 0) ? 'text-red-600' : 'text-emerald-700'">{{ summary.last24h?.shopify_paid_orders?.unledgered_eligible_orders || 0 }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">测试/非网站排除</div><div class="text-xl font-semibold">{{ Number(summary.last24h?.shopify_paid_orders?.ignored_test_orders || 0) + Number(summary.last24h?.shopify_paid_orders?.ignored_non_web_orders || 0) }}</div></div>
+                        <div class="border rounded-md p-3 bg-slate-50"><div class="text-xs text-slate-500">来源缺失/订单永久失败</div><div class="text-xl font-semibold" :class="Number(summary.last24h?.shopify_paid_orders?.missing_source_orders || 0) + Number(summary.last24h?.shopify_paid_orders?.permanently_failed_orders || 0) ? 'text-red-600' : 'text-emerald-700'">{{ Number(summary.last24h?.shopify_paid_orders?.missing_source_orders || 0) + Number(summary.last24h?.shopify_paid_orders?.permanently_failed_orders || 0) }}</div></div>
+                    </div>
+                </div>
+                <div class="surface p-5 text-sm">
+                    <div class="surface-header">
+                        <div>
+                            <div class="surface-title">店铺“今天”漏斗对账</div>
+                            <div class="surface-copy">每个店铺按自己的 IANA 时区切分自然日，事件按实际发生时间归档。这里用于和 Shopify Today 报表对账，不等同于 Meta 广告归因。</div>
+                        </div>
+                    </div>
+                    <div class="table-shell"><div class="table-scroll">
+                        <table class="data-table text-xs">
+                            <thead class="text-left"><tr><th>店铺</th><th>时区</th><th>加入购物车</th><th>发起结账</th><th>添加支付信息</th><th>Purchase</th><th>付款 Webhook 成功/总数</th><th>待处理/永久失败</th></tr></thead>
+                            <tbody>
+                                <tr v-for="shop in summary.store_today?.shops || []" :key="'today-' + shop.shop_id">
+                                    <td class="font-mono font-semibold">{{ shop.shop_domain }}</td>
+                                    <td class="font-mono">{{ shop.reporting_timezone }}</td>
+                                    <td>{{ storeTodayCount(shop, 'AddToCart') }}</td>
+                                    <td>{{ storeTodayCount(shop, 'InitiateCheckout') }}</td>
+                                    <td>{{ storeTodayCount(shop, 'AddPaymentInfo') }}</td>
+                                    <td class="font-semibold">{{ storeTodayCount(shop, 'Purchase') }}</td>
+                                    <td>{{ shop.successful_paid_webhooks || 0 }}/{{ shop.paid_webhooks || 0 }}</td>
+                                    <td :class="Number(shop.outstanding_paid_webhooks || 0) + Number(shop.permanently_failed_paid_webhooks || 0) ? 'text-red-600 font-semibold' : 'text-emerald-700'">{{ shop.outstanding_paid_webhooks || 0 }}/{{ shop.permanently_failed_paid_webhooks || 0 }}</td>
+                                </tr>
+                                <tr v-if="!(summary.store_today?.shops || []).length"><td colspan="8" class="table-empty">暂无店铺今日数据。</td></tr>
+                            </tbody>
+                        </table>
+                    </div></div>
+                </div>
                 <div class="surface p-4 text-sm">
                     <div class="surface-title mb-2">平台路由分布</div>
                     <div class="flex flex-wrap gap-2">
                         <span v-for="item in summary.pixels_by_platform || []" :key="item.platform" class="platform-pill" :class="item.platform">{{ item.platform }} · {{ item.count }}</span>
                         <span v-if="!summary.pixels_by_platform?.length" class="text-slate-500">尚无路由</span>
+                    </div>
+                    <div class="mt-3 border rounded-md p-3" :class="Number(summary.routing_health?.shared_facebook_datasets || 0) ? (summary.routing_health?.shared_facebook_routes_allowed ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-red-300 bg-red-50 text-red-800') : 'border-emerald-200 bg-emerald-50 text-emerald-800'">
+                        <div class="font-semibold">Meta Dataset 跨店共用：{{ summary.routing_health?.shared_facebook_datasets || 0 }}</div>
+                        <div v-if="Number(summary.routing_health?.shared_facebook_datasets || 0)" class="mt-1 text-xs">{{ summary.routing_health?.shared_facebook_routes_allowed ? '共享模式已启用：Meta 官方报表、质量、受众和学习信号是所有绑定店铺的汇总；请使用下方店铺漏斗分别对账。' : '共享模式未启用；请调整路由或服务器配置。' }}</div>
+                    </div>
+                    <div class="mt-3 border rounded-md p-3" :class="Number(summary.routing_health?.test_mode?.active_routes || 0) ? 'border-red-300 bg-red-50 text-red-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'">
+                        <div class="font-semibold">诊断测试路由：{{ summary.routing_health?.test_mode?.active_routes || 0 }}</div>
+                        <div class="mt-1 text-xs">测试码有效期 {{ summary.routing_health?.test_mode?.ttl_minutes || 30 }} 分钟；有效期间的服务端事件属于诊断流量，正式投放前必须为 0。</div>
+                    </div>
+                    <div class="mt-3 border rounded-md p-3" :class="Number(summary.shopify_api_health?.mismatched_deliveries || 0) ? 'border-red-300 bg-red-50 text-red-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'">
+                        <div class="font-semibold">Shopify API：{{ summary.shopify_api_health?.configured_version || '—' }}</div>
+                        <div class="mt-1 text-xs">近 7 天实际版本：{{ (summary.shopify_api_health?.observed_versions || []).map(item => item.version + ' × ' + item.deliveries).join('，') || '暂无新 Webhook' }}</div>
+                        <div v-if="Number(summary.shopify_api_health?.mismatched_deliveries || 0)" class="mt-1 text-xs">发现 {{ summary.shopify_api_health.mismatched_deliveries }} 条由其他 API 版本生成的 Webhook，请检查 Shopify 应用的 Webhook 版本设置。</div>
                     </div>
                 </div>
                 <div class="surface p-5 text-sm">
@@ -403,7 +499,7 @@
                                     <div class="font-semibold">{{ item.name }}</div>
                                     <div class="font-mono text-xs text-slate-500">{{ item.pixel_id }}</div>
                                 </div>
-                                <span class="px-2 py-1 rounded-md text-xs font-semibold" :class="item.status === 'SUCCESS' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'">{{ item.status }}</span>
+                                <span class="px-2 py-1 rounded-md text-xs font-semibold" :class="item.status === 'SUCCESS' ? 'bg-emerald-100 text-emerald-700' : (item.status === 'EMPTY' ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700')">{{ item.status }}</span>
                             </div>
                             <div class="mt-3 grid grid-cols-2 gap-3">
                                 <div class="border rounded-md bg-white p-3">
@@ -463,6 +559,31 @@
                     </div></div>
                 </div>
 
+                <div v-if="browserDiagnostics.length" class="surface p-5 text-sm">
+                    <div class="surface-header">
+                        <div>
+                            <div class="surface-title">浏览器投递丢失诊断</div>
+                            <div class="surface-copy">这是客户端自报的观测信号，不作为可信投递证明。仅保存错误代码、事件名计数和像素版本，不保存客户身份数据；应与服务端入库、路由账本和 Meta 回执交叉核对。</div>
+                        </div>
+                    </div>
+                    <div class="table-shell"><div class="table-scroll">
+                        <table class="data-table text-xs">
+                            <thead class="text-left"><tr><th>记录时间</th><th>店铺</th><th>代码</th><th>受影响数</th><th>事件分布</th><th>像素版本</th><th>客户端时间</th></tr></thead>
+                            <tbody>
+                                <tr v-for="item in browserDiagnostics" :key="'browser-' + item.id">
+                                    <td>{{ formatTime(item.created_at) }}</td>
+                                    <td class="font-mono">{{ item.shop_domain }}</td>
+                                    <td class="font-mono font-semibold text-red-700">{{ item.code }}</td>
+                                    <td class="font-semibold">{{ item.dropped_count }}</td>
+                                    <td class="font-mono">{{ JSON.stringify(item.event_counts || {}) }}</td>
+                                    <td class="font-mono">{{ item.source_version }}</td>
+                                    <td>{{ formatTime(item.client_last_at || item.client_first_at) }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div></div>
+                </div>
+
                 <div v-if="dlq.length" class="table-shell border-red-200 bg-red-50"><div class="table-scroll">
                     <table class="data-table text-xs">
                         <thead class="bg-red-100 text-left"><tr><th>店铺</th><th>失败时间</th><th>失败原因</th></tr></thead>
@@ -478,18 +599,20 @@
 
                 <div class="table-shell"><div class="table-scroll">
                     <table class="data-table text-xs">
-                        <thead class="text-left"><tr><th>时间</th><th>店铺</th><th>事件</th><th>EMQ</th><th>缺失信号</th><th>状态</th><th>平台响应</th></tr></thead>
+                        <thead class="text-left"><tr><th>时间</th><th>店铺</th><th>事件</th><th>Shopify 来源</th><th>金额</th><th>EMQ</th><th>质量缺口</th><th>状态</th><th>平台响应</th></tr></thead>
                         <tbody>
                             <tr v-for="log in logs" :key="log.id">
                                 <td>{{ formatTime(log.timestamp) }}</td>
                                 <td class="font-mono">{{ log.shop_domain }}</td>
                                 <td><b>{{ log.event_name }}</b><br><span class="font-mono text-slate-500">{{ log.event_id }}</span></td>
+                                <td><span class="font-mono">{{ log.source?.event_name || log.source?.provider || '—' }}</span><br><span class="font-mono text-slate-500">{{ log.source?.event_id || '—' }}</span></td>
+                                <td class="font-mono">{{ formatEventValue(log.custom_data) }}</td>
                                 <td class="font-semibold">{{ log.emq_estimate || '—' }}/10</td>
                                 <td class="font-mono text-slate-500">{{ summarizeQuality(log.quality) }}</td>
                                 <td class="font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
                                 <td class="font-mono text-slate-500">{{ summarizeResponse(log.fb_response) }}</td>
                             </tr>
-                            <tr v-if="!logs.length"><td colspan="7" class="table-empty">当前筛选范围内暂无事件记录。</td></tr>
+                            <tr v-if="!logs.length"><td colspan="9" class="table-empty">当前筛选范围内暂无事件记录。</td></tr>
                         </tbody>
                     </table>
                 </div></div>
@@ -512,6 +635,7 @@
                     shops: [],
                     pixels: [],
                     logs: [],
+                    browserDiagnostics: [],
                     dlq: [],
                     privacyRequests: [],
                     summary: {},
@@ -521,7 +645,7 @@
                     deployShopId: '',
                     selectedShopId: '',
                     currentShop: 'your-store.myshopify.com',
-                    newShop: { shop_domain: '', app_secret: '', admin_access_token: '' },
+                    newShop: { shop_domain: '', app_secret: '', admin_access_token: '', reporting_timezone: 'America/Los_Angeles' },
                     newPixel: { shop_ids: [], platform: 'facebook', name: '', pixel_id: '', access_token: '', quality_access_token: '', test_event_code: '', rate_limit_group: '' },
                 };
             },
@@ -562,12 +686,13 @@
                     return `// CAPI SaaS Hub - Shopify Customer Events Unified Event Gateway
 const CAPI_HUB_URL = "${this.apiDomain}/api/pixel-event";
 const CAPI_PIXEL_CONFIG_URL = "${this.apiDomain}/api/pixel-config";
+const CAPI_PIXEL_DIAGNOSTIC_URL = "${this.apiDomain}/api/pixel-diagnostic";
 const SHOP_DOMAIN = "${this.currentShop}";
 const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v14";
+const SOURCE_VERSION = "shopify-pixel-v17";
 const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
 const META_STANDARD_BROWSER_EVENTS = new Set([
     'PageView', 'ViewContent', 'Search', 'AddToCart',
@@ -594,20 +719,36 @@ const MAX_CLIENT_RETRIES = 32;
 const CLIENT_RETRY_MAX_AGE_MS = 6 * 24 * 60 * 60 * 1000;
 const RETRY_BACKOFF_MS = [1000, 3000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000, 7200000, 14400000, 21600000];
 const STORAGE_QUEUE_KEY = 'capi_gateway_event_queue_v3:' + SHOP_DOMAIN;
+const DIAGNOSTIC_STORAGE_KEY = 'capi_gateway_diagnostics_v1:' + SHOP_DOMAIN;
+const MAX_DIAGNOSTIC_QUEUE_SIZE = 50;
+const CLIENT_DIAGNOSTIC_CODES = new Set([
+    'QUEUE_OVERFLOW', 'RETRY_EXHAUSTED', 'RETRY_AGE_EXPIRED',
+    'STORAGE_READ_FAILED', 'STORAGE_WRITE_FAILED',
+    'SERVER_BATCH_REJECTED', 'SERVER_REQUEST_REJECTED',
+    'META_BROWSER_QUEUE_OVERFLOW',
+]);
 const MAX_STORED_EVENTS = 1000;
 const recentEvents = new Map();
 const eventQueue = [];
+const diagnosticQueue = [];
 var inFlightEvents = [];
 var eventQueueTimer = null;
 var persistedQueueLoaded = false;
 var storageWriteChain = Promise.resolve();
 var flushPromise = null;
+var diagnosticFlushPromise = null;
+var diagnosticQueueLoaded = false;
+var diagnosticLoadPromise = null;
+var storageFailureSignalActive = false;
+const recordedStorageFailureCodes = new Set();
+const activeGatewayControllers = new Set();
 const initializedMetaBrowserPixelIds = new Set();
 var metaBrowserSdkLoading = false;
 var metaBrowserSdkLoadAttempts = 0;
 var metaBrowserSdkRetryAt = 0;
 var metaRouteConfigPromise = null;
 var metaRouteConfigPending = false;
+var customerPrivacyStatus = initialCustomerPrivacyStatus();
 
 function normalizedMetaPixelIds() {
     return Array.from(new Set(META_ROUTE_PIXEL_IDS.map(function (value) {
@@ -631,12 +772,14 @@ function trimMetaBrowserQueue() {
         return true;
     }
 
+    var removed = 0;
     while (queue.length > META_PIXEL_MAX_QUEUE_SIZE) {
-        if (removeOldest(function (call) { return META_PIXEL_LOW_PRIORITY_EVENTS.has(call[2]); })) continue;
-        if (removeOldest(function (call) { return call[2] !== 'Purchase'; })) continue;
-        if (removeOldest(function () { return true; })) continue;
+        if (removeOldest(function (call) { return META_PIXEL_LOW_PRIORITY_EVENTS.has(call[2]); })) { removed += 1; continue; }
+        if (removeOldest(function (call) { return call[2] !== 'Purchase'; })) { removed += 1; continue; }
+        if (removeOldest(function () { return true; })) { removed += 1; continue; }
         break;
     }
+    if (removed > 0) queueClientDiagnostic('META_BROWSER_QUEUE_OVERFLOW', [], removed);
 }
 
 function injectMetaBrowserPixelScript() {
@@ -694,7 +837,7 @@ function injectMetaBrowserPixelScript() {
 
 function bootstrapMetaBrowserPixel() {
     var pixelIds = normalizedMetaPixelIds();
-    if (!pixelIds.length || typeof window === 'undefined' || typeof document === 'undefined') return false;
+    if (!trackingAllowedByPrivacy() || !pixelIds.length || typeof window === 'undefined' || typeof document === 'undefined') return false;
 
     try {
         if (!window.fbq) {
@@ -782,7 +925,10 @@ async function getStorageValue(key) {
         if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.getItem) {
             return await browser.localStorage.getItem(key);
         }
-    } catch (error) {}
+    } catch (error) {
+        signalStorageFailure('STORAGE_READ_FAILED');
+    }
+    signalStorageFailure('STORAGE_READ_FAILED');
     return undefined;
 }
 
@@ -790,16 +936,172 @@ async function setStorageValue(key, value) {
     try {
         if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.setItem) {
             await browser.localStorage.setItem(key, value);
+            return true;
         }
-    } catch (error) {}
+    } catch (error) {
+        signalStorageFailure('STORAGE_WRITE_FAILED');
+    }
+    signalStorageFailure('STORAGE_WRITE_FAILED');
+    return false;
 }
 
 async function removeStorageValue(key) {
     try {
         if (typeof browser !== 'undefined' && browser.localStorage && browser.localStorage.removeItem) {
             await browser.localStorage.removeItem(key);
+            return true;
         }
+    } catch (error) {
+        signalStorageFailure('STORAGE_WRITE_FAILED');
+    }
+    signalStorageFailure('STORAGE_WRITE_FAILED');
+    return false;
+}
+
+function eventCountsForDiagnostics(events) {
+    return (events || []).reduce(function (counts, event) {
+        var name = String(event && event.event_name || 'Unknown');
+        if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) name = 'Unknown';
+        counts[name] = Number(counts[name] || 0) + 1;
+        return counts;
+    }, {});
+}
+
+function directDiagnosticStorage() {
+    try {
+        if (typeof browser !== 'undefined' && browser.localStorage) return browser.localStorage;
     } catch (error) {}
+    return null;
+}
+
+async function persistDiagnosticQueue() {
+    var storage = directDiagnosticStorage();
+    if (!storage || !storage.setItem || storageFailureSignalActive) return false;
+    storageFailureSignalActive = true;
+    try {
+        if (diagnosticQueue.length) {
+            await storage.setItem(DIAGNOSTIC_STORAGE_KEY, JSON.stringify(diagnosticQueue.slice(-MAX_DIAGNOSTIC_QUEUE_SIZE)));
+        } else if (storage.removeItem) {
+            await storage.removeItem(DIAGNOSTIC_STORAGE_KEY);
+        }
+        return true;
+    } catch (error) {
+        return false;
+    } finally {
+        storageFailureSignalActive = false;
+    }
+}
+
+async function loadDiagnosticQueue() {
+    if (diagnosticQueueLoaded) return;
+    if (diagnosticLoadPromise) return diagnosticLoadPromise;
+    diagnosticLoadPromise = (async function () {
+        var storage = directDiagnosticStorage();
+        if (!storage || !storage.getItem) {
+            diagnosticQueueLoaded = true;
+            return;
+        }
+        storageFailureSignalActive = true;
+        try {
+            var stored = await storage.getItem(DIAGNOSTIC_STORAGE_KEY);
+            var parsed = stored ? JSON.parse(stored) : [];
+            if (Array.isArray(parsed)) {
+                parsed.slice(-MAX_DIAGNOSTIC_QUEUE_SIZE).forEach(function (item) {
+                    var count = Number(item && item.dropped_count);
+                    if (!item || !CLIENT_DIAGNOSTIC_CODES.has(item.code) || !Number.isInteger(count) || count <= 0) return;
+                    diagnosticQueue.push({
+                        code: item.code,
+                        dropped_count: Math.min(10000, count),
+                        event_counts: item.event_counts && typeof item.event_counts === 'object' ? item.event_counts : {},
+                        client_first_at: item.client_first_at,
+                        client_last_at: item.client_last_at,
+                    });
+                });
+            }
+        } catch (error) {
+            storageFailureSignalActive = false;
+            signalStorageFailure('STORAGE_READ_FAILED');
+        } finally {
+            storageFailureSignalActive = false;
+            diagnosticQueueLoaded = true;
+        }
+    })();
+    try {
+        await diagnosticLoadPromise;
+    } finally {
+        diagnosticLoadPromise = null;
+    }
+}
+
+function signalStorageFailure(code) {
+    if (storageFailureSignalActive || recordedStorageFailureCodes.has(code)) return;
+    recordedStorageFailureCodes.add(code);
+    queueClientDiagnostic(code, [], 1);
+}
+
+function queueClientDiagnostic(code, events, droppedCount) {
+    void loadDiagnosticQueue().then(function () {
+        var now = new Date().toISOString();
+        var eventCounts = eventCountsForDiagnostics(events);
+        var existing = diagnosticQueue.find(function (item) { return item.code === code; });
+        if (existing) {
+            existing.dropped_count = Math.min(10000, Number(existing.dropped_count || 0) + Number(droppedCount || 0));
+            existing.client_last_at = now;
+            Object.keys(eventCounts).forEach(function (name) {
+                existing.event_counts[name] = Math.min(10000, Number(existing.event_counts[name] || 0) + eventCounts[name]);
+            });
+        } else {
+            diagnosticQueue.push({
+                code: code,
+                dropped_count: Math.min(10000, Math.max(1, Number(droppedCount || (events || []).length || 1))),
+                event_counts: eventCounts,
+                client_first_at: now,
+                client_last_at: now,
+            });
+        }
+        if (diagnosticQueue.length > MAX_DIAGNOSTIC_QUEUE_SIZE) diagnosticQueue.splice(0, diagnosticQueue.length - MAX_DIAGNOSTIC_QUEUE_SIZE);
+        return persistDiagnosticQueue();
+    }).then(function () {
+        return flushClientDiagnostics();
+    }).catch(function () {});
+}
+
+async function postPixelDiagnostic(payload) {
+    var body = JSON.stringify(Object.assign({
+        shop_domain: SHOP_DOMAIN,
+        ingest_token: SHOP_INGEST_TOKEN,
+        source_version: SOURCE_VERSION,
+        schema_version: SCHEMA_VERSION,
+    }, payload));
+    var response = await fetch(CAPI_PIXEL_DIAGNOSTIC_URL, {
+        method: 'POST',
+        keepalive: serializedSize(body) < KEEPALIVE_LIMIT_BYTES,
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+    });
+    if (!response || !response.ok) throw new Error('Pixel diagnostic endpoint rejected the request');
+}
+
+async function flushClientDiagnosticsOnce() {
+    await loadDiagnosticQueue();
+    while (diagnosticQueue.length) {
+        var item = diagnosticQueue[0];
+        try {
+            await postPixelDiagnostic(Object.assign({ type: 'delivery_loss' }, item));
+            diagnosticQueue.shift();
+            await persistDiagnosticQueue();
+        } catch (error) {
+            break;
+        }
+    }
+}
+
+function flushClientDiagnostics() {
+    if (diagnosticFlushPromise) return diagnosticFlushPromise;
+    diagnosticFlushPromise = flushClientDiagnosticsOnce().finally(function () {
+        diagnosticFlushPromise = null;
+    });
+    return diagnosticFlushPromise;
 }
 
 function applyMetaRoutePixelIds(values) {
@@ -946,7 +1248,10 @@ function lineItemToContent(item) {
         price = totalPrice / quantity;
     }
     return {
-        id: normalizeShopifyId(variant.id || product.id || item.id),
+        // Checkout/cart line IDs are ephemeral and don't identify a catalog
+        // product. If Shopify doesn't expose a variant or product, omit the
+        // content ID instead of sending an unmatchable line-item GID to Meta.
+        id: normalizeShopifyId(variant.id || product.id),
         quantity: Number.isFinite(quantity) ? quantity : 1,
         item_price: price,
     };
@@ -1124,8 +1429,23 @@ function purchaseEventId(checkout, event) {
 
 function checkoutStageEventId(checkout, event, eventName) {
     checkout = checkout || {};
-    var baseId = firstNonEmpty(checkout.token, checkout.checkoutToken, event.id);
+    event = event || {};
+    // Shopify assigns a unique ID to each published standard event. Using it
+    // first preserves repeated checkout entries/submissions as distinct
+    // actions. The checkout token remains only a deterministic fallback when
+    // an older runtime does not expose event.id.
+    var baseId = firstNonEmpty(event.id, checkout.token, checkout.checkoutToken);
     return baseId ? String(baseId) + ':' + eventName : undefined;
+}
+
+function shopifySourceEventName(metaEventName, event) {
+    if (event && event.name) return String(event.name);
+    return {
+        AddToCart: 'product_added_to_cart',
+        InitiateCheckout: 'checkout_started',
+        AddPaymentInfo: 'payment_info_submitted',
+        Purchase: 'checkout_completed',
+    }[metaEventName];
 }
 
 function checkoutLineItems(checkout) {
@@ -1199,6 +1519,78 @@ function getInitData() {
     return {};
 }
 
+function initialCustomerPrivacyStatus() {
+    try {
+        if (typeof init !== 'undefined' && init && init.customerPrivacy) return init.customerPrivacy;
+    } catch (error) {}
+    return null;
+}
+
+function customerPrivacyApi() {
+    try {
+        if (typeof customerPrivacy !== 'undefined' && customerPrivacy) return customerPrivacy;
+    } catch (error) {}
+    try {
+        if (typeof api !== 'undefined' && api && api.customerPrivacy) return api.customerPrivacy;
+    } catch (error) {}
+    return null;
+}
+
+function trackingAllowedByPrivacy() {
+    if (!customerPrivacyStatus) return true;
+    return customerPrivacyStatus.marketingAllowed !== false &&
+        customerPrivacyStatus.saleOfDataAllowed !== false;
+}
+
+function clearQueuedTrackingData() {
+    if (eventQueueTimer) {
+        clearTimeout(eventQueueTimer);
+        eventQueueTimer = null;
+    }
+    eventQueue.splice(0, eventQueue.length);
+    inFlightEvents = [];
+    recentEvents.clear();
+    activeGatewayControllers.forEach(function (controller) {
+        try { controller.abort(); } catch (error) {}
+    });
+    activeGatewayControllers.clear();
+
+    try {
+        var fbq = typeof window !== 'undefined' && window.fbq;
+        if (fbq && !fbq.callMethod && Array.isArray(fbq.queue)) {
+            fbq.queue.splice(0, fbq.queue.length);
+            initializedMetaBrowserPixelIds.clear();
+        }
+    } catch (error) {}
+
+    // Serialize the delete after every already-scheduled write. Otherwise an
+    // older localStorage write can complete after consent revocation and
+    // resurrect events that were supposed to be erased.
+    storageWriteChain = storageWriteChain.catch(function () {}).then(function () {
+        return removeStorageValue(STORAGE_QUEUE_KEY);
+    });
+    return storageWriteChain;
+}
+
+function subscribeToPrivacyUpdates() {
+    var privacyApi = customerPrivacyApi();
+    if (!privacyApi || typeof privacyApi.subscribe !== 'function') return false;
+    try {
+        privacyApi.subscribe('visitorConsentCollected', function (event) {
+            customerPrivacyStatus = event && event.customerPrivacy || event || customerPrivacyStatus;
+            if (!trackingAllowedByPrivacy()) {
+                clearQueuedTrackingData();
+                return;
+            }
+            if (!metaRouteConfigPromise) startMetaRouteConfigRefresh();
+            bootstrapMetaBrowserPixel();
+        });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
 function scheduleEventQueueFlush(delayMs) {
     if (eventQueueTimer) clearTimeout(eventQueueTimer);
     eventQueueTimer = setTimeout(function () {
@@ -1255,7 +1647,7 @@ function storedEventPriority(event) {
 function boundStoredEvents(events) {
     var merged = mergeQueuedEvents(events);
     if (merged.length <= MAX_STORED_EVENTS) return merged;
-    return merged.map(function (event, index) {
+    var retained = merged.map(function (event, index) {
         return { event: event, index: index, priority: storedEventPriority(event) };
     }).sort(function (left, right) {
         if (right.priority !== left.priority) return right.priority - left.priority;
@@ -1263,6 +1655,19 @@ function boundStoredEvents(events) {
     }).slice(0, MAX_STORED_EVENTS).sort(function (left, right) {
         return left.index - right.index;
     }).map(function (item) { return item.event; });
+    var retainedKeys = new Set(retained.map(function (event) {
+        return [event.event_name, event.event_id].join(':');
+    }));
+    var dropped = merged.filter(function (event) {
+        return !retainedKeys.has([event.event_name, event.event_id].join(':'));
+    });
+    var newlyDropped = dropped.filter(function (event) {
+        if (event._client_storage_overflow_reported) return false;
+        event._client_storage_overflow_reported = true;
+        return true;
+    });
+    if (newlyDropped.length) queueClientDiagnostic('QUEUE_OVERFLOW', newlyDropped, newlyDropped.length);
+    return retained;
 }
 
 function persistEventQueue() {
@@ -1353,10 +1758,21 @@ function isRetryableResponse(response) {
 }
 
 function requeueFailedEvents(events, retryAfterMs) {
+    if (!trackingAllowedByPrivacy()) return;
     var now = Date.now();
+    var retryExhausted = [];
+    var ageExpired = [];
     var retryable = events.filter(function (event) {
         var firstQueuedAt = Number(event._client_first_queued_at || now);
-        return Number(event._client_retry_count || 0) < MAX_CLIENT_RETRIES && now - firstQueuedAt < CLIENT_RETRY_MAX_AGE_MS;
+        if (Number(event._client_retry_count || 0) >= MAX_CLIENT_RETRIES) {
+            retryExhausted.push(event);
+            return false;
+        }
+        if (now - firstQueuedAt >= CLIENT_RETRY_MAX_AGE_MS) {
+            ageExpired.push(event);
+            return false;
+        }
+        return true;
     }).map(function (event) {
         var nextRetryCount = Number(event._client_retry_count || 0) + 1;
         var baseDelay = RETRY_BACKOFF_MS[Math.min(nextRetryCount - 1, RETRY_BACKOFF_MS.length - 1)] || EVENT_QUEUE_FLUSH_MS;
@@ -1368,6 +1784,9 @@ function requeueFailedEvents(events, retryAfterMs) {
             _client_first_queued_at: Number(event._client_first_queued_at || now),
         });
     });
+
+    if (retryExhausted.length) queueClientDiagnostic('RETRY_EXHAUSTED', retryExhausted, retryExhausted.length);
+    if (ageExpired.length) queueClientDiagnostic('RETRY_AGE_EXPIRED', ageExpired, ageExpired.length);
 
     if (!retryable.length) return;
     Array.prototype.push.apply(eventQueue, retryable);
@@ -1398,6 +1817,7 @@ function requestOptionsForBody(body) {
             controller.abort();
         }, FETCH_TIMEOUT_MS);
         options.signal = controller.signal;
+        options._controller = controller;
         options._timeoutId = timeoutId;
     }
 
@@ -1409,7 +1829,15 @@ async function flushEventQueueOnce() {
         clearTimeout(eventQueueTimer);
         eventQueueTimer = null;
     }
+    if (!trackingAllowedByPrivacy()) {
+        await clearQueuedTrackingData();
+        return;
+    }
     await loadPersistedEventQueue();
+    if (!trackingAllowedByPrivacy()) {
+        await clearQueuedTrackingData();
+        return;
+    }
     if (!eventQueue.length) return;
 
     var now = Date.now();
@@ -1436,9 +1864,14 @@ async function flushEventQueueOnce() {
     await persistEventQueue();
     var batches = buildEventBatches(dueEvents);
     for (var index = 0; index < batches.length; index += 1) {
+        if (!trackingAllowedByPrivacy()) {
+            await clearQueuedTrackingData();
+            break;
+        }
         var batch = batches[index];
         var requestPayload = requestPayloadForEvents(batch);
         var options = requestOptionsForBody(JSON.stringify(requestPayload));
+        if (options._controller) activeGatewayControllers.add(options._controller);
 
         try {
             var response = await fetch(CAPI_HUB_URL, options);
@@ -1448,16 +1881,31 @@ async function flushEventQueueOnce() {
                     requeueFailedEvents(batch, retryAfterMsFromResponse(response));
                 } else {
                     removeInFlightEvents(batch);
+                    queueClientDiagnostic('SERVER_REQUEST_REJECTED', batch, batch.length);
                     console.warn('CAPI gateway rejected a non-retryable event batch', response.status);
                 }
             } else {
                 removeInFlightEvents(batch);
+                var responsePayload;
+                try { responsePayload = response && await response.json(); } catch (error) {}
+                if (responsePayload && responsePayload.batch && Array.isArray(responsePayload.results)) {
+                    var rejectedEvents = batch.filter(function (event, resultIndex) {
+                        var result = responsePayload.results[resultIndex];
+                        return result && (result.rejected === true || result.success === false);
+                    });
+                    if (rejectedEvents.length) {
+                        queueClientDiagnostic('SERVER_BATCH_REJECTED', rejectedEvents, rejectedEvents.length);
+                        console.warn('CAPI gateway permanently rejected ' + rejectedEvents.length + ' event(s) inside an accepted batch');
+                    }
+                }
             }
         } catch (error) {
             removeInFlightEvents(batch);
             requeueFailedEvents(batch);
         } finally {
+            if (options._controller) activeGatewayControllers.delete(options._controller);
             if (options._timeoutId) clearTimeout(options._timeoutId);
+            delete options._controller;
             delete options._timeoutId;
         }
     }
@@ -1478,6 +1926,7 @@ function flushEventQueue() {
 async function sendDualChannelEvent(metaEventName, event, customData, forcedEventId) {
     customData = customData || {};
     event = event || {};
+    if (!trackingAllowedByPrivacy()) return;
     var initContext = getInitContext();
     var initData = getInitData();
     var context = event.context || initContext || {};
@@ -1499,6 +1948,7 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     ));
     if (!shouldSendRecentEvent(metaEventName, eventId)) return;
     await waitForMetaRouteConfig();
+    if (!trackingAllowedByPrivacy()) return;
     var scopedOrderId = await shopScopedIdentifier(firstNonEmpty(customData.order_id, orderId));
     var browserCustomData = {
         ...customData,
@@ -1523,11 +1973,11 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     var rawCountry = address.countryCode || address.country;
     var orderCustomer = checkout.order && checkout.order.customer || {};
     var isFirstOrder = firstNonEmpty(orderCustomer.isFirstOrder, customer && customer.isFirstOrder);
-    var customerSegmentation;
+    var customerLifecycle;
     if (isFirstOrder === true) {
-        customerSegmentation = 'new_customer_to_business';
+        customerLifecycle = 'new_customer';
     } else if (isFirstOrder === false) {
-        customerSegmentation = 'existing_customer_to_business';
+        customerLifecycle = 'existing_customer';
     }
     var hashedFields = await Promise.all([
         sha256Hex(rawEmail, 'email'),
@@ -1540,60 +1990,68 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
         sha256Hex(rawCountry, 'country'),
     ]);
     var traceId = randomId('trace');
+    if (!trackingAllowedByPrivacy()) return;
 
     enqueueEventPayload(compact({
         shop_domain: SHOP_DOMAIN,
         ingest_token: SHOP_INGEST_TOKEN,
-            tenant_id: SHOP_DOMAIN,
-            schema_version: SCHEMA_VERSION,
-            source_version: SOURCE_VERSION,
-            trace_id: traceId,
-            pixel_ids: META_ROUTE_PIXEL_IDS,
-            dataset_ids: META_ROUTE_PIXEL_IDS,
-            event_name: metaEventName,
-            event_id: eventId,
-            action_source: 'website',
-            customer_segmentation: customerSegmentation,
-            timestamp: event.timestamp,
-            url: currentUrl,
-            event_source_url: currentUrl,
-            referrer: documentInfo.referrer || fallbackDocumentInfo.referrer,
-            user_agent: navigatorInfo.userAgent || fallbackNavigatorInfo.userAgent,
-            fbp: fbp,
-            fbc: fbc,
-            ttp: ttp,
-            ttclid: ttclid,
-            email_hash: hashedFields[0],
-            phone_hash: hashedFields[1],
-            first_name_hash: hashedFields[2],
-            last_name_hash: hashedFields[3],
-            city_hash: hashedFields[4],
-            state_hash: hashedFields[5],
-            zip_hash: hashedFields[6],
-            country_hash: hashedFields[7],
-            client_id: event.clientId,
-            checkout_token: checkoutToken,
-            cart_token: cartToken,
-            order_id: scopedOrderId,
-            route_hints: {
-                facebook_pixel_ids: META_ROUTE_PIXEL_IDS,
-                tiktok_pixel_ids: TIKTOK_ROUTE_PIXEL_IDS,
-            },
-            external_id: externalId,
-            value: customData.value,
-            currency: customData.currency,
-            content_ids: customData.content_ids,
-            contents: customData.contents,
-            content_type: customData.content_type,
-            num_items: customData.num_items,
-            search_string: customData.search_string,
-            content_name: customData.content_name,
-            content_category: customData.content_category,
+        tenant_id: SHOP_DOMAIN,
+        schema_version: SCHEMA_VERSION,
+        source_version: SOURCE_VERSION,
+        source_provider: 'shopify_web_pixels',
+        source_event_name: shopifySourceEventName(metaEventName, event),
+        source_event_id: event.id,
+        source_event_seq: event.seq,
+        trace_id: traceId,
+        pixel_ids: META_ROUTE_PIXEL_IDS,
+        dataset_ids: META_ROUTE_PIXEL_IDS,
+        event_name: metaEventName,
+        event_id: eventId,
+        action_source: 'website',
+        customer_lifecycle: customerLifecycle,
+        timestamp: event.timestamp,
+        url: currentUrl,
+        event_source_url: currentUrl,
+        referrer: documentInfo.referrer || fallbackDocumentInfo.referrer,
+        user_agent: navigatorInfo.userAgent || fallbackNavigatorInfo.userAgent,
+        fbp: fbp,
+        fbc: fbc,
+        ttp: ttp,
+        ttclid: ttclid,
+        email_hash: hashedFields[0],
+        phone_hash: hashedFields[1],
+        first_name_hash: hashedFields[2],
+        last_name_hash: hashedFields[3],
+        city_hash: hashedFields[4],
+        state_hash: hashedFields[5],
+        zip_hash: hashedFields[6],
+        country_hash: hashedFields[7],
+        client_id: event.clientId,
+        checkout_token: checkoutToken,
+        cart_token: cartToken,
+        _shopify_order_id: normalizedOrderId,
+        order_id: scopedOrderId,
+        route_hints: {
+            facebook_pixel_ids: META_ROUTE_PIXEL_IDS,
+            tiktok_pixel_ids: TIKTOK_ROUTE_PIXEL_IDS,
+        },
+        external_id: externalId,
+        value: customData.value,
+        currency: customData.currency,
+        content_ids: customData.content_ids,
+        contents: customData.contents,
+        content_type: customData.content_type,
+        num_items: customData.num_items,
+        search_string: customData.search_string,
+        content_name: customData.content_name,
+        content_category: customData.content_category,
         }));
 }
 
+subscribeToPrivacyUpdates();
 startMetaRouteConfigRefresh();
 scheduleMetaRouteConfigRefresh();
+void flushClientDiagnostics();
 
 analytics.subscribe('page_viewed', function (event) {
     return sendDualChannelEvent('PageView', event);
@@ -1770,7 +2228,15 @@ analytics.subscribe('search_submitted', function (event) {
                     }
                 },
                 async api(path, options = {}) {
-                    const response = await fetch(path, options);
+                    const requestOptions = { ...options };
+                    const method = String(requestOptions.method || 'GET').toUpperCase();
+                    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+                        requestOptions.headers = {
+                            ...(requestOptions.headers || {}),
+                            'X-CAPI-Admin-Request': '1',
+                        };
+                    }
+                    const response = await fetch(path, requestOptions);
                     const text = await response.text();
                     let payload = {};
                     if (text) {
@@ -1793,6 +2259,10 @@ analytics.subscribe('search_submitted', function (event) {
                     if (total < 86400) return `${(total / 3600).toFixed(1)}h`;
                     return `${(total / 86400).toFixed(1)}d`;
                 },
+                storeTodayCount(shop, eventName) {
+                    const event = (shop?.funnel_events || []).find(item => item.event_name === eventName);
+                    return Number(event?.unique_events || 0);
+                },
                 formatBytes(bytes) {
                     const value = Math.max(0, Number(bytes || 0));
                     if (value < 1024) return `${Math.round(value)} B`;
@@ -1806,17 +2276,18 @@ analytics.subscribe('search_submitted', function (event) {
                     return `${amount >= 10 ? amount.toFixed(1) : amount.toFixed(2)} ${units[index]}`;
                 },
                 async fetchAll() {
-                    await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchDlq(), this.fetchPrivacy(), this.fetchSummary()]);
+                    await Promise.all([this.fetchShops(), this.fetchPixels(), this.fetchLogs(), this.fetchBrowserDiagnostics(), this.fetchDlq(), this.fetchPrivacy(), this.fetchSummary()]);
                 },
                 shopScopedPath(path) {
                     return this.selectedShopId ? `${path}?shop_id=${encodeURIComponent(this.selectedShopId)}` : path;
                 },
                 async fetchOperationalData() {
-                    await Promise.all([this.fetchLogs(), this.fetchDlq(), this.fetchPrivacy(), this.fetchSummary()]);
+                    await Promise.all([this.fetchLogs(), this.fetchBrowserDiagnostics(), this.fetchDlq(), this.fetchPrivacy(), this.fetchSummary()]);
                 },
                 async fetchShops() { this.shops = await this.api('/api/admin/shops'); },
                 async fetchPixels() { this.pixels = await this.api('/api/admin/pixels'); },
                 async fetchLogs() { this.logs = await this.api(this.shopScopedPath('/api/admin/logs')); },
+                async fetchBrowserDiagnostics() { this.browserDiagnostics = await this.api(this.shopScopedPath('/api/admin/browser-diagnostics')); },
                 async fetchDlq() { this.dlq = await this.api(this.shopScopedPath('/api/admin/dlq')); },
                 async fetchPrivacy() { this.privacyRequests = await this.api(this.shopScopedPath('/api/admin/privacy')); },
                 async fetchSummary() { this.summary = await this.api(this.shopScopedPath('/api/admin/summary')); },
@@ -1884,9 +2355,36 @@ analytics.subscribe('search_submitted', function (event) {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(this.newShop),
                         });
-                        this.newShop = { shop_domain: '', app_secret: '', admin_access_token: '' };
+                        this.newShop = { shop_domain: '', app_secret: '', admin_access_token: '', reporting_timezone: 'America/Los_Angeles' };
                         await this.fetchShops();
                     }, '店铺已保存。');
+                },
+                async editShopTimezone(shop) {
+                    const value = prompt('请输入 IANA 时区，例如 America/Los_Angeles：', shop.reporting_timezone || 'UTC');
+                    if (value === null) return;
+                    await this.runAction(`shopTimezone:${shop.id}`, async () => {
+                        await this.api(`/api/admin/shops/${shop.id}/reporting-timezone`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ reporting_timezone: value.trim() }),
+                        });
+                        await Promise.all([this.fetchShops(), this.fetchSummary()]);
+                    }, '店铺报表时区已更新。');
+                },
+                async auditPaidWebhook(shop) {
+                    await this.runAction(`auditPaidWebhook:${shop.id}`, async () => {
+                        const result = await this.api(`/api/admin/shops/${shop.id}/audit-paid-webhook`, { method: 'POST' });
+                        await this.fetchShops();
+                        return result;
+                    }, 'orders/paid Webhook 订阅检查已完成。');
+                },
+                async ensurePaidWebhook(shop) {
+                    if (!confirm(`确认检查并在缺失时为 ${shop.shop_domain} 创建 orders/paid Webhook？现有其他地址不会被自动删除。`)) return;
+                    await this.runAction(`ensurePaidWebhook:${shop.id}`, async () => {
+                        const result = await this.api(`/api/admin/shops/${shop.id}/ensure-paid-webhook`, { method: 'POST' });
+                        await this.fetchShops();
+                        return result;
+                    }, 'orders/paid Webhook 已确认存在；如原本缺失则已创建。');
                 },
                 async addPixel() {
                     await this.runAction('addPixel', async () => {
@@ -1921,7 +2419,8 @@ analytics.subscribe('search_submitted', function (event) {
                 },
                 async editPixelRoutes(pixel) {
                     const current = (pixel.routes || []).map(route => route.shop_domain).join(', ');
-                    const value = prompt('请输入此 Pixel 绑定的店铺域名，多个域名使用英文逗号分隔：', current);
+                    const promptText = '请输入此 Pixel 绑定的店铺域名，多个域名使用英文逗号分隔：';
+                    const value = prompt(promptText, current);
                     if (value === null) return;
                     const domains = value.split(',').map(item => item.trim().toLowerCase()).filter(Boolean);
                     const shopIds = this.shops
@@ -1964,12 +2463,30 @@ analytics.subscribe('search_submitted', function (event) {
                 summarizeResponse(value) {
                     if (!value) return '等待处理';
                     const deliveries = value.deliveries || [];
-                    if (deliveries.length) return deliveries.map(item => `${item.pixel_id}:${item.status}`).join(', ');
+                    if (deliveries.length) return deliveries.map(item => {
+                        const response = item.response || {};
+                        const acknowledged = response.accepted_event === true
+                            || Number(response.accepted_event_count || 0) === 1
+                            || Number(response.events_received || 0) > 0;
+                        const trace = response.fbtrace_id ? ` · ${response.fbtrace_id}` : '';
+                        return `${item.pixel_id}:${item.status}${acknowledged ? ' · API已确认' : ''}${trace}`;
+                    }).join(', ');
                     return value.fbtrace_id || JSON.stringify(value).slice(0, 120);
                 },
                 summarizeQuality(value) {
-                    const missing = value?.missing_match_signals || [];
+                    const missingMatch = (value?.missing_match_signals || []).map(item => `匹配:${item}`);
+                    const missingParameters = (value?.missing_event_parameters || []).map(item => `参数:${item}`);
+                    const localValidation = (value?.local_validation_errors || []).map(item => `校验:${item}`);
+                    const missing = [...missingMatch, ...missingParameters, ...localValidation];
                     return missing.length ? missing.join(', ') : 'OK';
+                },
+                formatCurrencyBreakdown(value) {
+                    const entries = Object.entries(value || {});
+                    return entries.length ? entries.map(([currency, amount]) => `${currency} ${Number(amount).toFixed(2)}`).join(' · ') : '—';
+                },
+                formatEventValue(customData) {
+                    if (customData?.value === undefined || customData?.value === null) return '—';
+                    return `${customData.currency || '?'} ${Number(customData.value).toFixed(2)}`;
                 },
                 formatPercent(value) {
                     return value === null || value === undefined ? '-' : `${Number(value).toFixed(1)}%`;

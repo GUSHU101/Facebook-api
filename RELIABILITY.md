@@ -215,7 +215,9 @@ worker restarted.
     loss after credential repair and indiscriminate replay.
 57. Meta Test Event Code belongs to `shop_pixel_routes`, not the shared
     credential. One shop can be tested without silently placing every other
-    shop using the Dataset into test mode. Dataset Quality polling also uses
+    shop using the Dataset into test mode. Test codes have a bounded TTL, and
+    production diagnostics fail while an active route is still in diagnostic
+    test mode. Dataset Quality polling also uses
     the exact same credential-scope lease and cooldown as production delivery,
     so observability traffic cannot bypass shared Meta pacing.
 58. Browser Pixel execution remains subordinate to Shopify Customer Events

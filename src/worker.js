@@ -178,18 +178,23 @@ async function extendDeliveryLeases(routeId, claims) {
     return rowCount;
 }
 
-async function markDeliverySuccess(routeId, claims, response) {
+async function markDeliverySuccess(routeId, claims, responseForEvent) {
     if (claims.length === 0) return [];
     const { eventStoreIds, attemptCounts } = claimArrays(claims);
+    const platformResponses = claims.map(claim => JSON.stringify(
+        typeof responseForEvent === 'function'
+            ? responseForEvent(String(claim.eventStoreId))
+            : responseForEvent,
+    ));
     const { rows } = await pool.query(
-        `WITH claimed(event_store_id, attempt_count) AS (
-             SELECT * FROM UNNEST($2::bigint[], $3::int[])
+        `WITH claimed(event_store_id, attempt_count, platform_response) AS (
+             SELECT * FROM UNNEST($2::bigint[], $3::int[], $4::jsonb[])
          )
          UPDATE event_deliveries ed
          SET status = 'SUCCESS',
              delivered_at = NOW(),
              lease_expires_at = NULL,
-             platform_response = $4::jsonb,
+             platform_response = c.platform_response,
              error_code = NULL,
              error_message = NULL,
              updated_at = NOW()
@@ -199,7 +204,7 @@ async function markDeliverySuccess(routeId, claims, response) {
            AND ed.attempt_count = c.attempt_count
            AND ed.status = 'IN_PROGRESS'
          RETURNING ed.event_store_id`,
-        [routeId, eventStoreIds, attemptCounts, JSON.stringify(response)],
+        [routeId, eventStoreIds, attemptCounts, platformResponses],
     );
     return rows.map(row => String(row.event_store_id));
 }
@@ -394,6 +399,9 @@ async function loadReadyShopEvents(shopId) {
            AND EXISTS (
                    SELECT 1
                    FROM shop_pixel_routes active_route
+                   JOIN pixels active_pixel
+                     ON active_pixel.id = active_route.pixel_id
+                    AND active_pixel.status = 'active'
                    LEFT JOIN event_deliveries delivery
                      ON delivery.event_store_id = event_store.id
                     AND delivery.route_id = active_route.id
@@ -433,6 +441,9 @@ async function hasReadyShopEvents(shopId) {
            AND EXISTS (
                    SELECT 1
                    FROM shop_pixel_routes active_route
+                   JOIN pixels active_pixel
+                     ON active_pixel.id = active_route.pixel_id
+                    AND active_pixel.status = 'active'
                    LEFT JOIN event_deliveries delivery
                      ON delivery.event_store_id = event_store.id
                     AND delivery.route_id = active_route.id
@@ -568,6 +579,41 @@ function buildFacebookResult(pixel, successes, failures) {
             maxUsagePercent: maxUsagePercent || undefined,
             cooldownSeconds: cooldownSeconds || undefined,
         },
+    };
+}
+
+function perEventAcceptanceResponse(pixel, deliveryResult, eventStoreId) {
+    const resultItems = Array.isArray(deliveryResult.results) ? deliveryResult.results : [];
+    if (pixel.platform === 'facebook') {
+        const batch = resultItems.find(item => (
+            Array.isArray(item.event_store_ids)
+            && item.event_store_ids.map(String).includes(String(eventStoreId))
+        ));
+        return {
+            platform: 'facebook',
+            pixel_id: pixel.pixel_id,
+            status: 'SUCCESS',
+            accepted_event: true,
+            accepted_event_count: 1,
+            api_version: config.fbApiVersion,
+            test_mode: Boolean(pixel.test_event_code),
+            fbtrace_id: batch?.fbtrace_id || null,
+            meta_batch_events_received: Number(batch?.events_received || 0),
+            meta_batch_size: Array.isArray(batch?.event_store_ids) ? batch.event_store_ids.length : 0,
+        };
+    }
+
+    const item = resultItems.find(result => String(result.event_store_id) === String(eventStoreId));
+    return {
+        platform: pixel.platform,
+        pixel_id: pixel.pixel_id,
+        status: 'SUCCESS',
+        accepted_event: true,
+        accepted_event_count: 1,
+        test_mode: Boolean(pixel.test_event_code),
+        request_id: item?.request_id || null,
+        response_code: item?.code ?? null,
+        response_message: item?.message || null,
     };
 }
 
@@ -978,7 +1024,7 @@ async function applyPlatformResult(pixel, dbEvents, claimedEvents, result, deliv
         const updatedIds = await markDeliverySuccess(
             pixel.route_id,
             claimsForEvents(successDbEvents, claimedEvents),
-            successDelivery,
+            eventStoreId => perEventAcceptanceResponse(pixel, deliveryResult, eventStoreId),
         );
         if (updatedIds.length > 0) deliveries.push(successDelivery);
     }
@@ -1049,7 +1095,10 @@ const worker = new Worker('capi-events', async job => {
                 p.credential_scope,
                 p.credential_version,
                 p.rate_limit_group,
-                r.test_event_code
+                CASE
+                    WHEN r.test_event_code_expires_at > NOW() THEN r.test_event_code
+                    ELSE NULL
+                END AS test_event_code
          FROM shop_pixel_routes r
          JOIN pixels p ON p.id = r.pixel_id
          JOIN event_deliveries snapshot_delivery
@@ -1354,6 +1403,25 @@ worker.on('error', error => {
     console.error('Worker runtime error:', error);
 });
 
+async function writeWorkerHeartbeat() {
+    await redis.set(
+        'health:capi-worker',
+        String(Date.now()),
+        'EX',
+        config.workerHeartbeatTtlSeconds,
+    );
+}
+
+const workerHeartbeatTimer = setInterval(() => {
+    void writeWorkerHeartbeat().catch(error => {
+        console.error('Worker heartbeat failed:', error.message);
+    });
+}, Math.max(5_000, Math.floor(config.workerHeartbeatTtlSeconds * 1000 / 3)));
+workerHeartbeatTimer.unref?.();
+void writeWorkerHeartbeat().catch(error => {
+    console.error('Initial worker heartbeat failed:', error.message);
+});
+
 let shuttingDown = false;
 async function shutdown(signal) {
     if (shuttingDown) return;
@@ -1365,6 +1433,7 @@ async function shutdown(signal) {
     }, config.shutdownTimeoutMs);
     forceTimer.unref?.();
     try {
+        clearInterval(workerHeartbeatTimer);
         await worker.close();
         await capiQueue.close();
         await pool.end();

@@ -101,6 +101,22 @@ function readShopifyApiVersion() {
     return value;
 }
 
+function readOptionalPublicBaseUrl() {
+    const raw = String(process.env.PUBLIC_BASE_URL || '').trim();
+    if (!raw) return '';
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    } catch (error) {
+        throw new Error('PUBLIC_BASE_URL must be a valid URL');
+    }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) {
+        throw new Error('PUBLIC_BASE_URL must be a credential-free HTTPS URL');
+    }
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+    return parsed.toString().replace(/\/$/, '');
+}
+
 const aesSecretKey = readRequired('AES_SECRET_KEY');
 if (aesSecretKey.length < 32) {
     throw new Error('AES_SECRET_KEY must be at least 32 characters');
@@ -161,11 +177,15 @@ module.exports = {
     adminUsername,
     adminPassword,
     requireIngestToken,
+    publicBaseUrl: readOptionalPublicBaseUrl(),
+    allowSharedFacebookDatasetRoutes: readBool('ALLOW_SHARED_FACEBOOK_DATASET_ROUTES', true),
+    testEventCodeTtlMinutes: readBoundedInt('TEST_EVENT_CODE_TTL_MINUTES', 30, 24 * 60),
     shopifyWebOrderSources: readCsv('SHOPIFY_WEB_ORDER_SOURCES', 'web'),
     shopifyAppSecret: String(process.env.SHOPIFY_APP_SECRET || '').trim(),
     shopifyApiVersion: readShopifyApiVersion(),
     shopifyReconcileCron: process.env.SHOPIFY_RECONCILE_CRON || '23 */15 * * * *',
-    shopifyReconcileLookbackHours: readBoundedInt('SHOPIFY_RECONCILE_LOOKBACK_HOURS', 48, 24 * 30),
+    shopifyWebhookAuditCron: process.env.SHOPIFY_WEBHOOK_AUDIT_CRON || '41 7 * * * *',
+    shopifyReconcileLookbackHours: readBoundedInt('SHOPIFY_RECONCILE_LOOKBACK_HOURS', 144, 24 * 30),
     shopifyReconcileMaxOrders: readBoundedInt('SHOPIFY_RECONCILE_MAX_ORDERS', 1000, 10000),
     shopifyReconcileMaxLineItemPages: readBoundedInt('SHOPIFY_RECONCILE_MAX_LINE_ITEM_PAGES', 100, 1000),
     fbApiVersion: readFacebookApiVersion(),
@@ -200,6 +220,7 @@ module.exports = {
     shopifyWebhookInboxBatchSize: readBoundedInt('SHOPIFY_WEBHOOK_INBOX_BATCH_SIZE', 200, 1000),
     shopifyWebhookInboxMaxAttempts: readBoundedInt('SHOPIFY_WEBHOOK_INBOX_MAX_ATTEMPTS', 20, 100),
     shopifyWebhookInboxLeaseSeconds: readBoundedInt('SHOPIFY_WEBHOOK_INBOX_LEASE_SECONDS', 60, 600),
+    shopifyWebhookProcessTimeoutMs: readBoundedInt('SHOPIFY_WEBHOOK_PROCESS_TIMEOUT_MS', 45000, 590000),
     shopifyPrivacyCron: process.env.SHOPIFY_PRIVACY_CRON || '11 */1 * * * *',
     shopifyPrivacyBatchSize: readBoundedInt('SHOPIFY_PRIVACY_BATCH_SIZE', 50, 500),
     shopifyPrivacyMaxAttempts: readBoundedInt('SHOPIFY_PRIVACY_MAX_ATTEMPTS', 20, 100),
@@ -209,6 +230,8 @@ module.exports = {
     fbRequestTimeoutMs: readInt('FB_REQUEST_TIMEOUT_MS', 15000),
     facebookBatchSize: readBoundedInt('FACEBOOK_BATCH_SIZE', 100, 1000),
     workerConcurrency: readBoundedInt('WORKER_CONCURRENCY', 20, 200),
+    requireWorkerHeartbeat: readBool('REQUIRE_WORKER_HEARTBEAT', production),
+    workerHeartbeatTtlSeconds: readBoundedInt('WORKER_HEARTBEAT_TTL_SECONDS', 45, 300),
     workerRateLimitMax: readInt('WORKER_RATE_LIMIT_MAX', 100),
     workerRateLimitDurationMs: readInt('WORKER_RATE_LIMIT_DURATION_MS', 1000),
     platformRequestsPerSecondPerCredential: readBoundedInt('PLATFORM_REQUESTS_PER_SECOND_PER_CREDENTIAL', 20, 100),
@@ -232,6 +255,7 @@ module.exports = {
     cleanupMaxBatches: readBoundedInt('CLEANUP_MAX_BATCHES', 2, 20),
     eventRetentionDays: readInt('EVENT_RETENTION_DAYS', 90),
     deadLetterRetentionDays: readInt('DEAD_LETTER_RETENTION_DAYS', 90),
+    browserDiagnosticRetentionDays: readInt('BROWSER_DIAGNOSTIC_RETENTION_DAYS', 30),
     aliasRetentionDays: readInt('ALIAS_RETENTION_DAYS', 120),
     qualityRetentionDays: readInt('QUALITY_RETENTION_DAYS', 30),
 };

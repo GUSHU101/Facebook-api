@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { FUNNEL_EVENT_NAME_SET } = require('./funnel');
 
 function compactObject(value) {
     return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== ''));
@@ -105,10 +106,8 @@ function stripPrivateFields(eventPayload) {
     return Object.fromEntries(Object.entries(eventPayload).filter(([key]) => !key.startsWith('_')));
 }
 
-const COMMERCE_EVENTS = new Set(['AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase']);
-
 function missingCommerceSignals(eventName, customData = {}) {
-    if (!COMMERCE_EVENTS.has(eventName)) return [];
+    if (!FUNNEL_EVENT_NAME_SET.has(eventName)) return [];
     const missing = [];
     if (customData.value === undefined || customData.value === null || customData.value === '') missing.push('value');
     if (!String(customData.currency || '').trim()) missing.push('currency');
