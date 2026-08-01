@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const { Queue } = require('bullmq');
+const Redis = require('ioredis');
 const { Pool } = require('pg');
 
 const enabled = process.env.RUN_INTEGRATION_TESTS === '1';
@@ -468,6 +470,300 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         }
         if (pixelId) await pool.query('DELETE FROM pixels WHERE id = $1', [pixelId]).catch(() => {});
         if (cleanupShopIds.length) await pool.query('DELETE FROM shops WHERE id = ANY($1::int[])', [cleanupShopIds]).catch(() => {});
+        await pool.end().catch(() => {});
+    }
+});
+
+test('hard worker crash and partial multiroute failure recover without resending successful routes', { skip: !enabled }, async () => {
+    const suffix = crypto.randomUUID();
+    const shopDomain = `crash-recovery-${suffix}.myshopify.com`;
+    const firstPixelExternalId = `8${Date.now()}${Math.floor(Math.random() * 10000)}`;
+    const secondPixelExternalId = `7${Date.now()}${Math.floor(Math.random() * 10000)}`;
+    const crashEventId = `${shopDomain}:crash-${suffix}`;
+    const partialEventId = `${shopDomain}:partial-${suffix}`;
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const queueRedis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
+    const queue = new Queue('capi-events', { connection: queueRedis });
+    const metaRequests = [];
+    let holdFirstRequest = true;
+    let heldResponse;
+    let firstRequestResolve;
+    const firstRequestSeen = new Promise(resolve => { firstRequestResolve = resolve; });
+    let secondPixelTransientFailures = 0;
+
+    const fakeMeta = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            const eventIds = (body.data || []).map(event => event.event_id);
+            const isSecondPixelPartial = req.url.includes(`/${secondPixelExternalId}/events`)
+                && eventIds.includes(partialEventId);
+            const simulatedStatus = isSecondPixelPartial && secondPixelTransientFailures === 0
+                ? 503
+                : 200;
+            if (simulatedStatus === 503) secondPixelTransientFailures += 1;
+            metaRequests.push({ url: req.url, body, simulatedStatus });
+
+            if (holdFirstRequest) {
+                holdFirstRequest = false;
+                heldResponse = res;
+                firstRequestResolve();
+                return;
+            }
+            if (simulatedStatus === 503) {
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+                res.end(JSON.stringify({
+                    error: { message: 'simulated partial-route outage', code: 2, is_transient: true },
+                }));
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                events_received: Array.isArray(body.data) ? body.data.length : 0,
+                fbtrace_id: `recovery-trace-${metaRequests.length}`,
+            }));
+        });
+    });
+    await new Promise((resolve, reject) => {
+        fakeMeta.once('error', reject);
+        fakeMeta.listen(0, '127.0.0.1', resolve);
+    });
+
+    const runtimeEnv = {
+        ...process.env,
+        NODE_ENV: 'test',
+        FB_GRAPH_BASE_URL: `http://127.0.0.1:${fakeMeta.address().port}`,
+        FB_REQUEST_TIMEOUT_MS: '1000',
+        CREDENTIAL_LEASE_MS: '1000',
+        DELIVERY_RETRY_BASE_SECONDS: '1',
+        QUEUE_BACKOFF_MS: '100',
+        REQUIRE_WORKER_HEARTBEAT: 'false',
+    };
+    const cwd = require('node:path').join(__dirname, '..');
+    let worker;
+    let diagnostics = '';
+    const startWorker = () => {
+        const child = spawn(process.execPath, ['src/worker.js'], {
+            cwd,
+            env: runtimeEnv,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        child.stdout.on('data', chunk => { diagnostics += chunk.toString(); });
+        child.stderr.on('data', chunk => { diagnostics += chunk.toString(); });
+        return child;
+    };
+    let shopId;
+    let firstPixelId;
+    let secondPixelId;
+    let firstRouteId;
+    let secondRouteId;
+    let crashEventStoreId;
+    let partialEventStoreId;
+
+    try {
+        ({ rows: [{ id: shopId }] } = await pool.query(
+            `INSERT INTO shops (shop_domain, app_secret)
+             VALUES ($1, 'crash-recovery-secret') RETURNING id`,
+            [shopDomain],
+        ));
+        ({ rows: [{ id: firstPixelId }] } = await pool.query(
+            `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token)
+             VALUES ($1, 'facebook', 'crash-primary', $2, $3) RETURNING id`,
+            [shopId, firstPixelExternalId, `crash-token-${suffix}`],
+        ));
+        ({ rows: [{ id: firstRouteId }] } = await pool.query(
+            `INSERT INTO shop_pixel_routes (shop_id, pixel_id)
+             VALUES ($1, $2) RETURNING id`,
+            [shopId, firstPixelId],
+        ));
+        const crashPayload = {
+            event_name: 'PageView',
+            event_time: Math.floor(Date.now() / 1000),
+            event_id: crashEventId,
+            action_source: 'website',
+            event_source_url: `https://${shopDomain}/products/crash-test`,
+            user_data: {
+                external_id: `visitor-${suffix}`,
+                client_ip_address: '127.0.0.1',
+                client_user_agent: 'CAPI-Crash-Recovery/1.0',
+            },
+            custom_data: {},
+        };
+        ({ rows: [{ id: crashEventStoreId }] } = await pool.query(
+            `INSERT INTO event_store
+                (shop_id, event_name, event_id, request_payload, delivery_route_snapshot)
+             VALUES ($1, 'PageView', $2, $3::jsonb, ARRAY[$4]::bigint[])
+             RETURNING id`,
+            [shopId, crashEventId, JSON.stringify(crashPayload), firstRouteId],
+        ));
+        await pool.query(
+            `INSERT INTO event_deliveries (event_store_id, route_id)
+             VALUES ($1, $2)`,
+            [crashEventStoreId, firstRouteId],
+        );
+
+        worker = startWorker();
+        await waitForCondition(
+            () => diagnostics.includes('CAPI worker started'),
+            'first crash-test worker startup',
+        );
+        await queue.add(
+            'send-fb-batch',
+            { shopId: Number(shopId) },
+            { jobId: `crash-start-${suffix}`, attempts: 1 },
+        );
+        await Promise.race([
+            firstRequestSeen,
+            new Promise((resolve, reject) => setTimeout(
+                () => reject(new Error('worker never reached the held Meta request')),
+                10_000,
+            )),
+        ]);
+        await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT status, attempt_count FROM event_deliveries
+                 WHERE event_store_id = $1 AND route_id = $2`,
+                [crashEventStoreId, firstRouteId],
+            );
+            return rows[0]?.status === 'IN_PROGRESS' ? rows[0] : null;
+        }, 'crash delivery IN_PROGRESS state');
+
+        worker.kill('SIGKILL');
+        await new Promise(resolve => worker.once('exit', resolve));
+        if (heldResponse && !heldResponse.destroyed) heldResponse.destroy();
+        const { rows: [credential] } = await pool.query(
+            'SELECT credential_scope FROM pixels WHERE id = $1',
+            [firstPixelId],
+        );
+        assert.ok(credential.credential_scope);
+        await pool.query(
+            `UPDATE event_deliveries
+             SET lease_expires_at = NOW() - INTERVAL '1 second'
+             WHERE event_store_id = $1 AND route_id = $2`,
+            [crashEventStoreId, firstRouteId],
+        );
+        await waitForCondition(async () => {
+            const [shopLock, credentialLock] = await Promise.all([
+                queueRedis.exists(`lock:delivery-shop:${shopId}`),
+                queueRedis.exists(`lock:delivery-credential:${credential.credential_scope}`),
+            ]);
+            return shopLock === 0 && credentialLock === 0;
+        }, 'crashed worker Redis leases to expire', 10_000);
+
+        diagnostics = '';
+        worker = startWorker();
+        await waitForCondition(
+            () => diagnostics.includes('CAPI worker started'),
+            'replacement worker startup',
+        );
+        await queue.add(
+            'send-fb-batch',
+            { shopId: Number(shopId) },
+            { jobId: `crash-recover-${suffix}`, attempts: 3, backoff: { type: 'fixed', delay: 100 } },
+        );
+        const recoveredCrashDelivery = await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT event.status AS event_status, delivery.status AS delivery_status,
+                        delivery.attempt_count, delivery.platform_response
+                 FROM event_store event
+                 JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 WHERE event.id = $1 AND delivery.route_id = $2`,
+                [crashEventStoreId, firstRouteId],
+            );
+            return rows[0]?.event_status === 'SUCCESS' ? rows[0] : null;
+        }, 'hard-crash delivery recovery', 20_000);
+        assert.equal(recoveredCrashDelivery.delivery_status, 'SUCCESS');
+        assert.equal(Number(recoveredCrashDelivery.attempt_count), 2);
+        assert.equal(recoveredCrashDelivery.platform_response.accepted_event, true);
+        assert.equal(metaRequests.filter(request => (
+            (request.body.data || []).some(event => event.event_id === crashEventId)
+        )).length, 2);
+
+        ({ rows: [{ id: secondPixelId }] } = await pool.query(
+            `INSERT INTO pixels (shop_id, platform, name, pixel_id, access_token)
+             VALUES ($1, 'facebook', 'partial-secondary', $2, $3) RETURNING id`,
+            [shopId, secondPixelExternalId, `partial-token-${suffix}`],
+        ));
+        ({ rows: [{ id: secondRouteId }] } = await pool.query(
+            `INSERT INTO shop_pixel_routes (shop_id, pixel_id)
+             VALUES ($1, $2) RETURNING id`,
+            [shopId, secondPixelId],
+        ));
+        const partialPayload = {
+            ...crashPayload,
+            event_name: 'ViewContent',
+            event_id: partialEventId,
+            custom_data: {
+                value: 18.5,
+                currency: 'USD',
+                content_ids: ['partial-variant'],
+                contents: [{ id: 'partial-variant', quantity: 1, item_price: 18.5 }],
+                content_type: 'product',
+            },
+        };
+        ({ rows: [{ id: partialEventStoreId }] } = await pool.query(
+            `INSERT INTO event_store
+                (shop_id, event_name, event_id, request_payload, delivery_route_snapshot)
+             VALUES ($1, 'ViewContent', $2, $3::jsonb, ARRAY[$4, $5]::bigint[])
+             RETURNING id`,
+            [shopId, partialEventId, JSON.stringify(partialPayload), firstRouteId, secondRouteId],
+        ));
+        await pool.query(
+            `INSERT INTO event_deliveries (event_store_id, route_id)
+             VALUES ($1, $2), ($1, $3)`,
+            [partialEventStoreId, firstRouteId, secondRouteId],
+        );
+        await queue.add(
+            'send-fb-batch',
+            { shopId: Number(shopId) },
+            { jobId: `partial-routes-${suffix}`, attempts: 3, backoff: { type: 'fixed', delay: 100 } },
+        );
+        const partialDeliveries = await waitForCondition(async () => {
+            const { rows } = await pool.query(
+                `SELECT event.status AS event_status, delivery.route_id,
+                        delivery.status AS delivery_status, delivery.attempt_count
+                 FROM event_store event
+                 JOIN event_deliveries delivery ON delivery.event_store_id = event.id
+                 WHERE event.id = $1
+                 ORDER BY delivery.route_id`,
+                [partialEventStoreId],
+            );
+            return rows.length === 2 && rows.every(row => row.delivery_status === 'SUCCESS')
+                ? rows
+                : null;
+        }, 'partial multiroute retry completion', 20_000);
+        assert.ok(partialDeliveries.every(row => row.event_status === 'SUCCESS'));
+        const firstRouteDelivery = partialDeliveries.find(row => String(row.route_id) === String(firstRouteId));
+        const secondRouteDelivery = partialDeliveries.find(row => String(row.route_id) === String(secondRouteId));
+        assert.equal(Number(firstRouteDelivery.attempt_count), 1);
+        assert.equal(Number(secondRouteDelivery.attempt_count), 2);
+        const firstRouteRequests = metaRequests.filter(request => (
+            request.url.includes(`/${firstPixelExternalId}/events`)
+            && (request.body.data || []).some(event => event.event_id === partialEventId)
+        ));
+        const secondRouteRequests = metaRequests.filter(request => (
+            request.url.includes(`/${secondPixelExternalId}/events`)
+            && (request.body.data || []).some(event => event.event_id === partialEventId)
+        ));
+        assert.equal(firstRouteRequests.length, 1);
+        assert.equal(secondRouteRequests.filter(request => request.simulatedStatus === 503).length, 1);
+        assert.equal(secondRouteRequests.filter(request => request.simulatedStatus === 200).length, 1);
+    } catch (error) {
+        error.message = `${error.message}\nWorker diagnostics:\n${diagnostics}`
+            + `\nMeta requests:\n${JSON.stringify(metaRequests, null, 2)}`;
+        throw error;
+    } finally {
+        await stopChild(worker);
+        if (heldResponse && !heldResponse.destroyed) heldResponse.destroy();
+        await new Promise(resolve => fakeMeta.close(resolve));
+        if (shopId) await pool.query('DELETE FROM event_store WHERE shop_id = $1', [shopId]).catch(() => {});
+        if (shopId) await pool.query('DELETE FROM shop_pixel_routes WHERE shop_id = $1', [shopId]).catch(() => {});
+        if (secondPixelId) await pool.query('DELETE FROM pixels WHERE id = $1', [secondPixelId]).catch(() => {});
+        if (firstPixelId) await pool.query('DELETE FROM pixels WHERE id = $1', [firstPixelId]).catch(() => {});
+        if (shopId) await pool.query('DELETE FROM shops WHERE id = $1', [shopId]).catch(() => {});
+        await queue.close().catch(() => {});
+        await queueRedis.quit().catch(() => {});
         await pool.end().catch(() => {});
     }
 });

@@ -59,6 +59,7 @@ const {
 const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
 const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const { parseJsonPreservingLargeIntegers } = require('./utils/json');
+const { enqueueReschedulableJob } = require('./utils/queue');
 const { consumeWeightedWindow } = require('./utils/weighted-rate-limit');
 
 const app = express();
@@ -1785,23 +1786,12 @@ async function scheduleDurableDispatch(shopId, eventName) {
     return withTimeout(
         (async () => {
             const jobId = `dispatch-${shopId}-${queueClass}-${timeBucket}`;
-            const job = await capiQueue.add('send-fb-batch', { shopId }, { delay, jobId });
-            const state = await job.getState();
-            // BullMQ retains completed jobs for diagnostics. If a same-second
-            // event reuses an already completed/failed coalescing ID, adding it
-            // alone does not create new work and the event would wait for the
-            // rescue scan. A unique follow-up closes that high-traffic gap.
-            if (state === 'completed' || state === 'failed') {
-                return capiQueue.add(
-                    'send-fb-batch',
-                    { shopId },
-                    {
-                        delay,
-                        jobId: `${jobId}-${crypto.randomUUID()}`,
-                    },
-                );
-            }
-            return job;
+            return enqueueReschedulableJob(
+                capiQueue,
+                'send-fb-batch',
+                { shopId },
+                { delay, jobId },
+            );
         })(),
         1500,
         'BullMQ dispatch',

@@ -62,7 +62,10 @@ jobs:
         run: npm run check
 
       - name: Deployment shell syntax check
-        run: bash -n deploy/install_ubuntu.sh deploy/configure_baota_nginx.sh deploy/update_baota.sh scripts/dotenv.sh scripts/backup.sh scripts/restore.sh scripts/repair-db-ownership.sh
+        run: bash -n deploy/install_ubuntu.sh deploy/configure_baota_nginx.sh deploy/update_baota.sh scripts/dotenv.sh scripts/backup.sh scripts/restore.sh scripts/repair-db-ownership.sh test/deployment-safety.sh
+
+      - name: Deployment failure-safety tests
+        run: bash test/deployment-safety.sh
 
       - name: Verify safe dotenv loading
         run: |

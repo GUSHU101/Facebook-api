@@ -50,6 +50,7 @@ fi
 command -v node >/dev/null 2>&1 || fail "Node.js was not found; install/select Node.js 20+ in Baota"
 command -v npm >/dev/null 2>&1 || fail "npm was not found beside the selected Baota Node.js runtime"
 command -v pg_dump >/dev/null 2>&1 || fail "pg_dump was not found; install/select PostgreSQL before updating"
+command -v pg_restore >/dev/null 2>&1 || fail "pg_restore was not found; install/select PostgreSQL before updating"
 command -v pm2 >/dev/null 2>&1 || fail "PM2 was not found; install PM2 before updating"
 node_major="$(node -p 'Number(process.versions.node.split(`.`)[0])')"
 [ "$node_major" -ge 20 ] || fail "Node.js 20 or newer is required"

@@ -56,6 +56,7 @@ const {
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
 const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
+const { enqueueReschedulableJob } = require('../src/utils/queue');
 const { consumeWeightedWindow } = require('../src/utils/weighted-rate-limit');
 const {
     boundedScalarValues,
@@ -737,6 +738,67 @@ test('route retry backoff is exponential and capped', () => {
     assert.equal(retryDelaySeconds(20, 5, 900), 900);
 });
 
+test('coalesced queue jobs reuse live work but replace terminal or missing jobs', async () => {
+    const liveCalls = [];
+    const liveQueue = {
+        async add(name, data, options) {
+            liveCalls.push({ name, data, options });
+            return { id: options.jobId, getState: async () => 'delayed' };
+        },
+    };
+    const liveJob = await enqueueReschedulableJob(
+        liveQueue,
+        'send-fb-batch',
+        { shopId: 7 },
+        { delay: 1000, jobId: 'retry-7-100' },
+        () => 'unused',
+    );
+    assert.equal(liveCalls.length, 1);
+    assert.equal(liveJob.id, 'retry-7-100');
+
+    const terminalCalls = [];
+    const terminalQueue = {
+        async add(name, data, options) {
+            terminalCalls.push({ name, data, options });
+            return {
+                id: options.jobId,
+                getState: async () => terminalCalls.length === 1 ? 'completed' : 'waiting',
+            };
+        },
+    };
+    const replacement = await enqueueReschedulableJob(
+        terminalQueue,
+        'send-fb-batch',
+        { shopId: 7 },
+        { delay: 1000, jobId: 'retry-7-100' },
+        () => 'replacement',
+    );
+    assert.equal(terminalCalls.length, 2);
+    assert.equal(terminalCalls[1].options.jobId, 'retry-7-100-replacement');
+    assert.equal(replacement.id, 'retry-7-100-replacement');
+
+    const missingCalls = [];
+    const missingQueue = {
+        async add(name, data, options) {
+            missingCalls.push({ name, data, options });
+            return {
+                id: options.jobId,
+                getState: async () => missingCalls.length === 1 ? 'unknown' : 'waiting',
+            };
+        },
+    };
+    const raceReplacement = await enqueueReschedulableJob(
+        missingQueue,
+        'send-fb-batch',
+        { shopId: 8 },
+        { jobId: 'dispatch-8-normal-100' },
+        () => 'race-replacement',
+    );
+    assert.equal(missingCalls.length, 2);
+    assert.equal(missingCalls[1].options.jobId, 'dispatch-8-normal-100-race-replacement');
+    assert.equal(raceReplacement.id, 'dispatch-8-normal-100-race-replacement');
+});
+
 test('platform retry control honors Retry-After and adds bounded jitter', () => {
     assert.equal(parseRetryAfterSeconds('120', 0), 120);
     assert.equal(parseRetryAfterSeconds('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120);
@@ -988,6 +1050,7 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     const schema = fs.readFileSync(path.join(__dirname, '..', 'init.sql'), 'utf8');
     const scaleIndexes = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'scale-indexes.sql'), 'utf8');
     const workerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'worker.js'), 'utf8');
+    const queueSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'utils', 'queue.js'), 'utf8');
     assert.match(schema, /CREATE TABLE IF NOT EXISTS shop_pixel_routes/);
     assert.match(schema, /reporting_timezone VARCHAR\(64\) NOT NULL DEFAULT 'UTC'/);
     assert.match(schema, /shopify_api_version VARCHAR\(20\)/);
@@ -1116,8 +1179,10 @@ test('schema defines multistore routing and per-route idempotency boundaries', (
     assert.match(serverSource, /SET status = CASE WHEN \$2::boolean THEN 'PENDING' ELSE status END,[\s\S]*?request_payload = \$4::jsonb/);
     assert.match(serverSource, /GROUP BY e\.shop_id\s+ORDER BY e\.shop_id ASC/);
     assert.match(serverSource, /jobId: `rescue-\$\{shopId\}-\$\{rescueMinute\}`/);
-    assert.match(serverSource, /const state = await job\.getState\(\)/);
-    assert.match(serverSource, /state === 'completed' \|\| state === 'failed'/);
+    assert.match(serverSource, /enqueueReschedulableJob\(/);
+    assert.match(workerSource, /enqueueReschedulableJob\(/);
+    assert.match(queueSource, /const state = await job\.getState\(\)/);
+    assert.match(queueSource, /LIVE_JOB_STATES\.has\(state\)/);
     assert.match(serverSource, /cleanupExpiredOperationalData/);
     assert.match(serverSource, /status IN \('SUCCESS', 'FAILED', 'PARTIAL_FAILED', 'AWAITING_PAYMENT'\)/);
     assert.match(serverSource, /const persisted = await persistOutboxEvent\(shopId,[\s\S]*?isAwaitingPayment/);
@@ -2212,6 +2277,7 @@ test('deployment workflow preserves production secrets and verifies runtime read
         'utf8',
     );
     const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+    const backup = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'backup.sh'), 'utf8');
     const restore = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'restore.sh'), 'utf8');
     const ownershipRepair = fs.readFileSync(
         path.join(__dirname, '..', 'scripts', 'repair-db-ownership.sh'),
@@ -2250,8 +2316,22 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(ci, /scripts\/repair-db-ownership\.sh/);
     assert.match(ci, /deploy\/configure_baota_nginx\.sh/);
     assert.match(ci, /deploy\/update_baota\.sh/);
+    assert.match(backup, /trap cleanup_partial_files EXIT/);
+    assert.match(backup, /pg_dump .*--file="\$DB_TMP"/);
+    assert.match(backup, /pg_restore --list "\$DB_TMP"/);
+    assert.match(backup, /mv -f -- "\$DB_TMP" "\$db_file"/);
     assert.match(restore, /--single-transaction/);
+    assert.ok(
+        restore.indexOf('pg_restore --list "$BACKUP_FILE"') < restore.indexOf('\n  stop_runtime\n'),
+        'restore archives must be validated before runtime is stopped',
+    );
+    assert.match(restore, /for process_name in capi-api capi-worker/);
+    assert.match(restore, /pm2_as_runtime_user stop "\$process_name"/);
+    assert.match(restore, /pm2_as_runtime_user restart capi-api --update-env/);
+    assert.match(restore, /pm2_as_runtime_user restart capi-worker --update-env/);
+    assert.doesNotMatch(restore, /startOrReload/);
     assert.match(restore, /runtime remains stopped and maintenance mode stays enabled/);
+    assert.match(baotaUpdater, /command -v pg_restore .*fail "pg_restore was not found/);
     assert.match(ownershipRepair, /DATABASE_URL must include a user and database name/);
     assert.match(ownershipRepair, /\/www\/server\/nodejs/);
     assert.match(ownershipRepair, /\/usr\/lib\/postgresql/);
