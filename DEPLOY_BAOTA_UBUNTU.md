@@ -3,6 +3,8 @@
 本文只讲一种部署方式：**宝塔面板管理 API，PM2 只管理 Worker，Nginx 对外提供 8443 HTTPS**。
 不要把本文命令和 Ubuntu 一键安装脚本混用，也不要同时用宝塔和 `ecosystem.config.js` 启动 API，否则会争用 3000 端口。
 
+> 已经部署成功，只想更新 GitHub 正式 `main`？请直接看更短的 [宝塔日常更新教程](BAOTA_UPDATE_GUIDE.md)，不需要重新执行整份安装指南。
+
 本文统一使用以下示例；你的值不同才需要替换：
 
 ```text
@@ -103,6 +105,14 @@ git status -sb
 cd /www/wwwroot/Facebook-api-main
 git pull --ff-only origin main
 ```
+
+如果第一次用 root 更新时提示 `fatal: detected dubious ownership in repository`，先执行一次：
+
+```bash
+git config --global --add safe.directory /www/wwwroot/Facebook-api-main
+```
+
+然后重新执行 `git pull`。这条命令只需要做一次；成功时不会显示内容。
 
 如果 `git pull` 提示本地修改冲突，不要使用 `git reset --hard`。先备份 `.env`，并确认修改来自哪里。
 
@@ -414,7 +424,7 @@ https://pixel.atelierwrap.cc:8443/api/webhook/shop/redact
 
 ### B. 更新正式 main 代码
 
-先在宝塔停止 API，然后：
+完整的逐步说明和错误处理见 [宝塔日常更新教程](BAOTA_UPDATE_GUIDE.md)。最简流程是先在宝塔停止 API，然后：
 
 ```bash
 cd /www/wwwroot/Facebook-api-main
@@ -449,6 +459,28 @@ pm2 status
 测试完成后清空每个店铺路由上的 Meta Test Event Code。新版测试码默认 30 分钟自动失效，`npm run doctor` 在生产环境发现仍有效的测试路由时会阻止误发布。
 
 ## 12. 常见错误对照
+
+### `fatal: detected dubious ownership in repository`
+
+Git 不信任当前 root 用户没有拥有的项目目录。只执行一次：
+
+```bash
+git config --global --add safe.directory /www/wwwroot/Facebook-api-main
+```
+
+随后重新执行 `git pull --ff-only origin main`。不要因此修改整个项目的所有者。
+
+### `npm: command not found`
+
+宝塔把 Node/npm 放在自己的版本目录，root 的 `PATH` 中可能没有 npm。这是正常情况。不要执行裸 `npm ci` 或全局重装 npm，直接运行统一更新脚本：
+
+```bash
+sudo bash /www/wwwroot/Facebook-api-main/deploy/update_baota.sh
+```
+
+### npm 提示 `EACCES` 或 `/www/server/nodejs/cache`
+
+旧脚本可能碰到被 root 文件污染的宝塔共享缓存。先拉取最新正式 `main`，再重跑统一更新脚本；最新版会自动使用项目运行用户专用的 npm 缓存。
 
 ### `Cannot find module 'dotenv'`
 

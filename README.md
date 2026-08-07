@@ -16,7 +16,8 @@ npm run build:admin
 先选择一种部署方式，二者不要混用：
 
 - 纯 Ubuntu VPS：[Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md)
-- 宝塔 Node 项目部署：[宝塔完整部署指南](DEPLOY_BAOTA_UBUNTU.md)。宝塔用户更新代码后统一运行
+- 宝塔已经部署、只更新代码：[宝塔日常更新教程](BAOTA_UPDATE_GUIDE.md)（推荐先看，按 4 步操作）
+- 宝塔首次安装或重新配置：[宝塔完整部署指南](DEPLOY_BAOTA_UBUNTU.md)。宝塔用户更新代码后统一运行
   `sudo bash deploy/update_baota.sh`；脚本会先做数据库与 `.env` 快照、按项目所有者管理唯一 Worker，并在失败时保留维护模式。不要再手工寻找 Node/psql、创建 `/tmp` 脚本或用 PM2 重复启动 API。
 - 发布前检查：[GitHub 发布检查清单](GITHUB_RELEASE_CHECKLIST.md)
 
@@ -263,8 +264,7 @@ npm audit --omit=dev --audit-level=moderate
 
 ### 升级已有部署
 
-宝塔部署不要直接执行下面的 `npm ci`，也不要以 root 手工寻找 npm；请按
-[宝塔完整部署指南](DEPLOY_BAOTA_UBUNTU.md)只运行 `sudo bash deploy/update_baota.sh`，
+宝塔部署请直接按 [宝塔日常更新教程](BAOTA_UPDATE_GUIDE.md)操作。不要执行裸 `npm ci`，也不要以 root 手工寻找 npm；拉取正式 `main` 后只运行 `sudo bash deploy/update_baota.sh`，
 脚本会识别宝塔不同版本的 Node 安装目录并使用项目所有者执行安装。
 
 以下命令只适用于 Node/npm 已在当前用户 `PATH` 中的非宝塔部署。停止 API 和 Worker、备份 PostgreSQL并拉取新代码后执行：
@@ -286,7 +286,7 @@ npm run doctor
 ## 使用教程
 
 1. 将项目上传到 GitHub，并确认 CI 通过。
-2. 按 [Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md) 或 [宝塔部署指南](DEPLOY_BAOTA_UBUNTU.md) 部署。
+2. 按 [Ubuntu 一键部署指南](DEPLOY_UBUNTU_ONECLICK.md) 或 [宝塔完整部署指南](DEPLOY_BAOTA_UBUNTU.md) 首次部署；宝塔以后更新只看 [宝塔日常更新教程](BAOTA_UPDATE_GUIDE.md)。
 3. 打开 `https://你的域名:8443/admin`。
 4. 使用 `myshopify.com` 域名和 webhook secret 添加 Shopify 店铺；可选填写 `read_orders` Admin API Token 作为漏投 webhook 的对账兜底。
 5. 添加 Facebook / Meta 路由：

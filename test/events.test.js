@@ -2894,6 +2894,10 @@ test('deployment workflow preserves production secrets and verifies runtime read
         path.join(__dirname, '..', 'deploy', 'update_baota.sh'),
         'utf8',
     );
+    const baotaUpdateGuide = fs.readFileSync(
+        path.join(__dirname, '..', 'BAOTA_UPDATE_GUIDE.md'),
+        'utf8',
+    );
 
     assert.match(installer, /FORCE_ENV_REWRITE="\$\{FORCE_ENV_REWRITE:-0\}"/);
     assert.match(installer, /Preserving existing \.env and database credentials/);
@@ -2964,4 +2968,11 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaUpdater, /maintenance mode remains enabled/);
     assert.match(baotaUpdater, /APP_USER="\$\(stat -c '%U' "\$APP_DIR"\)"/);
     assert.doesNotMatch(baotaUpdater, /pm2 startup systemd -u root --hp \/root/);
+    assert.match(baotaUpdateGuide, /git config --global --add safe\.directory \/www\/wwwroot\/Facebook-api-main/);
+    assert.match(baotaUpdateGuide, /sudo bash deploy\/update_baota\.sh/);
+    assert.match(baotaUpdateGuide, /update completed successfully/);
+    assert.match(baotaUpdateGuide, /不要再运行裸 `npm`/);
+    assert.match(baotaUpdateGuide, /不要删除 `\.maintenance`/);
+    assert.match(baotaUpdateGuide, /127\.0\.0\.1:3000\/readyz/);
+    assert.match(baotaUpdateGuide, /pixel\.atelierwrap\.cc:8443\/healthz/);
 });
