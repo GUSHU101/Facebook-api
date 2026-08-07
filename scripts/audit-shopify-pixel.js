@@ -62,7 +62,7 @@ function audit() {
     assert(source.includes('event.context'), 'Shopify top-frame event context is missing');
     assert(source.includes('event.timestamp'), 'Shopify authoritative event timestamp is missing');
     assert(source.includes('event.id'), 'Shopify authoritative event ID is missing');
-    assert(source.includes('shopify-pixel-v25'), 'current source version is not v25');
+assert(source.includes('shopify-pixel-v26'), 'current source version is not v26');
     assert(source.includes('META_CLICK_ID_MAX_LENGTH = 500'), 'official Meta fbclid length boundary is missing');
     assert(source.includes('getOrCreateFbp'), 'official first-party fbp management is missing');
     assert(source.includes('primeMetaAttributionCookies'), 'landing-page fbp/fbc capture is missing');
@@ -86,9 +86,9 @@ function audit() {
         'all_standard_events compatibility alarm must be subscribed exactly once',
     );
 
-    new vm.Script(source, { filename: 'shopify-customer-events-v25.js' });
+new vm.Script(source, { filename: 'shopify-customer-events-v26.js' });
     return {
-        sourceVersion: 'shopify-pixel-v25',
+    sourceVersion: 'shopify-pixel-v26',
         characters: source.length,
         standardEvents: SHOPIFY_STANDARD_EVENTS.length,
         aggregateCompatibilityAlarm: true,

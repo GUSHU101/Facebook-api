@@ -251,6 +251,7 @@ const SUPPORTED_PIXEL_SOURCE_VERSIONS = new Set([
     'shopify-pixel-v23',
     'shopify-pixel-v24',
     'shopify-pixel-v25',
+    'shopify-pixel-v26',
 ]);
 const SHOPIFY_BROWSER_EVENT_SOURCES = new Map([
     ['ShopifyAlertDisplayed', 'alert_displayed'],
@@ -481,7 +482,7 @@ function validateShopifyBrowserPayload(payload) {
         error.statusCode = 426;
         throw error;
     }
-    if (['shopify-pixel-v23', 'shopify-pixel-v24', 'shopify-pixel-v25'].includes(sourceVersion)) {
+    if (['shopify-pixel-v23', 'shopify-pixel-v24', 'shopify-pixel-v25', 'shopify-pixel-v26'].includes(sourceVersion)) {
         requireBoundedString(payload?.source_event_id, 'source_event_id', 4096);
         const timestamp = new Date(requireBoundedString(payload?.timestamp, 'timestamp', 100));
         const eventMilliseconds = timestamp.getTime();

@@ -2200,7 +2200,7 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
     assert.deepEqual(sentEvents[0].dataset_ids, ['1234567890', '2222222222']);
     assert.equal(sentEvents[0].pixel_id, undefined);
     assert.equal(sentEvents[0].schema_version, '2.0');
-    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v25');
+    assert.equal(sentEvents[0].source_version, 'shopify-pixel-v26');
     assert.equal(generated.includes('batch.filter(function (event, resultIndex)'), false);
     assert.match(generated, /for \(var resultIndex = 0; resultIndex < batch\.length; resultIndex \+= 1\)/);
     assert.equal(sentEvents[0].source_provider, 'shopify_web_pixels');
@@ -2376,7 +2376,7 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
         request.body.code === 'UNSUPPORTED_SHOPIFY_STANDARD_EVENT'
     ));
     assert.ok(compatibilityWarning);
-    assert.equal(compatibilityWarning.body.source_version, 'shopify-pixel-v25');
+    assert.equal(compatibilityWarning.body.source_version, 'shopify-pixel-v26');
     assert.deepEqual(compatibilityWarning.body.event_counts, { future_standard_event: 1 });
 
     requests.length = 0;

@@ -88,7 +88,7 @@ Customer Events 现在只有在 Shopify 隐私对象明确返回 `analyticsProce
 
 ## 部署后必须执行的验证
 
-1. 在每个 Shopify 店铺重新复制后台生成的最新 `shopify-pixel-v25` 代码，并在 Customer Events 界面连接、声明营销/分析/数据共享用途。
+1. 在每个 Shopify 店铺重新复制后台生成的最新 `shopify-pixel-v26` 代码，并在 Customer Events 界面连接、声明营销/分析/数据共享用途。
 2. 运行 `npm run doctor`、`npm run check`、`npm test`。
 3. 在 Shopify Pixel Helper 中分别触发页面、商品、加购、结账各阶段与测试付款，确认 15 个订阅没有运行时错误。
 4. Meta Test Events 只临时配置测试码；生产确认后让测试码过期，避免长期污染正式诊断。
