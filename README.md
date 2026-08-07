@@ -106,6 +106,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - Meta 响应头 `Retry-After`、`X-Business-Use-Case-Usage`、`X-App-Usage`、`X-Ad-Account-Usage` 会形成持久化的凭证冷却。使用率过高时会提前减缓后续发送，收到 429 后会暂停所有共用该凭证的店铺。
 - 店铺采集 Token 是嵌入 Shopify 自定义像素的公开路由凭据，不等同于用户身份认证。默认启用较宽松的店铺/IP 限流（`PIXEL_RATE_LIMIT_PER_MINUTE=600`，按“事件数”和“每 16 KiB 请求体单位数”中的较大值计费）：多 API 实例通过 Redis 共用计数，Redis 故障时自动降级为进程内限流；浏览器会对 `429` 使用稳定事件 ID 重试。只有前置 CDN/WAF 已提供可靠限流时才应显式设为 `0`。
 - Shopify GraphQL 对账会逐页读取订单商品行，最终事件默认保留最多 `COMMERCE_ITEM_LIMIT=1000` 行，而不是旧版固定 200 行；超过明确运维上限时会记录截断诊断。该上限可调到 5000，用于在超大订单保真度与单事件内存/请求体积之间建立可控边界。
+- Shopify Admin GraphQL 的幂等查询会对 HTTP 429/5xx、暂时性网络错误以及 GraphQL `THROTTLED` 做有上限的指数退避，并在配置的等待上限内参考 `Retry-After` 与 GraphQL cost/throttleStatus。Webhook 创建等 mutation 不自动重试，避免请求实际成功但响应丢失时重复写入；下一轮只读审计会安全确认最终状态。可用 `SHOPIFY_GRAPHQL_MAX_ATTEMPTS`、`SHOPIFY_GRAPHQL_RETRY_BASE_MS` 和 `SHOPIFY_GRAPHQL_RETRY_MAX_MS` 调整。
 - Shopify 客户事件代码运行在沙箱中，网络请求的浏览器 Origin 不应被假定为店铺自定义域名。采集与 Pixel 配置接口本身不使用 Cookie 凭据，建议保持 `CORS_ORIGIN=*`；安全边界由店铺采集 Token、服务端店铺查找、批次同租户验证、限流和数据库路由共同提供。管理接口没有启用 CORS。
 - Shopify `orders/paid` 在 HMAC 验证后先持久化到 PostgreSQL 收件箱并立即确认，随后通过租约、指数退避和定时扫描生成 Purchase；外部平台或 Redis 短暂故障不会阻塞 Shopify 的确认窗口。
 - 系统会定时通过 Shopify Admin GraphQL 只读审计 `ORDERS_PAID` 的店铺级订阅，并在后台显示 `HEALTHY`、`MISSING`、`URI_MISMATCH` 或错误状态。管理员可点击“修复 Webhook”只在正确公网 URI 缺失时创建订阅；已有其他 URI 不会被自动删除，避免误改外部系统。
@@ -171,6 +172,9 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    REQUIRE_INGEST_TOKEN=true
    SHOPIFY_WEB_ORDER_SOURCES=web
    SHOPIFY_API_VERSION=2026-07
+   SHOPIFY_GRAPHQL_MAX_ATTEMPTS=3
+   SHOPIFY_GRAPHQL_RETRY_BASE_MS=1000
+   SHOPIFY_GRAPHQL_RETRY_MAX_MS=15000
    SHOPIFY_RECONCILE_CRON="23 */15 * * * *"
    SHOPIFY_WEBHOOK_AUDIT_CRON="41 7 * * * *"
    SHOPIFY_RECONCILE_LOOKBACK_HOURS=144

@@ -65,6 +65,11 @@ const {
     retryDelayWithJitterSeconds,
     shouldIsolateFacebookError,
 } = require('../src/platforms/rate-control');
+const {
+    isRetryableShopifyGraphqlFailure,
+    requestShopifyGraphqlQuery,
+    shopifyGraphqlRetryDelayMs,
+} = require('../src/platforms/shopify');
 const { buildTikTokPayload, tiktokEventName } = require('../src/platforms/tiktok');
 const { missingMatchSignals } = require('../src/utils/emq');
 const { parseJsonPreservingLargeIntegers } = require('../src/utils/json');
@@ -1070,6 +1075,77 @@ test('platform retry control honors Retry-After and adds bounded jitter', () => 
     assert.equal(retryDelayWithJitterSeconds(4, 5, 900, undefined, 86400, 0.5), 40);
 });
 
+test('Shopify GraphQL query retry honors HTTP and cost throttle hints', async () => {
+    const delays = [];
+    const reasons = [];
+    let requests = 0;
+    const response = await requestShopifyGraphqlQuery(async () => {
+        requests += 1;
+        if (requests === 1) {
+            const error = new Error('rate limited');
+            error.response = {
+                status: 429,
+                headers: { 'retry-after': '3' },
+                data: {},
+            };
+            throw error;
+        }
+        if (requests === 2) {
+            return {
+                status: 200,
+                data: {
+                    errors: [{ message: 'Throttled', extensions: { code: 'THROTTLED' } }],
+                    extensions: {
+                        cost: {
+                            requestedQueryCost: 100,
+                            throttleStatus: { currentlyAvailable: 0, restoreRate: 25 },
+                        },
+                    },
+                },
+            };
+        }
+        return { status: 200, data: { data: { orders: { edges: [] } } } };
+    }, {
+        maxAttempts: 3,
+        baseMs: 1000,
+        maxMs: 10000,
+        sleep: async delayMs => delays.push(delayMs),
+        onRetry: item => reasons.push(item.reason),
+    });
+
+    assert.equal(requests, 3);
+    assert.deepEqual(delays, [3000, 4000]);
+    assert.deepEqual(reasons, ['HTTP 429', 'THROTTLED']);
+    assert.equal(response.data.data.orders.edges.length, 0);
+});
+
+test('Shopify GraphQL query retry fails closed for permanent or mixed errors', async () => {
+    assert.equal(isRetryableShopifyGraphqlFailure({
+        data: { errors: [{ message: 'Throttled', extensions: { code: 'THROTTLED' } }] },
+    }), true);
+    assert.equal(isRetryableShopifyGraphqlFailure({ code: 'ENOTFOUND' }), true);
+    assert.equal(isRetryableShopifyGraphqlFailure({
+        data: {
+            errors: [
+                { message: 'Throttled', extensions: { code: 'THROTTLED' } },
+                { message: 'Access denied', extensions: { code: 'ACCESS_DENIED' } },
+            ],
+        },
+    }), false);
+    assert.equal(shopifyGraphqlRetryDelayMs({
+        headers: { 'retry-after': '120' },
+    }, 1, { baseMs: 1000, maxMs: 15000, nowMs: 0 }), 15000);
+
+    let attempts = 0;
+    const permanent = { status: 200, data: { errors: [{ message: 'Access denied' }] } };
+    const result = await requestShopifyGraphqlQuery(async () => {
+        attempts += 1;
+        return permanent;
+    }, { maxAttempts: 3, sleep: async () => assert.fail('permanent errors must not sleep') });
+    assert.equal(attempts, 1);
+    assert.equal(result, permanent);
+});
+
 test('Meta usage headers proactively open a credential cooldown', () => {
     const control = metaRateControlFromHeaders({
         'x-business-use-case-usage': JSON.stringify({
@@ -1629,6 +1705,13 @@ test('runtime config rejects weak encryption keys and malformed CORS origins', (
     assert.notEqual(malformedShopifyVersion.status, 0);
     assert.match(malformedShopifyVersion.stderr, /SHOPIFY_API_VERSION must look like 2026-07/);
 
+    const invertedShopifyRetryWindow = probeConfig({
+        SHOPIFY_GRAPHQL_RETRY_BASE_MS: '20000',
+        SHOPIFY_GRAPHQL_RETRY_MAX_MS: '10000',
+    });
+    assert.notEqual(invertedShopifyRetryWindow.status, 0);
+    assert.match(invertedShopifyRetryWindow.stderr, /SHOPIFY_GRAPHQL_RETRY_MAX_MS must be at least/);
+
     const valid = probeConfig({
         CORS_ORIGIN: 'https://shop.example.com,http://localhost:3000',
         PUBLIC_BASE_URL: 'https://pixel.example.com/',
@@ -1920,6 +2003,13 @@ test('generated Shopify pixel sends Meta browser and CAPI events with identical 
 
     vm.runInNewContext(generated, sandbox);
     assert.equal(typeof privacyCallback, 'function');
+    const completePrivacyStatus = sandbox.customerPrivacyStatus;
+    sandbox.customerPrivacyStatus = {
+        analyticsProcessingAllowed: true,
+        marketingAllowed: true,
+    };
+    assert.equal(sandbox.trackingAllowedByPrivacy(), false);
+    sandbox.customerPrivacyStatus = completePrivacyStatus;
     assert.deepEqual(Object.keys(callbacks).sort(), [
         'alert_displayed',
         'all_standard_events',
@@ -2682,7 +2772,7 @@ test('admin page script parses and handles admin action failures', async () => {
     assert.doesNotMatch(html, /https:\/\/(?:unpkg\.com|cdn\.tailwindcss\.com)/);
     assert.match(html, /Purchase 仅由付款 Webhook\/对账确认后的 CAPI 发送/);
     const localVue = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'vue.global.prod.js'), 'utf8');
-    assert.match(localVue, /vue v3\.5\.40/);
+    assert.match(localVue, /vue v3\.5\.41/);
     assert.match(serverSource, /app\.get\('\/admin\/assets\/vue\.global\.prod\.js'/);
     assert.match(serverSource, /server\.requestTimeout = config\.httpRequestTimeoutMs/);
     assert.match(serverSource, /server\.closeIdleConnections\?\.\(\)/);

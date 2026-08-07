@@ -56,6 +56,7 @@ const {
 } = require('./events/merge');
 const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
 const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
+const { requestShopifyGraphqlQuery } = require('./platforms/shopify');
 const {
     META_DATASET_QUALITY_FALLBACK_FIELDS,
     META_QUALITY_METRIC_TYPE,
@@ -2518,21 +2519,16 @@ async function auditPaidWebhookSubscriptionForShop(shop, options = {}) {
     const token = decryptTokenIfPossible(shop.admin_access_token);
     const url = `https://${shop.shop_domain}/admin/api/${config.shopifyApiVersion}/graphql.json`;
     try {
-        const queryResponse = await axios.post(url, { query: SHOPIFY_PAID_WEBHOOK_SUBSCRIPTIONS_QUERY }, {
-            timeout: config.fbRequestTimeoutMs,
-            headers: {
-                'X-Shopify-Access-Token': token,
-                'Content-Type': 'application/json',
-            },
-        });
-        const servedApiVersion = auditShopifyApiVersion(
-            queryResponse,
+        const queryResponse = await postShopifyGraphqlQuery(
+            url,
+            token,
+            { query: SHOPIFY_PAID_WEBHOOK_SUBSCRIPTIONS_QUERY },
             `ORDERS_PAID webhook audit for ${shop.shop_domain}`,
         );
+        const servedApiVersion = observedShopifyApiVersion(queryResponse) || config.shopifyApiVersion;
         if (Array.isArray(queryResponse.data?.errors) && queryResponse.data.errors.length > 0) {
             throw new Error(`Shopify GraphQL: ${queryResponse.data.errors.map(item => item.message).join('; ')}`);
         }
-        await waitForShopifyGraphqlThrottle(queryResponse.data);
         const subscriptions = queryResponse.data?.data?.webhookSubscriptions?.nodes || [];
         const observedUris = [...new Set(subscriptions.map(item => String(item?.uri || '').trim()).filter(Boolean))];
         const matching = subscriptions.filter(item => String(item?.uri || '').trim() === expectedUri);
@@ -2665,18 +2661,40 @@ function auditShopifyApiVersion(response, context) {
     return observed || config.shopifyApiVersion;
 }
 
-async function shopifyAccessScopes(url, token) {
-    try {
-        const response = await axios.post(url, { query: SHOPIFY_ACCESS_SCOPES_QUERY }, {
+async function postShopifyGraphqlQuery(url, token, body, context) {
+    const response = await requestShopifyGraphqlQuery(
+        () => axios.post(url, body, {
             timeout: config.fbRequestTimeoutMs,
             headers: {
                 'X-Shopify-Access-Token': token,
                 'Content-Type': 'application/json',
             },
-        });
-        auditShopifyApiVersion(response, 'access scopes');
-        if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) return new Set();
+        }),
+        {
+            maxAttempts: config.shopifyGraphqlMaxAttempts,
+            baseMs: config.shopifyGraphqlRetryBaseMs,
+            maxMs: config.shopifyGraphqlRetryMaxMs,
+            onRetry: ({ attempt, delayMs, reason }) => console.warn(
+                `[ShopifyAPI] ${context} retry ${attempt}/${config.shopifyGraphqlMaxAttempts - 1} in ${delayMs}ms: ${reason}`,
+            ),
+        },
+    );
+    auditShopifyApiVersion(response, context);
+    if (!Array.isArray(response.data?.errors) || response.data.errors.length === 0) {
         await waitForShopifyGraphqlThrottle(response.data);
+    }
+    return response;
+}
+
+async function shopifyAccessScopes(url, token) {
+    try {
+        const response = await postShopifyGraphqlQuery(
+            url,
+            token,
+            { query: SHOPIFY_ACCESS_SCOPES_QUERY },
+            'access scopes',
+        );
+        if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) return new Set();
         return new Set(
             (response.data?.data?.currentAppInstallation?.accessScopes || [])
                 .map(scope => String(scope?.handle || '').trim())
@@ -2698,17 +2716,10 @@ async function hydrateAllShopifyLineItems(node, url, token) {
         if (pageCount >= config.shopifyReconcileMaxLineItemPages) {
             throw new Error(`Shopify order ${node.id} exceeds the configured line item pagination safety limit`);
         }
-        const response = await axios.post(url, {
+        const response = await postShopifyGraphqlQuery(url, token, {
             query: SHOPIFY_ORDER_LINE_ITEMS_QUERY,
             variables: { id: node.id, after: pageInfo.endCursor },
-        }, {
-            timeout: config.fbRequestTimeoutMs,
-            headers: {
-                'X-Shopify-Access-Token': token,
-                'Content-Type': 'application/json',
-            },
-        });
-        auditShopifyApiVersion(response, 'line item pagination');
+        }, 'line item pagination');
         if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
             throw new Error(`Shopify GraphQL: ${response.data.errors.map(item => item.message).join('; ')}`);
         }
@@ -2717,7 +2728,6 @@ async function hydrateAllShopifyLineItems(node, url, token) {
         lineItems.push(...(connection.nodes || []));
         pageInfo = connection.pageInfo;
         pageCount += 1;
-        await waitForShopifyGraphqlThrottle(response.data);
     }
     node.lineItems = { nodes: lineItems, pageInfo };
 }
@@ -2810,7 +2820,7 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
     while (true) {
         const first = Math.min(100, config.shopifyReconcileMaxOrders - scanned);
         if (first <= 0) break;
-        const response = await axios.post(url, {
+        const response = await postShopifyGraphqlQuery(url, token, {
             query: SHOPIFY_RECONCILE_QUERY,
             variables: {
                 first,
@@ -2821,17 +2831,8 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
                 // move between pages and invalidate Shopify cursors.
                 query: `updated_at:>'${since}' updated_at:<='${cutoff}' financial_status:paid`,
             },
-        }, {
-            timeout: config.fbRequestTimeoutMs,
-            headers: {
-                'X-Shopify-Access-Token': token,
-                'Content-Type': 'application/json',
-            },
-        });
-        servedApiVersion = auditShopifyApiVersion(
-            response,
-            `paid order reconciliation for ${shop.shop_domain}`,
-        );
+        }, `paid order reconciliation for ${shop.shop_domain}`);
+        servedApiVersion = observedShopifyApiVersion(response) || config.shopifyApiVersion;
         if (Array.isArray(response.data?.errors) && response.data.errors.length > 0) {
             const errorMessage = response.data.errors.map(item => item.message).join('; ');
             // Shopify cursors can become invalid after retention or index
@@ -2852,7 +2853,6 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
             }
             throw new Error(`Shopify GraphQL: ${errorMessage}`);
         }
-        await waitForShopifyGraphqlThrottle(response.data);
         const connection = response.data?.data?.orders;
         if (!connection) throw new Error('Shopify GraphQL response is missing orders');
         for (const edge of connection.edges || []) {

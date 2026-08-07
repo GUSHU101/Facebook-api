@@ -1737,9 +1737,12 @@ function customerPrivacyApi() {
 
 function trackingAllowedByPrivacy() {
     if (!customerPrivacyStatus || typeof customerPrivacyStatus !== 'object') return false;
-    return customerPrivacyStatus.analyticsProcessingAllowed !== false &&
-        customerPrivacyStatus.marketingAllowed !== false &&
-        customerPrivacyStatus.saleOfDataAllowed !== false;
+    // Customer Events is marketing/analytics processing. Treat an incomplete
+    // privacy object as unknown and fail closed until Shopify explicitly grants
+    // every declared processing purpose.
+    return customerPrivacyStatus.analyticsProcessingAllowed === true &&
+        customerPrivacyStatus.marketingAllowed === true &&
+        customerPrivacyStatus.saleOfDataAllowed === true;
 }
 
 async function primeMetaAttributionCookies() {

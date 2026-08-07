@@ -69,6 +69,10 @@ Meta Parameter Builder 可能在 SHA-256、`fbp`、`fbc` 后加入大小写敏�
 
 `checkout_completed` 可能因目标页面未加载而完全不触发，也不能证明异步、延期或线下支付已经成功，因此它只保存浏览器归因候选，不直接发送不可撤回的浏览器 Purchase。最终 Purchase 只由已验签的 `orders/paid` 或 Admin GraphQL 对账确认。浏览器与服务端共享同一个店铺命名空间 Purchase ID；Webhook 重试还按 `X-Shopify-Webhook-Id` 去重。
 
+### 6. 隐私状态与 Shopify Admin API 限流
+
+Customer Events 现在只有在 Shopify 隐私对象明确返回 `analyticsProcessingAllowed=true`、`marketingAllowed=true` 和 `saleOfDataAllowed=true` 时才会启动 Meta Pixel 或发送 CAPI；字段缺失、状态未知或撤回任一用途均按未授权处理并清除未发送队列。Admin GraphQL 的只读查询对 429、5xx、暂时性网络错误和 `THROTTLED` 做有上限重试，并参考 `Retry-After` 与 query cost；Webhook 创建 mutation 保持单次提交，避免响应丢失时重复写入。
+
 ## 当前官方契约检查结果
 
 - Website 事件具备 `action_source=website`、`event_source_url`、`client_user_agent`、`event_time`、`event_id` 和至少一个有效匹配信号。

@@ -186,6 +186,11 @@ if (shutdownTimeoutMs <= httpRequestTimeoutMs) {
 const adminUsername = readRequired('ADMIN_USERNAME');
 const adminPassword = readRequired('ADMIN_PASSWORD');
 const requireIngestToken = readBool('REQUIRE_INGEST_TOKEN', true);
+const shopifyGraphqlRetryBaseMs = readBoundedInt('SHOPIFY_GRAPHQL_RETRY_BASE_MS', 1000, 60000);
+const shopifyGraphqlRetryMaxMs = readBoundedInt('SHOPIFY_GRAPHQL_RETRY_MAX_MS', 15000, 60000);
+if (shopifyGraphqlRetryMaxMs < shopifyGraphqlRetryBaseMs) {
+    throw new Error('SHOPIFY_GRAPHQL_RETRY_MAX_MS must be at least SHOPIFY_GRAPHQL_RETRY_BASE_MS');
+}
 if (production && adminPassword.length < 16) {
     throw new Error('ADMIN_PASSWORD must be at least 16 characters in production');
 }
@@ -213,6 +218,9 @@ module.exports = {
     shopifyWebOrderSources: readCsv('SHOPIFY_WEB_ORDER_SOURCES', 'web'),
     shopifyAppSecret: String(process.env.SHOPIFY_APP_SECRET || '').trim(),
     shopifyApiVersion: readShopifyApiVersion(),
+    shopifyGraphqlMaxAttempts: readBoundedInt('SHOPIFY_GRAPHQL_MAX_ATTEMPTS', 3, 10),
+    shopifyGraphqlRetryBaseMs,
+    shopifyGraphqlRetryMaxMs,
     shopifyReconcileCron: process.env.SHOPIFY_RECONCILE_CRON || '23 */15 * * * *',
     shopifyWebhookAuditCron: process.env.SHOPIFY_WEBHOOK_AUDIT_CRON || '41 7 * * * *',
     // Leave one day inside Meta's seven-day server-event window for durable
