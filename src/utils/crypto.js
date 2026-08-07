@@ -143,8 +143,19 @@ function hashUserData(data, type = 'default', context = {}) {
     return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
+function normalizeMetaHashedValue(value) {
+    const normalized = String(value || '').trim();
+    // Meta's Parameter Builder can append a case-sensitive 8-character
+    // appendix (or the legacy 2-character form) to a normalized SHA-256
+    // value. The complete returned value must be forwarded byte-for-byte;
+    // lowercasing or re-hashing it destroys the match signal.
+    return /^[a-f0-9]{64}(?:\.(?:[A-Za-z0-9]{2}|[A-Za-z0-9]{8}))?$/.test(normalized)
+        ? normalized
+        : undefined;
+}
+
 function isSha256Hash(value) {
-    return /^[a-f0-9]{64}$/.test(String(value || '').trim().toLowerCase());
+    return Boolean(normalizeMetaHashedValue(value));
 }
 
 function boundedScalarValues(value, maximum = 50) {
@@ -165,7 +176,7 @@ function collectHashedUserData(explicitHashes = [], rawValues = [], type = 'defa
     const output = [];
     const seen = new Set();
     const append = value => {
-        const normalized = String(value || '').trim().toLowerCase();
+        const normalized = normalizeMetaHashedValue(value);
         if (normalized && !seen.has(normalized)) {
             seen.add(normalized);
             output.push(normalized);
@@ -176,7 +187,7 @@ function collectHashedUserData(explicitHashes = [], rawValues = [], type = 'defa
         if (isSha256Hash(value)) append(value);
     }
     for (const value of boundedScalarValues(rawValues)) {
-        const normalized = String(value || '').trim().toLowerCase();
+        const normalized = normalizeMetaHashedValue(value);
         if (isSha256Hash(normalized)) append(normalized);
         else append(hashUserData(value, type, context));
     }
@@ -195,5 +206,6 @@ module.exports = {
     collectHashedUserData,
     boundedScalarValues,
     isSha256Hash,
+    normalizeMetaHashedValue,
     normalizeForHash,
 };

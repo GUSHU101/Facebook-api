@@ -210,7 +210,7 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         const commonEvent = {
             shop_domain: shopDomain,
             schema_version: '2.0',
-            source_version: 'shopify-pixel-v21',
+            source_version: 'shopify-pixel-v25',
             source_provider: 'shopify_web_pixels',
             timestamp: new Date().toISOString(),
             url: `https://${shopDomain}/products/integration?utm_source=e2e&email=remove@example.com`,
@@ -227,6 +227,20 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
             }),
         });
         assert.equal(invalidMapping.status, 422, await invalidMapping.text());
+
+        const invalidTimestamp = await fetch(`${apiOrigin}/api/pixel-event`, {
+            method: 'POST',
+            headers: eventHeaders,
+            body: JSON.stringify({
+                ...commonEvent,
+                timestamp: 'not-a-shopify-timestamp',
+                event_name: 'PageView',
+                event_id: `${shopDomain}:invalid-timestamp`,
+                source_event_name: 'page_viewed',
+                source_event_id: `source-invalid-timestamp-${suffix}`,
+            }),
+        });
+        assert.equal(invalidTimestamp.status, 422, await invalidTimestamp.text());
 
         const pageViewId = `${shopDomain}:page-${suffix}`;
         const pageViewPayload = {
@@ -431,6 +445,8 @@ test('storefront ingestion reaches the real worker, Meta transport, ledger, and 
         }, 'paid Purchase SUCCESS ledger', 30_000);
         assert.equal(purchaseLedger.delivery_status, 'SUCCESS');
         assert.equal(purchaseLedger.request_payload._payment_confirmed, true);
+        assert.equal(purchaseLedger.request_payload._source.event_time_source, 'shopify_webhook_triggered_at');
+        assert.equal(purchaseLedger.request_payload._source.event_time_confidence, 'webhook_trigger');
         assert.equal(purchaseLedger.platform_response.accepted_event, true);
 
         const deliveredEvents = metaRequests

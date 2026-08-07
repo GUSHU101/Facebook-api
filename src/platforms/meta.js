@@ -1,8 +1,10 @@
 const net = require('node:net');
 const { FUNNEL_EVENT_NAME_SET } = require('../events/funnel');
+const { normalizeMetaHashedValue } = require('../utils/crypto');
 
 const HASHED_USER_FIELDS = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'];
 const META_COOKIE_PATTERN = /^fb\.\d+\.\d{13}\.[^\s]+$/;
+const META_COOKIE_MAX_LENGTH = 1024;
 const ACTION_SOURCES = new Set([
     'email', 'website', 'app', 'phone_call', 'chat', 'physical_store',
     'system_generated', 'business_messaging', 'other',
@@ -20,20 +22,22 @@ const CUSTOMER_SEGMENTATION_VALUES = new Set([
 ]);
 function normalizeMetaCookie(value) {
     const normalized = String(value || '').trim();
-    return META_COOKIE_PATTERN.test(normalized) ? normalized : undefined;
+    return normalized.length <= META_COOKIE_MAX_LENGTH && META_COOKIE_PATTERN.test(normalized)
+        ? normalized
+        : undefined;
 }
 
 function validHashArray(value) {
     const values = Array.isArray(value) ? value : [value];
-    return values.length > 0 && values.every(item => /^[a-f0-9]{64}$/.test(String(item || '')));
+    return values.length > 0 && values.every(item => Boolean(normalizeMetaHashedValue(item)));
 }
 
 function sanitizeMetaUserData(userData = {}) {
     const output = {};
     for (const field of HASHED_USER_FIELDS) {
         const values = (Array.isArray(userData[field]) ? userData[field] : [userData[field]])
-            .map(value => String(value || '').trim().toLowerCase())
-            .filter(value => /^[a-f0-9]{64}$/.test(value));
+            .map(normalizeMetaHashedValue)
+            .filter(Boolean);
         const unique = [...new Set(values)];
         if (unique.length) output[field] = unique;
     }
@@ -106,7 +110,7 @@ function validateMetaEvent(event, nowSeconds = Math.floor(Date.now() / 1000)) {
         if (!hasMatchSignal) errors.push('user_data requires at least one valid matching signal');
         for (const field of HASHED_USER_FIELDS) {
             if (userData[field] !== undefined && !validHashArray(userData[field])) {
-                errors.push(`user_data.${field} must contain SHA-256 hashes`);
+                errors.push(`user_data.${field} must contain SHA-256 or Meta Parameter Builder values`);
             }
         }
         if (userData.client_ip_address && !net.isIP(String(userData.client_ip_address).trim())) {

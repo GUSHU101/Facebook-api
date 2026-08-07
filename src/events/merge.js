@@ -1,5 +1,6 @@
 const { compactObject, firstPresent, missingCommerceSignals } = require('./common');
 const { calculateEMQ, missingMatchSignals } = require('../utils/emq');
+const { normalizeMetaCookie } = require('../platforms/meta');
 
 function mergeUniqueArrays(left, right) {
     const output = [];
@@ -14,6 +15,23 @@ function mergeUniqueArrays(left, right) {
     return output.length ? output : undefined;
 }
 
+function metaCookieCreationTime(value) {
+    const normalized = normalizeMetaCookie(value);
+    if (!normalized) return undefined;
+    const timestamp = Number(normalized.split('.')[2]);
+    return Number.isSafeInteger(timestamp) ? timestamp : undefined;
+}
+
+function newestMetaCookie(left, right) {
+    const normalizedLeft = normalizeMetaCookie(left);
+    const normalizedRight = normalizeMetaCookie(right);
+    if (!normalizedLeft) return normalizedRight;
+    if (!normalizedRight) return normalizedLeft;
+    const leftTime = metaCookieCreationTime(normalizedLeft);
+    const rightTime = metaCookieCreationTime(normalizedRight);
+    return rightTime >= leftTime ? normalizedRight : normalizedLeft;
+}
+
 function mergeUserData(left = {}, right = {}) {
     const arrayFields = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'];
     const merged = { ...left, ...right };
@@ -24,8 +42,11 @@ function mergeUserData(left = {}, right = {}) {
         ...merged,
         client_ip_address: firstPresent(right.client_ip_address, left.client_ip_address),
         client_user_agent: firstPresent(right.client_user_agent, left.client_user_agent),
-        fbc: firstPresent(right.fbc, left.fbc),
-        fbp: firstPresent(right.fbp, left.fbp),
+        // Meta recommends refreshing fbp/fbc and sending the newest observed
+        // first-party values. The embedded millisecond creation time is more
+        // authoritative than whichever duplicate happened to arrive last.
+        fbc: newestMetaCookie(left.fbc, right.fbc),
+        fbp: newestMetaCookie(left.fbp, right.fbp),
     });
 }
 
@@ -133,4 +154,5 @@ module.exports = {
     mergePlatformData,
     mergeUniqueArrays,
     mergeUserData,
+    newestMetaCookie,
 };

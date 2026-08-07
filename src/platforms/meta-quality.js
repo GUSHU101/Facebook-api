@@ -1,14 +1,20 @@
 const META_QUALITY_METRIC_TYPE = 'EVENT_MATCH_QUALITY';
 const META_DATASET_QUALITY_FIELDS = [
     'event_name',
-    // Diagnostics are not part of every default Graph object projection.
-    // Request them explicitly while retaining the default score and match-key
-    // fields documented for AdsPixelCAPIEMQ.
-    'event_match_quality{composite_score,match_key_feedback,diagnostics}',
+    'event_match_quality{composite_score,match_key_feedback{identifier,potential_aly_acr_increase{percentage,description}},diagnostics}',
+    'event_coverage{percentage,goal_percentage,description,potential_aly_acr_increase{percentage,description}}',
+    // Meta's current executable Dataset Quality example uses "dedupe", not
+    // the non-existent "dedup" spelling that produces Graph error #100.
+    'dedupe_key_feedback{dedupe_key,browser_events_with_dedupe_key{percentage,description},server_events_with_dedupe_key{percentage,description},overall_browser_coverage_from_dedupe_key{percentage,description}}',
+    'data_freshness{upload_frequency,description}',
+    'acr{description,percentage}',
+    'event_potential_aly_acr_increase{description,percentage}',
+].join(',');
+
+const META_DATASET_QUALITY_FALLBACK_FIELDS = [
+    'event_name',
+    'event_match_quality',
     'event_coverage',
-    'dedup_key_feedback',
-    'data_freshness',
-    'acr',
 ].join(',');
 
 function firstPresent(...values) {
@@ -56,15 +62,15 @@ function officialQualityDetails(value) {
             ? matchQuality.diagnostics
             : undefined,
         event_coverage: value?.event_coverage,
-        // Meta's Dataset Quality guide has used both spellings in examples.
-        // The current field selector is dedup_key_feedback, but accepting the
-        // response alias keeps historical snapshots and API variants visible.
-        dedup_key_feedback: firstPresent(
-            value?.dedup_key_feedback,
+        // Preserve compatibility with historical snapshots while exposing
+        // the current official spelling in normalized output.
+        dedupe_key_feedback: firstPresent(
             value?.dedupe_key_feedback,
+            value?.dedup_key_feedback,
         ),
         data_freshness: value?.data_freshness,
         acr: value?.acr,
+        event_potential_aly_acr_increase: value?.event_potential_aly_acr_increase,
     };
 }
 
@@ -133,19 +139,28 @@ function summarizeMetaQuality(rawPayload) {
     };
 }
 
-function buildMetaQualityRequestParams(datasetId, agentName = '') {
+function buildMetaQualityRequestParams(datasetId, agentName = '', fields = META_DATASET_QUALITY_FIELDS) {
     const normalizedAgent = String(agentName || '').trim().toLowerCase();
     return compactObject({
         dataset_id: String(datasetId),
-        fields: `web{${META_DATASET_QUALITY_FIELDS}}`,
+        fields: `web{${fields}}`,
         agent_name: normalizedAgent || undefined,
     });
 }
 
+function isMetaQualityFieldProjectionError(error) {
+    const graphError = error?.response?.data?.error || error?.error || error;
+    const message = String(graphError?.message || '');
+    return Number(graphError?.code) === 100
+        && /nonexisting field|unknown field|cannot query field|tried accessing/i.test(message);
+}
+
 module.exports = {
     META_DATASET_QUALITY_FIELDS,
+    META_DATASET_QUALITY_FALLBACK_FIELDS,
     META_QUALITY_METRIC_TYPE,
     buildMetaQualityRequestParams,
     extractOfficialEmqEvents,
+    isMetaQualityFieldProjectionError,
     summarizeMetaQuality,
 };

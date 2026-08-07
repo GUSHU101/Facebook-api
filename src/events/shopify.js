@@ -29,17 +29,22 @@ function readOrderAttribute(order, names) {
     return found?.value;
 }
 
-function buildFbcFromUrl(sourceUrl, timestampMs = Date.now()) {
+function buildFbcFromUrl(sourceUrl, timestampMs) {
     try {
         const parsed = new URL(sourceUrl);
         const fbclid = parsed.searchParams.get('fbclid');
-        if (!fbclid) return undefined;
+        // Meta ClickIDs are case-sensitive. Preserve the exact query value and
+        // use the same 500-character safety boundary as Meta's official client
+        // Parameter Builder.
+        if (!fbclid || fbclid.length > 500 || /\s/.test(fbclid)) return undefined;
         let creationTime = Number(timestampMs);
         if (Number.isFinite(creationTime) && creationTime > 0 && creationTime < 10_000_000_000) {
             creationTime *= 1000;
         }
         creationTime = Math.trunc(creationTime);
-        if (!/^\d{13}$/.test(String(creationTime))) creationTime = Date.now();
+        // Never rewrite a recovered historical click as if it were first seen
+        // during the reconciliation scan.
+        if (!/^\d{13}$/.test(String(creationTime))) return undefined;
         return `fb.1.${creationTime}.${fbclid}`;
     } catch (error) {
         return undefined;
@@ -72,7 +77,12 @@ function shopifyCustomerLifecycle(customer = {}) {
     return undefined;
 }
 
-function shopifyPaymentTimestamp(order = {}) {
+function validShopifyTimestamp(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    return Number.isFinite(Date.parse(String(value))) ? value : undefined;
+}
+
+function shopifyPaymentTime(order = {}) {
     const rawTransactions = Array.isArray(order.transactions)
         ? order.transactions
         : (Array.isArray(order.transactions?.nodes) ? order.transactions.nodes : []);
@@ -82,24 +92,57 @@ function shopifyPaymentTimestamp(order = {}) {
             const kind = String(transaction?.kind || '').trim().toUpperCase();
             return status === 'SUCCESS' && ['SALE', 'CAPTURE'].includes(kind);
         })
-        .map(transaction => firstPresent(
-            transaction.processed_at,
-            transaction.processedAt,
-            transaction.created_at,
-            transaction.createdAt,
-        ))
-        .map(value => ({ value, timestamp: Date.parse(String(value || '')) }))
+        .map(transaction => {
+            const processed = validShopifyTimestamp(firstPresent(
+                transaction.processed_at,
+                transaction.processedAt,
+            ));
+            const created = validShopifyTimestamp(firstPresent(
+                transaction.created_at,
+                transaction.createdAt,
+            ));
+            const value = firstPresent(processed, created);
+            return {
+                value,
+                source: processed
+                    ? 'shopify_transaction_processed_at'
+                    : 'shopify_transaction_created_at',
+                confidence: 'payment_transaction',
+                timestamp: Date.parse(String(value || '')),
+            };
+        })
         .filter(item => Number.isFinite(item.timestamp))
         .sort((left, right) => right.timestamp - left.timestamp);
-    return firstPresent(
-        successfulPaymentTimes[0]?.value,
-        order.updated_at,
-        order.updatedAt,
-        order.processed_at,
-        order.processedAt,
-        order.created_at,
-        order.createdAt,
-    );
+    if (successfulPaymentTimes[0]) return successfulPaymentTimes[0];
+
+    // updatedAt is an incremental-sync cursor, not an occurrence timestamp.
+    // Fulfilment, tags, refunds, edits and internal Shopify changes can update
+    // an old paid order. Using it here would rewrite a historical Purchase as
+    // a recent conversion. processedAt/createdAt are stable historical
+    // fallbacks when a gateway transaction timestamp is unavailable.
+    const processed = validShopifyTimestamp(firstPresent(order.processed_at, order.processedAt));
+    if (processed) {
+        return {
+            value: processed,
+            source: 'shopify_order_processed_at',
+            confidence: 'order_time_fallback',
+            timestamp: Date.parse(String(processed)),
+        };
+    }
+    const created = validShopifyTimestamp(firstPresent(order.created_at, order.createdAt));
+    if (created) {
+        return {
+            value: created,
+            source: 'shopify_order_created_at',
+            confidence: 'order_time_fallback',
+            timestamp: Date.parse(String(created)),
+        };
+    }
+    return {};
+}
+
+function shopifyPaymentTimestamp(order = {}) {
+    return shopifyPaymentTime(order).value;
 }
 
 function allocatedDiscount(item) {
@@ -155,8 +198,8 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const address = Object.keys(billingAddress).length ? billingAddress : shippingAddress;
     const contents = buildOrderContents(order);
     const reportedItemQuantity = Number(firstPresent(
-        order.current_subtotal_line_items_quantity,
         order.subtotal_line_items_quantity,
+        order.current_subtotal_line_items_quantity,
     ));
     const sourceUrl = toAbsoluteShopUrl(shopDomain, order.landing_site);
     const checkoutToken = firstPresent(order.checkout_token, order.cart_token, order.token);
@@ -165,10 +208,13 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         order.client_details?.fbp,
     );
     const orderCreatedAtMs = Date.parse(String(firstPresent(order.created_at, order.processed_at, '') || ''));
+    const suppliedEventTimeMs = Date.parse(String(options.eventTimestamp || ''));
     const fbcCreatedAtMs = options.nowMs !== undefined && options.nowMs !== null
         && Number.isFinite(Number(options.nowMs))
         ? Number(options.nowMs)
-        : (Number.isFinite(orderCreatedAtMs) ? orderCreatedAtMs : Date.now());
+        : (Number.isFinite(orderCreatedAtMs)
+            ? orderCreatedAtMs
+            : (Number.isFinite(suppliedEventTimeMs) ? suppliedEventTimeMs : undefined));
     const fbc = firstPresent(
         readOrderAttribute(order, ['_fbc', 'fbc', 'facebook_click_id']),
         order.client_details?.fbc,
@@ -193,6 +239,15 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
     const clientId = firstPresent(readOrderAttribute(order, ['client_id', 'shopify_client_id']), shopifyY);
     const orderId = normalizeShopifyId(order.id);
     const orderName = firstPresent(order.name, order.order_number, orderId);
+    const suppliedEventTimestamp = validShopifyTimestamp(options.eventTimestamp);
+    const fallbackPaymentTime = shopifyPaymentTime(order);
+    const selectedEventTimestamp = suppliedEventTimestamp || fallbackPaymentTime.value;
+    const eventTimeSource = suppliedEventTimestamp
+        ? firstPresent(options.eventTimestampSource, 'shopify_webhook_triggered_at')
+        : fallbackPaymentTime.source;
+    const eventTimeConfidence = suppliedEventTimestamp
+        ? firstPresent(options.eventTimestampConfidence, 'webhook_trigger')
+        : fallbackPaymentTime.confidence;
     const stableEventId = tenantScopedIdentifier(shopDomain, firstPresent(
         checkoutToken,
         orderId,
@@ -241,7 +296,10 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         fbc,
         ttp,
         ttclid,
-        value: firstPresent(order.current_total_price, order.total_price),
+        // Purchase represents the paid order before later returns/refunds.
+        // Shopify current_total_price is mutable and remains only a fallback
+        // for legacy payloads that omit the stable order total.
+        value: firstPresent(order.total_price, order.total_received, order.current_total_price),
         currency: firstPresent(order.currency, order.presentment_currency, order.current_total_price_set?.shop_money?.currency_code),
         content_ids: contents.map(item => item.id),
         contents,
@@ -255,7 +313,9 @@ function buildShopifyOrderPurchasePayload(order, shopDomain, options = {}) {
         // For orders/paid, the webhook trigger time is the closest available
         // timestamp to the actual payment transition. Checkout creation time
         // can be hours or days earlier for deferred/manual payment flows.
-        timestamp: firstPresent(options.eventTimestamp, order.processed_at, order.updated_at, order.created_at),
+        timestamp: selectedEventTimestamp,
+        event_time_source: eventTimeSource,
+        event_time_confidence: eventTimeConfidence,
     };
 }
 
@@ -268,6 +328,7 @@ module.exports = {
     paidOrderIgnoreReason,
     readOrderAttribute,
     shopifyCustomerLifecycle,
+    shopifyPaymentTime,
     shopifyPaymentTimestamp,
     toAbsoluteShopUrl,
 };

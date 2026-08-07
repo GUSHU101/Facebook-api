@@ -24,6 +24,7 @@ const {
     encryptToken,
     decryptTokenIfPossible,
     hashUserData,
+    normalizeMetaHashedValue,
     timingSafeCompare,
     timingSafeStringCompare,
 } = require('./utils/crypto');
@@ -42,7 +43,7 @@ const {
 const {
     buildShopifyOrderPurchasePayload,
     paidOrderIgnoreReason,
-    shopifyPaymentTimestamp,
+    shopifyPaymentTime,
 } = require('./events/shopify');
 const { FUNNEL_EVENT_NAMES, decorateFunnelSummary } = require('./events/funnel');
 const {
@@ -51,16 +52,15 @@ const {
     snapshotForAttributionKey,
 } = require('./events/attribution');
 const {
-    mergeCustomData,
     mergePersistedEventPayload,
-    mergePlatformData,
-    mergeUserData,
 } = require('./events/merge');
 const { classifyFacebookError, metaRateControlFromHeaders } = require('./platforms/rate-control');
 const { normalizeMetaCookie, prepareMetaEvent, validateMetaEvent } = require('./platforms/meta');
 const {
+    META_DATASET_QUALITY_FALLBACK_FIELDS,
     META_QUALITY_METRIC_TYPE,
     buildMetaQualityRequestParams,
+    isMetaQualityFieldProjectionError,
     summarizeMetaQuality,
 } = require('./platforms/meta-quality');
 const { parseJsonPreservingLargeIntegers } = require('./utils/json');
@@ -246,8 +246,13 @@ const SUPPORTED_PIXEL_SOURCE_VERSIONS = new Set([
     'shopify-pixel-v19',
     'shopify-pixel-v20',
     'shopify-pixel-v21',
+    'shopify-pixel-v22',
+    'shopify-pixel-v23',
+    'shopify-pixel-v24',
+    'shopify-pixel-v25',
 ]);
 const SHOPIFY_BROWSER_EVENT_SOURCES = new Map([
+    ['ShopifyAlertDisplayed', 'alert_displayed'],
     ['PageView', 'page_viewed'],
     ['Search', 'search_submitted'],
     ['CartView', 'cart_viewed'],
@@ -261,7 +266,9 @@ const SHOPIFY_BROWSER_EVENT_SOURCES = new Map([
     ['CheckoutShippingInfoSubmitted', 'checkout_shipping_info_submitted'],
     ['AddPaymentInfo', 'payment_info_submitted'],
     ['Purchase', 'checkout_completed'],
+    ['ShopifyUiExtensionErrored', 'ui_extension_errored'],
 ]);
+const MAX_SHOPIFY_BROWSER_EVENT_AGE_SECONDS = 6 * 24 * 60 * 60;
 const BROWSER_DIAGNOSTIC_CODES = new Set([
     'QUEUE_OVERFLOW',
     'RETRY_EXHAUSTED',
@@ -271,6 +278,7 @@ const BROWSER_DIAGNOSTIC_CODES = new Set([
     'SERVER_BATCH_REJECTED',
     'SERVER_REQUEST_REJECTED',
     'META_BROWSER_QUEUE_OVERFLOW',
+    'UNSUPPORTED_SHOPIFY_STANDARD_EVENT',
 ]);
 const PIXEL_CONFIG_CACHE_TTL_MS = 5000;
 const MAX_PIXEL_CONFIG_CACHE_ENTRIES = 5000;
@@ -471,6 +479,27 @@ function validateShopifyBrowserPayload(payload) {
         const error = new Error('Unsupported storefront pixel source/schema version');
         error.statusCode = 426;
         throw error;
+    }
+    if (['shopify-pixel-v23', 'shopify-pixel-v24', 'shopify-pixel-v25'].includes(sourceVersion)) {
+        requireBoundedString(payload?.source_event_id, 'source_event_id', 4096);
+        const timestamp = new Date(requireBoundedString(payload?.timestamp, 'timestamp', 100));
+        const eventMilliseconds = timestamp.getTime();
+        const now = Date.now();
+        if (!Number.isFinite(eventMilliseconds)) {
+            const error = new Error('timestamp must be a valid Shopify customer-event timestamp');
+            error.statusCode = 422;
+            throw error;
+        }
+        if (eventMilliseconds > now + (5 * 60 * 1000)) {
+            const error = new Error('timestamp is more than five minutes in the future');
+            error.statusCode = 422;
+            throw error;
+        }
+        if (eventMilliseconds < now - (MAX_SHOPIFY_BROWSER_EVENT_AGE_SECONDS * 1000)) {
+            const error = new Error('timestamp is too old for reliable Meta delivery');
+            error.statusCode = 422;
+            throw error;
+        }
     }
 }
 
@@ -866,14 +895,22 @@ async function fetchMetaQualityForPixel(pixel) {
     if (!token) throw new Error('Missing Meta quality token');
 
     const url = `https://graph.facebook.com/${config.fbApiVersion}/dataset_quality`;
-    const response = await axios.get(url, {
+    const request = fields => axios.get(url, {
         timeout: config.fbRequestTimeoutMs,
         headers: {
             Authorization: `Bearer ${token}`,
         },
-        params: buildMetaQualityRequestParams(pixel.pixel_id, config.metaQualityAgentName),
+        params: buildMetaQualityRequestParams(pixel.pixel_id, config.metaQualityAgentName, fields),
     });
-    return response;
+    try {
+        return await request();
+    } catch (error) {
+        if (!isMetaQualityFieldProjectionError(error)) throw error;
+        // Dataset Quality projections vary across Graph schema rollouts. A
+        // missing optional diagnostic must not hide every available EMQ and
+        // coverage metric, so retry once with the conservative projection.
+        return request(META_DATASET_QUALITY_FALLBACK_FIELDS);
+    }
 }
 
 async function sharedCredentialCooldownSeconds(credentialScope) {
@@ -1044,12 +1081,16 @@ function buildUserData(req, payload, options = {}) {
     const state = firstPresent(payload.state, payload.province, payload.province_code, payload.customer_state);
     const zip = firstPresent(payload.zip, payload.postal_code, payload.postalCode, payload.customer_zip);
     const country = firstPresent(payload.country, payload.country_code, payload.customer_country);
+    const suppliedExternalIdHash = firstPresent(
+        normalizeMetaHashedValue(firstScalar(payload.external_id_hash)),
+        normalizeMetaHashedValue(firstScalar(payload.external_id_sha256)),
+        normalizeMetaHashedValue(firstScalar(payload.external_id)),
+    );
     const externalId = primaryExternalId(payload);
     const tenantId = normalizeShopDomain(firstPresent(payload.tenant_id, payload.shop_domain));
-    const scopedExternalId = tenantScopedExternalId(
-        tenantId,
-        firstPresent(externalId, firstScalar(payload.external_id_hash)),
-    );
+    const scopedExternalId = suppliedExternalIdHash
+        ? undefined
+        : tenantScopedExternalId(tenantId, externalId);
 
     const hashed = {
         em: collectHashedUserData(
@@ -1073,7 +1114,9 @@ function buildUserData(req, payload, options = {}) {
             [payload.country_hashed, country],
             'country',
         ),
-        external_id: scopedExternalId ? [scopedExternalId] : undefined,
+        external_id: suppliedExternalIdHash
+            ? [suppliedExternalIdHash]
+            : (scopedExternalId ? [scopedExternalId] : undefined),
     };
 
     return compactObject({
@@ -1138,24 +1181,12 @@ function buildPlatformData(payload) {
 }
 
 function mergeQueuedEvent(left, right) {
-    const mergedUserData = mergeUserData(left.user_data, right.user_data);
-    const merged = {
-        ...left,
-        ...right,
-        event_time: Math.min(Number(left.event_time || right.event_time), Number(right.event_time || left.event_time)),
-        event_source_url: firstPresent(right.event_source_url, left.event_source_url),
-        user_data: mergedUserData,
-        custom_data: mergeCustomData(left.custom_data, right.custom_data),
-        _platform_data: mergePlatformData(left._platform_data, right._platform_data),
-        _duplicate_candidate: Boolean(left._duplicate_candidate || right._duplicate_candidate),
-        _attribution_enriched: Boolean(left._attribution_enriched || right._attribution_enriched),
-        _received_at: Math.min(Number(left._received_at || right._received_at), Number(right._received_at || left._received_at)),
-    };
-    merged._emq_estimate = Math.max(Number(left._emq_estimate || 0), Number(right._emq_estimate || 0), calculateEMQ(mergedUserData));
-    merged._quality = {
-        missing_match_signals: missingMatchSignals(mergedUserData),
-        missing_event_parameters: missingCommerceSignals(merged.event_name, merged.custom_data),
-    };
+    const merged = mergePersistedEventPayload(left, right);
+    merged._emq_estimate = Math.max(
+        Number(left._emq_estimate || 0),
+        Number(right._emq_estimate || 0),
+        calculateEMQ(merged.user_data || {}),
+    );
     return compactObject(merged);
 }
 
@@ -1782,6 +1813,8 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
         _quality: {
             missing_match_signals: missingMatchSignals(userData),
             missing_event_parameters: missingCommerceSignals(eventName, customData),
+            event_time_source: enrichedPayload.event_time_source,
+            event_time_confidence: enrichedPayload.event_time_confidence,
             commerce_items_truncated: (Array.isArray(enrichedPayload.contents)
                 && enrichedPayload.contents.length > config.commerceItemLimit)
                 || (Array.isArray(enrichedPayload.content_ids)
@@ -1796,6 +1829,8 @@ async function queueEventForOutbox(req, payload, shopId, options = {}) {
             source_version: enrichedPayload.source_version,
             api_version: enrichedPayload.source_api_version,
             customer_lifecycle: enrichedPayload.customer_lifecycle,
+            event_time_source: enrichedPayload.event_time_source,
+            event_time_confidence: enrichedPayload.event_time_confidence,
             // Private, shop-scoped audit key. This never leaves the service,
             // but lets the dashboard reconcile each paid Shopify order to its
             // durable Purchase and Meta delivery without comparing display
@@ -2158,6 +2193,7 @@ app.post('/api/pixel-config', asyncHandler(async (req, res) => {
 
 async function processShopifyWebhookInboxRow(row) {
     const order = row.payload || {};
+    const isReconciled = row.webhook_id?.startsWith('reconcile:');
     const ignoreReason = paidOrderIgnoreReason(order, config.shopifyWebOrderSources);
     if (ignoreReason) {
         return { ignored: true, reason: ignoreReason };
@@ -2181,8 +2217,31 @@ async function processShopifyWebhookInboxRow(row) {
         error.statusCode = 422;
         throw error;
     }
+    const fallbackPaymentTime = shopifyPaymentTime(order);
+    const webhookUpdatedAt = !isReconciled && !row.triggered_at
+        && Number.isFinite(Date.parse(String(order.updated_at || '')))
+        ? order.updated_at
+        : undefined;
+    const eventTimestamp = row.triggered_at || webhookUpdatedAt || fallbackPaymentTime.value;
+    const eventTimestampSource = row.triggered_at
+        ? (isReconciled
+            ? firstPresent(order._payment_timestamp_source, fallbackPaymentTime.source)
+            : 'shopify_webhook_triggered_at')
+        : (webhookUpdatedAt ? 'shopify_order_updated_at_webhook_fallback' : fallbackPaymentTime.source);
+    const eventTimestampConfidence = row.triggered_at
+        ? (isReconciled
+            ? firstPresent(order._payment_timestamp_confidence, fallbackPaymentTime.confidence)
+            : 'webhook_trigger')
+        : (webhookUpdatedAt ? 'webhook_payload_fallback' : fallbackPaymentTime.confidence);
+    if (!eventTimestamp) {
+        const error = new Error('Missing a trustworthy paid-order event timestamp');
+        error.statusCode = 422;
+        throw error;
+    }
     const payload = buildShopifyOrderPurchasePayload(order, row.shop_domain, {
-        eventTimestamp: row.triggered_at || undefined,
+        eventTimestamp,
+        eventTimestampSource,
+        eventTimestampConfidence,
     });
     const purchaseValue = Number(payload.value);
     if (!Number.isFinite(purchaseValue) || purchaseValue < 0 || !/^[A-Z]{3}$/.test(String(payload.currency || '').toUpperCase())) {
@@ -2195,7 +2254,7 @@ async function processShopifyWebhookInboxRow(row) {
         ...payload,
         shop_domain: row.shop_domain,
         tenant_id: row.shop_domain,
-        source_provider: row.webhook_id?.startsWith('reconcile:')
+        source_provider: isReconciled
             ? 'shopify_admin_graphql'
             : 'shopify_webhook',
         source_event_name: row.topic,
@@ -2320,8 +2379,10 @@ const SHOPIFY_RECONCILE_QUERY = `
                 node {
                     id legacyResourceId name createdAt processedAt updatedAt sourceName test
                     email phone cartToken checkoutToken clientIp
-                    currentSubtotalLineItemsQuantity
+                    subtotalLineItemsQuantity currentSubtotalLineItemsQuantity
                     displayFinancialStatus
+                    totalPriceSet { shopMoney { amount currencyCode } }
+                    totalReceivedSet { shopMoney { amount currencyCode } }
                     currentTotalPriceSet { shopMoney { amount currencyCode } }
                     transactions(first: 100) {
                         id kind status createdAt processedAt test
@@ -2661,10 +2722,12 @@ async function hydrateAllShopifyLineItems(node, url, token) {
     node.lineItems = { nodes: lineItems, pageInfo };
 }
 
-function reconciledGraphqlOrder(node) {
+function reconciledGraphqlOrder(node, paymentTime = shopifyPaymentTime(node)) {
     const customerOrderIndex = Number(node.customerJourneySummary?.customerOrderIndex);
     return {
         _reconciled: true,
+        _payment_timestamp_source: paymentTime.source,
+        _payment_timestamp_confidence: paymentTime.confidence,
         id: node.legacyResourceId || node.id,
         admin_graphql_api_id: node.id,
         name: node.name,
@@ -2673,10 +2736,19 @@ function reconciledGraphqlOrder(node) {
         updated_at: node.updatedAt,
         source_name: node.sourceName,
         test: node.test,
+        subtotal_line_items_quantity: node.subtotalLineItemsQuantity,
         current_subtotal_line_items_quantity: node.currentSubtotalLineItemsQuantity,
         financial_status: String(node.displayFinancialStatus || '').toLowerCase(),
+        total_price: firstPresent(
+            node.totalPriceSet?.shopMoney?.amount,
+            node.totalReceivedSet?.shopMoney?.amount,
+        ),
         current_total_price: node.currentTotalPriceSet?.shopMoney?.amount,
-        currency: node.currentTotalPriceSet?.shopMoney?.currencyCode,
+        currency: firstPresent(
+            node.totalPriceSet?.shopMoney?.currencyCode,
+            node.totalReceivedSet?.shopMoney?.currencyCode,
+            node.currentTotalPriceSet?.shopMoney?.currencyCode,
+        ),
         email: node.email,
         phone: node.phone,
         checkout_token: node.checkoutToken,
@@ -2731,11 +2803,12 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
     const accessScopes = await shopifyAccessScopes(url, token);
     const includeCustomer = accessScopes.has('read_customers');
     let after = state.rows[0].after_cursor || null;
+    let scanned = 0;
     let received = 0;
     let cursorRestarted = false;
     let servedApiVersion = config.shopifyApiVersion;
     while (true) {
-        const first = Math.min(100, config.shopifyReconcileMaxOrders - received);
+        const first = Math.min(100, config.shopifyReconcileMaxOrders - scanned);
         if (first <= 0) break;
         const response = await axios.post(url, {
             query: SHOPIFY_RECONCILE_QUERY,
@@ -2783,14 +2856,29 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
         const connection = response.data?.data?.orders;
         if (!connection) throw new Error('Shopify GraphQL response is missing orders');
         for (const edge of connection.edges || []) {
+            scanned += 1;
             const node = edge.node;
             if (!node?.id || String(node.displayFinancialStatus).toUpperCase() !== 'PAID') continue;
+            const paymentTime = shopifyPaymentTime(node);
+            // The updated_at query is only a reconciliation cursor. An old
+            // paid order can be edited today, but that must not make its old
+            // Purchase look recent or enter the Meta retry window. Deferred
+            // orders paid recently remain eligible because the transaction
+            // timestamp, rather than order creation time, is authoritative.
+            const paymentTimestamp = Number(paymentTime.timestamp);
+            const paymentWindowStart = scanCutoff.getTime()
+                - (config.shopifyReconcileLookbackHours * 60 * 60 * 1000);
+            if (!Number.isFinite(paymentTimestamp)
+                || paymentTimestamp < paymentWindowStart
+                || paymentTimestamp > scanCutoff.getTime() + (5 * 60 * 1000)) {
+                continue;
+            }
             await hydrateAllShopifyLineItems(node, url, token);
-            const payload = reconciledGraphqlOrder(node);
+            const payload = reconciledGraphqlOrder(node, paymentTime);
             const identity = crypto.createHash('sha256')
                 .update(`${node.id}\0${node.processedAt || node.createdAt || ''}`)
                 .digest('hex');
-            await db.query(
+            const insertResult = await db.query(
                 `INSERT INTO shopify_webhook_inbox
                     (shop_id, webhook_id, topic, shopify_api_version, triggered_at, payload)
                  VALUES ($1, $2, 'orders/paid', $3, $4, $5::jsonb)
@@ -2799,11 +2887,11 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
                     shop.id,
                     `reconcile:${identity}`,
                     servedApiVersion,
-                    shopifyPaymentTimestamp(node) || scanCutoff,
+                    paymentTime.value,
                     JSON.stringify(payload),
                 ],
             );
-            received += 1;
+            received += insertResult.rowCount;
         }
         after = connection.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
         if (after) {
@@ -2820,7 +2908,7 @@ async function reconcilePaidOrdersForShop(shop, db = pool) {
                 [shop.id, since, scanCutoff, after],
             );
         }
-        if (!after || received >= config.shopifyReconcileMaxOrders) break;
+        if (!after || scanned >= config.shopifyReconcileMaxOrders) break;
     }
 
     if (!after) await db.query(
@@ -4238,6 +4326,12 @@ app.get('/api/admin/logs', asyncHandler(async (req, res) => {
                e.request_payload->'_source' AS source,
                e.request_payload->'custom_data' AS custom_data,
                e.fb_response, e.timestamp,
+               e.timestamp AS collected_at,
+               CASE
+                   WHEN COALESCE(e.request_payload->>'event_time', '') ~ '^\\d+$'
+                       THEN to_timestamp((e.request_payload->>'event_time')::double precision)
+                   ELSE e.timestamp AT TIME ZONE 'UTC'
+               END AS occurred_at,
                COALESCE(d.deliveries, '[]'::jsonb) AS route_deliveries
         FROM event_store e
         JOIN shops s ON e.shop_id = s.id

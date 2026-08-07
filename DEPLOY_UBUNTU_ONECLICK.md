@@ -151,7 +151,7 @@ sudo env \
 
 ## 6. 重复执行和升级安全
 
-升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v16` 代码重新复制到每个 Shopify 店铺。v16 会自动同时运行浏览器 Meta Pixel 与本项目 CAPI、复用相同 eventID，并监听 Shopify 客户隐私授权变化；加购、发起结账、添加支付信息按 Shopify 单次 `event.id` 统计，Purchase 按 checkout/order 去重，同时保留 SDK 有界重试、浏览器队列上限和每 60 秒活动路由同步。服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。以后日常新增、停用或重新分配 Pixel 不需要仅为路由列表重贴代码。连接前请停用相同 Dataset 的主题 Meta 代码、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，避免重复事件源。
+升级脚本完成后，进入管理后台，把当前生成的 `shopify-pixel-v25` 代码重新复制到每个 Shopify 店铺。v25 覆盖 Shopify 当前 15 个标准 Customer Events，并对结账提示/扩展错误事件做脱敏；它会让加购、发起结账和添加支付信息在浏览器 Meta Pixel 与本项目 CAPI 之间复用同一个 Shopify `event.id`。Purchase 浏览器数据只作为等待付款的归因候选，不再在 `checkout_completed` 时直接发送，必须由 `orders/paid` Webhook 或 Admin API 对账确认后才能通过 CAPI 投递。代码同时验证原始事件 ID/时间戳、监听 Shopify 客户隐私授权变化，通过 `all_standard_events` 对未来新增事件发出脱敏兼容性告警，并按 Meta 官方规则尽早捕获、续期和刷新 `_fbp/_fbc`；SDK 有界重试、浏览器队列上限和每 60 秒活动路由同步仍然保留。服务器升级不会自动修改 Shopify 后台已有的自定义像素代码。以后日常新增、停用或重新分配 Pixel 不需要仅为路由列表重贴代码。连接前请停用相同 Dataset 的主题 Meta 代码、GTM Meta 标签或 Shopify Facebook & Instagram 数据共享，避免重复或提前的 Purchase 事件源。
 
 安装器可以重复运行。只要 `${APP_DIR}/.env` 已存在且 `FORCE_ENV_REWRITE` 不是 `1`，脚本会：
 

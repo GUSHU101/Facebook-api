@@ -49,7 +49,7 @@
                     <div>
                         <div class="eyebrow">Installation · Web Pixel</div>
                         <h2 class="page-title">像素接入与部署</h2>
-                        <p class="page-description">为指定 Shopify 店铺生成 Meta 浏览器 Pixel + 服务端 CAPI 双通道代码。两条链路共用事件名与 eventID，浏览器端会定期同步当前 Meta 路由，服务端路由仍是唯一可信投递边界。</p>
+                        <p class="page-description">为指定 Shopify 店铺生成 Meta 浏览器 Pixel + 服务端 CAPI 代码。漏斗前置事件双通道复用 eventID；Purchase 只走付款确认后的 CAPI，浏览器端会定期同步当前 Meta 路由。</p>
                     </div>
                     <div class="status-chip"><span class="live-dot"></span>稳定事件 ID · 持久队列</div>
                 </div>
@@ -89,7 +89,7 @@
                 <div class="toolbar flex flex-wrap items-center justify-between gap-3">
                     <div>
                         <div class="surface-title">Shopify Customer Events 代码</div>
-                        <div class="surface-copy">复制到 Shopify 自定义像素；浏览器 Pixel 立即发送，服务端 Purchase 仍由已验证的 orders/paid Webhook 确认。</div>
+                        <div class="surface-copy">复制到 Shopify 自定义像素；漏斗前置事件同时发送浏览器 Pixel 与 CAPI，Purchase 只在已验证的 orders/paid Webhook 确认付款后由服务端发送。</div>
                     </div>
                     <div class="flex flex-wrap items-center gap-3">
                         <button @click="copyCode" class="primary-btn px-4 py-2">复制跟踪代码</button>
@@ -97,7 +97,7 @@
                     </div>
                 </div>
                 <div class="border border-amber-300 bg-amber-50 text-amber-900 rounded-md p-3 text-sm">
-                    生成代码已经同时发送 Meta 浏览器 Pixel 与本项目 CAPI，并自动复用同一 eventID。不要再为相同 Dataset 启用 Shopify Facebook &amp; Instagram、GTM、主题 Meta Pixel 或另一套 CAPI；外部来源无法复用本项目 eventID 时会造成重复计数。
+                    生成代码会为漏斗前置事件同时发送 Meta 浏览器 Pixel 与本项目 CAPI，并自动复用同一 eventID；Purchase 仅由付款 Webhook/对账确认后的 CAPI 发送。不要再为相同 Dataset 启用 Shopify Facebook &amp; Instagram、GTM、主题 Meta Pixel 或另一套 CAPI，否则 Purchase 可能被提前或重复计数。
                 </div>
                 <textarea readonly :value="generatedCode" aria-label="Shopify 跟踪代码" class="code-editor w-full h-[620px] p-5 font-mono text-xs leading-5"></textarea>
             </section>
@@ -152,7 +152,7 @@
                                     <div class="mt-1 text-xs text-slate-500">{{ s.paid_webhook_last_checked_at ? formatTime(s.paid_webhook_last_checked_at) : '等待审计' }}</div>
                                 </td>
                                 <td>
-                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v21' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
+                                    <span :class="['status-pill', s.pixel_source_version === 'shopify-pixel-v25' ? 'ready' : 'pending']">{{ s.pixel_source_version || '未收到像素事件' }}</span>
                                     <div class="mt-1 text-xs text-slate-500">客户端自报：{{ s.pixel_last_seen_at ? formatTime(s.pixel_last_seen_at) : '新版首个事件进入后显示' }} · 自报丢失诊断 {{ s.pixel_diagnostic_count || 0 }}</div>
                                 </td>
                                 <td>{{ formatTime(s.created_at) }}</td>
@@ -634,10 +634,11 @@
 
                 <div class="table-shell"><div class="table-scroll">
                     <table class="data-table text-xs">
-                        <thead class="text-left"><tr><th>时间</th><th>店铺</th><th>事件</th><th>Shopify 来源</th><th>金额</th><th>EMQ</th><th>质量缺口</th><th>状态</th><th>平台响应</th></tr></thead>
+                        <thead class="text-left"><tr><th>发生时间</th><th>收集时间</th><th>店铺</th><th>事件</th><th>Shopify 来源</th><th>金额</th><th>EMQ</th><th>质量缺口</th><th>状态</th><th>平台响应</th></tr></thead>
                         <tbody>
                             <tr v-for="log in logs" :key="log.id">
-                                <td>{{ formatTime(log.timestamp) }}</td>
+                                <td>{{ formatTime(log.occurred_at || log.timestamp) }}<br><span class="font-mono text-slate-500">{{ log.source?.event_time_source || '未标注来源' }}</span></td>
+                                <td>{{ formatTime(log.collected_at || log.timestamp) }}</td>
                                 <td class="font-mono">{{ log.shop_domain }}</td>
                                 <td><b>{{ log.event_name }}</b><br><span class="font-mono text-slate-500">{{ log.event_id }}</span></td>
                                 <td><span class="font-mono">{{ log.source?.event_name || log.source?.provider || '—' }}</span><br><span class="font-mono text-slate-500">{{ log.source?.event_id || '—' }}</span></td>
@@ -647,7 +648,7 @@
                                 <td class="font-semibold" :class="statusClass(log.status)">{{ log.status }}</td>
                                 <td class="font-mono text-slate-500 whitespace-normal break-words max-w-md" :title="summarizeResponse(log.route_deliveries, log.fb_response)">{{ summarizeResponse(log.route_deliveries, log.fb_response) }}</td>
                             </tr>
-                            <tr v-if="!logs.length"><td colspan="9" class="table-empty">当前筛选范围内暂无事件记录。</td></tr>
+                            <tr v-if="!logs.length"><td colspan="10" class="table-empty">当前筛选范围内暂无事件记录。</td></tr>
                         </tbody>
                     </table>
                 </div></div>
@@ -735,15 +736,25 @@ const SHOP_INGEST_TOKEN = "${this.currentShopIngestToken}";
 var META_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentMetaPixelIds)};
 const TIKTOK_ROUTE_PIXEL_IDS = ${JSON.stringify(this.currentTikTokPixelIds)};
 const SCHEMA_VERSION = "2.0";
-const SOURCE_VERSION = "shopify-pixel-v21";
+const SOURCE_VERSION = "shopify-pixel-v25";
+const SUPPORTED_SHOPIFY_STANDARD_EVENTS = new Set([
+    'alert_displayed', 'cart_viewed', 'checkout_address_info_submitted',
+    'checkout_completed', 'checkout_contact_info_submitted',
+    'checkout_shipping_info_submitted', 'checkout_started',
+    'collection_viewed', 'page_viewed', 'payment_info_submitted',
+    'product_added_to_cart', 'product_removed_from_cart', 'product_viewed',
+    'search_submitted', 'ui_extension_errored',
+]);
 const META_PIXEL_SCRIPT_URL = "https://connect.facebook.net/en_US/fbevents.js";
 const META_STANDARD_BROWSER_EVENTS = new Set([
     'PageView', 'ViewContent', 'Search', 'AddToCart',
-    'InitiateCheckout', 'AddPaymentInfo', 'Purchase',
+    'InitiateCheckout', 'AddPaymentInfo',
 ]);
 const META_PIXEL_MAX_LOAD_ATTEMPTS = 3;
 const META_PIXEL_RETRY_BACKOFF_MS = [1000, 5000, 30000];
 const META_PIXEL_MAX_QUEUE_SIZE = 500;
+const META_CLICK_ID_MAX_LENGTH = 500;
+const META_COOKIE_MAX_LENGTH = 1024;
 const META_ROUTE_CONFIG_WAIT_MS = 500;
 const META_ROUTE_CONFIG_TTL_MS = 60 * 1000;
 const META_ROUTE_CONFIG_STORAGE_KEY = 'capi_meta_route_config_v1:' + SHOP_DOMAIN;
@@ -751,6 +762,7 @@ const META_PIXEL_LOW_PRIORITY_EVENTS = new Set([
     'PageView', 'Search', 'CartView', 'CollectionView',
     'RemoveFromCart', 'CheckoutContactInfoSubmitted',
     'CheckoutAddressInfoSubmitted', 'CheckoutShippingInfoSubmitted',
+    'ShopifyAlertDisplayed', 'ShopifyUiExtensionErrored',
 ]);
 const RECENT_EVENT_TTL_MS = 5000;
 const MAX_RECENT_EVENTS = 5000;
@@ -769,6 +781,7 @@ const CLIENT_DIAGNOSTIC_CODES = new Set([
     'STORAGE_READ_FAILED', 'STORAGE_WRITE_FAILED',
     'SERVER_BATCH_REJECTED', 'SERVER_REQUEST_REJECTED',
     'META_BROWSER_QUEUE_OVERFLOW',
+    'UNSUPPORTED_SHOPIFY_STANDARD_EVENT',
 ]);
 const MAX_STORED_EVENTS = 1000;
 const recentEvents = new Map();
@@ -792,6 +805,7 @@ var metaBrowserSdkLoadAttempts = 0;
 var metaBrowserSdkRetryAt = 0;
 var metaRouteConfigPromise = null;
 var metaRouteConfigPending = false;
+var inMemoryMetaBrowserId;
 var customerPrivacyStatus = initialCustomerPrivacyStatus();
 
 function normalizedMetaPixelIds() {
@@ -1310,6 +1324,31 @@ function lineItemToContent(item) {
     };
 }
 
+function productVariantToContent(variant) {
+    variant = variant || {};
+    var product = variant.product || {};
+    var id = normalizeShopifyId(variant.id || product.id);
+    return {
+        id: id,
+        quantity: 1,
+        item_price: moneyAmount(variant.price),
+    };
+}
+
+function totalItemQuantity(items, fallback) {
+    var suppliedTotal = Number(fallback);
+    if (Number.isFinite(suppliedTotal) && suppliedTotal > 0) return suppliedTotal;
+    return (Array.isArray(items) ? items : []).reduce(function (sum, item) {
+        var quantity = Number(item && item.quantity);
+        return sum + (Number.isFinite(quantity) && quantity > 0 ? quantity : 0);
+    }, 0);
+}
+
+function boundedDiagnosticLabel(value, fallback) {
+    var text = String(value || '').trim();
+    return (text || fallback || '').slice(0, 100) || undefined;
+}
+
 function compact(object) {
     var output = {};
     Object.keys(object).forEach(function (key) {
@@ -1494,15 +1533,48 @@ function checkoutStageEventId(checkout, event, eventName) {
 function shopifySourceEventName(metaEventName, event) {
     if (event && event.name) return String(event.name);
     return {
+        ShopifyAlertDisplayed: 'alert_displayed',
+        CartView: 'cart_viewed',
+        CollectionView: 'collection_viewed',
+        ViewContent: 'product_viewed',
         AddToCart: 'product_added_to_cart',
+        RemoveFromCart: 'product_removed_from_cart',
         InitiateCheckout: 'checkout_started',
+        CheckoutContactInfoSubmitted: 'checkout_contact_info_submitted',
+        CheckoutAddressInfoSubmitted: 'checkout_address_info_submitted',
+        CheckoutShippingInfoSubmitted: 'checkout_shipping_info_submitted',
         AddPaymentInfo: 'payment_info_submitted',
         Purchase: 'checkout_completed',
+        Search: 'search_submitted',
+        PageView: 'page_viewed',
+        ShopifyUiExtensionErrored: 'ui_extension_errored',
     }[metaEventName];
 }
 
 function checkoutLineItems(checkout) {
     return Array.isArray(checkout && checkout.lineItems) ? checkout.lineItems : [];
+}
+
+function checkoutContents(checkout) {
+    var contents = [];
+    checkoutLineItems(checkout).forEach(function (lineItem) {
+        var components = [];
+        if (Array.isArray(lineItem && lineItem.lineComponents)) components = lineItem.lineComponents;
+        var componentContents = components.map(lineItemToContent).filter(function (item) {
+            return item.id;
+        });
+        // CheckoutLineItem.lineComponents is Shopify's authoritative catalog
+        // breakdown for bundles. Prefer those component variants when they
+        // are available, but retain the bundle variant as a safe fallback if
+        // a runtime redacts or omits component catalog identities.
+        if (componentContents.length) {
+            Array.prototype.push.apply(contents, componentContents);
+            return;
+        }
+        var lineContent = lineItemToContent(lineItem);
+        if (lineContent.id) contents.push(lineContent);
+    });
+    return contents;
 }
 
 function checkoutValue(checkout) {
@@ -1515,22 +1587,72 @@ function checkoutCurrency(checkout) {
     return moneyCurrency(firstNonEmpty(checkout.totalPrice, checkout.subtotalPrice), checkout.currencyCode);
 }
 
-async function getFbp() {
-    // _fbp identifies a browser that the Meta Pixel has actually observed.
-    // Forward the real first-party cookie when present; inventing one would
-    // create a synthetic match signal and can reduce attribution accuracy.
-    return getCookieValue('_fbp');
+function validMetaCookie(value) {
+    var text = String(value || '').trim();
+    if (text.length <= META_COOKIE_MAX_LENGTH && /^fb\\.\\d+\\.\\d{13}\\.[^\\s]+$/.test(text)) return text;
+    return undefined;
+}
+
+function newMetaBrowserIdPayload() {
+    function randomNineDigitInteger() {
+        try {
+            var cryptoApi = typeof globalThis !== 'undefined' && globalThis.crypto;
+            if (cryptoApi && cryptoApi.getRandomValues) {
+                var values = new Uint32Array(1);
+                cryptoApi.getRandomValues(values);
+                return Math.floor(values[0] / 4294967296 * 999999999);
+            }
+        } catch (error) {}
+        // Meta's official client Parameter Builder uses the same bounded
+        // Math.random fallback when Web Crypto is unavailable.
+        return Math.floor(Math.random() * 999999999);
+    }
+    return String(randomNineDigitInteger()) + String(randomNineDigitInteger());
+}
+
+async function getOrCreateFbp() {
+    if (!trackingAllowedByPrivacy()) return undefined;
+    var existing = validMetaCookie(await getCookieValue('_fbp'));
+    if (!trackingAllowedByPrivacy()) return undefined;
+    if (existing) {
+        inMemoryMetaBrowserId = existing;
+        // Meta's official Parameter Builder refreshes the first-party cookie
+        // lifetime whenever it is observed.
+        await setCookieValue('_fbp', existing, 90);
+        return existing;
+    }
+    if (!inMemoryMetaBrowserId) {
+        inMemoryMetaBrowserId = 'fb.1.' + Date.now() + '.' + newMetaBrowserIdPayload();
+    }
+    await setCookieValue('_fbp', inMemoryMetaBrowserId, 90);
+    return inMemoryMetaBrowserId;
+}
+
+function existingFbcMatchesClickId(cookieValue, clickId) {
+    var existing = validMetaCookie(cookieValue);
+    if (!existing || !clickId) return false;
+    var payload = existing.split('.').slice(3).join('.');
+    if (payload === clickId) return true;
+    if (payload.indexOf(clickId + '.') !== 0) return false;
+    // The official Parameter Builder can append a two- or eight-character
+    // SDK token after the case-sensitive fbclid.
+    return /^[A-Za-z0-9]{2}(?:[A-Za-z0-9]{6})?$/.test(payload.slice(clickId.length + 1));
 }
 
 async function getOrCreateFbc(href) {
-    var fbclid = String(getUrlParam('fbclid', href) || '').trim();
-    if (!fbclid || fbclid.length > 1024 || /\\s/.test(fbclid)) fbclid = undefined;
-    var existing = await getCookieValue('_fbc');
-    if (fbclid && (!existing || !existing.endsWith('.' + fbclid))) {
+    if (!trackingAllowedByPrivacy()) return undefined;
+    // fbclid is case-sensitive and must be preserved exactly as received.
+    var fbclidValue = getUrlParam('fbclid', href);
+    var fbclid = fbclidValue === undefined || fbclidValue === null ? undefined : String(fbclidValue);
+    if (!fbclid || fbclid.length > META_CLICK_ID_MAX_LENGTH || /\\s/.test(fbclid)) fbclid = undefined;
+    var existing = validMetaCookie(await getCookieValue('_fbc'));
+    if (!trackingAllowedByPrivacy()) return undefined;
+    if (fbclid && !existingFbcMatchesClickId(existing, fbclid)) {
         var generated = 'fb.1.' + Date.now() + '.' + fbclid;
-        await setCookieValue('_fbc', generated);
+        await setCookieValue('_fbc', generated, 90);
         return generated;
     }
+    if (existing) await setCookieValue('_fbc', existing, 90);
     return existing;
 }
 
@@ -1614,9 +1736,22 @@ function customerPrivacyApi() {
 }
 
 function trackingAllowedByPrivacy() {
-    if (!customerPrivacyStatus) return true;
-    return customerPrivacyStatus.marketingAllowed !== false &&
+    if (!customerPrivacyStatus || typeof customerPrivacyStatus !== 'object') return false;
+    return customerPrivacyStatus.analyticsProcessingAllowed !== false &&
+        customerPrivacyStatus.marketingAllowed !== false &&
         customerPrivacyStatus.saleOfDataAllowed !== false;
+}
+
+async function primeMetaAttributionCookies() {
+    if (!trackingAllowedByPrivacy()) return;
+    var context = getInitContext();
+    var documentInfo = context.document || {};
+    var locationInfo = documentInfo.location || {};
+    var currentUrl = locationInfo.href || documentInfo.URL;
+    await Promise.all([
+        getOrCreateFbp(),
+        getOrCreateFbc(currentUrl),
+    ]);
 }
 
 function clearQueuedTrackingData() {
@@ -1661,6 +1796,7 @@ function subscribeToPrivacyUpdates() {
             }
             if (!metaRouteConfigPromise) startMetaRouteConfigRefresh();
             bootstrapMetaBrowserPixel();
+            void primeMetaAttributionCookies();
         });
         return true;
     } catch (error) {
@@ -2030,8 +2166,8 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     await waitForMetaRouteConfig();
     if (!trackingAllowedByPrivacy()) return;
     var scopedOrderId = await shopScopedIdentifier(firstNonEmpty(customData.order_id, orderId));
-    var fbp = await getFbp();
     var fbc = await getOrCreateFbc(currentUrl);
+    var fbp = await getOrCreateFbp();
     var ttp = await getTtp();
     var ttclid = await rememberTtclid(currentUrl);
     var checkoutToken = checkout.token || checkout.checkoutToken;
@@ -2053,13 +2189,20 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
     } else if (isFirstOrder === false) {
         customerLifecycle = 'existing_customer';
     }
-    var browserCustomData = {
-        ...customData,
-        order_id: scopedOrderId,
-        customer_segmentation: metaCustomerSegmentation(customerLifecycle),
-    };
-    var browserMatching = await metaBrowserAdvancedMatching(customer, address, checkout, event, externalId);
-    sendMetaBrowserEvent(metaEventName, eventId, browserCustomData, browserMatching);
+    // checkout_completed proves that Shopify created the order, but this
+    // service deliberately counts Purchase only after orders/paid confirms
+    // settlement. A browser Purchase cannot be recalled if a deferred/manual
+    // payment later fails, so keep the browser channel for pre-purchase funnel
+    // events and persist Purchase here only as an AWAITING_PAYMENT candidate.
+    if (metaEventName !== 'Purchase') {
+        var browserCustomData = {
+            ...customData,
+            order_id: scopedOrderId,
+            customer_segmentation: metaCustomerSegmentation(customerLifecycle),
+        };
+        var browserMatching = await metaBrowserAdvancedMatching(customer, address, checkout, event, externalId);
+        sendMetaBrowserEvent(metaEventName, eventId, browserCustomData, browserMatching);
+    }
     var hashedFields = await Promise.all([
         sha256Hex(rawEmail, 'email'),
         sha256Hex(rawPhone, 'phone', rawCountry),
@@ -2091,6 +2234,8 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
         action_source: 'website',
         customer_lifecycle: customerLifecycle,
         timestamp: event.timestamp,
+        event_time_source: 'shopify_customer_event_timestamp',
+        event_time_confidence: 'shopify_customer_event',
         url: currentUrl,
         event_source_url: currentUrl,
         referrer: documentInfo.referrer || fallbackDocumentInfo.referrer,
@@ -2132,10 +2277,22 @@ async function sendDualChannelEvent(metaEventName, event, customData, forcedEven
 subscribeToPrivacyUpdates();
 startMetaRouteConfigRefresh();
 scheduleMetaRouteConfigRefresh();
+void primeMetaAttributionCookies();
 void flushClientDiagnostics();
 
 analytics.subscribe('page_viewed', function (event) {
     return sendDualChannelEvent('PageView', event);
+});
+
+analytics.subscribe('alert_displayed', function (event) {
+    var alert = event.data && event.data.alert || {};
+    return sendDualChannelEvent('ShopifyAlertDisplayed', event, {
+        // Deliberately exclude alert.message and alert.value: they can contain
+        // customer-entered checkout data. Type and field target are sufficient
+        // for aggregate diagnostics in Meta Events Manager.
+        content_category: boundedDiagnosticLabel(alert.type, 'CHECKOUT_ALERT'),
+        content_name: boundedDiagnosticLabel(alert.target, 'checkout'),
+    });
 });
 
 analytics.subscribe('cart_viewed', function (event) {
@@ -2148,13 +2305,17 @@ analytics.subscribe('cart_viewed', function (event) {
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lines, cart.totalQuantity),
     });
 });
 
 analytics.subscribe('collection_viewed', function (event) {
     var collection = event.data && event.data.collection || {};
+    var contents = (collection.productVariants || []).map(productVariantToContent).filter(function (item) { return item.id; });
     return sendDualChannelEvent('CollectionView', event, {
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
         content_category: collection.title,
         content_name: collection.title,
     });
@@ -2206,86 +2367,120 @@ analytics.subscribe('product_removed_from_cart', function (event) {
 
 analytics.subscribe('checkout_started', function (event) {
     var checkout = event.data && event.data.checkout || {};
-    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    var lineItems = checkoutLineItems(checkout);
+    var contents = checkoutContents(checkout);
     return sendDualChannelEvent('InitiateCheckout', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lineItems),
     }, checkoutStageEventId(checkout, event, 'InitiateCheckout'));
 });
 
 analytics.subscribe('checkout_contact_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
-    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    var lineItems = checkoutLineItems(checkout);
+    var contents = checkoutContents(checkout);
     return sendDualChannelEvent('CheckoutContactInfoSubmitted', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lineItems),
     }, checkoutStageEventId(checkout, event, 'CheckoutContactInfoSubmitted'));
 });
 
 analytics.subscribe('checkout_address_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
-    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    var lineItems = checkoutLineItems(checkout);
+    var contents = checkoutContents(checkout);
     return sendDualChannelEvent('CheckoutAddressInfoSubmitted', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lineItems),
     }, checkoutStageEventId(checkout, event, 'CheckoutAddressInfoSubmitted'));
 });
 
 analytics.subscribe('checkout_shipping_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
-    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    var lineItems = checkoutLineItems(checkout);
+    var contents = checkoutContents(checkout);
     return sendDualChannelEvent('CheckoutShippingInfoSubmitted', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lineItems),
     }, checkoutStageEventId(checkout, event, 'CheckoutShippingInfoSubmitted'));
 });
 
 analytics.subscribe('payment_info_submitted', function (event) {
     var checkout = event.data && event.data.checkout || {};
-    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    var lineItems = checkoutLineItems(checkout);
+    var contents = checkoutContents(checkout);
     return sendDualChannelEvent('AddPaymentInfo', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lineItems),
     }, checkoutStageEventId(checkout, event, 'AddPaymentInfo'));
 });
 
 analytics.subscribe('checkout_completed', function (event) {
     var checkout = event.data && event.data.checkout || {};
-    var contents = checkoutLineItems(checkout).map(lineItemToContent).filter(function (item) { return item.id; });
+    var lineItems = checkoutLineItems(checkout);
+    var contents = checkoutContents(checkout);
     return sendDualChannelEvent('Purchase', event, {
         value: checkoutValue(checkout),
         currency: checkoutCurrency(checkout),
         content_ids: contents.map(function (item) { return item.id; }),
         contents: contents,
         content_type: 'product',
-        num_items: contents.reduce(function (sum, item) { return sum + Number(item.quantity || 0); }, 0),
+        num_items: totalItemQuantity(lineItems),
         order_id: firstNonEmpty(checkout.order && checkout.order.name, normalizeShopifyId(checkout.order && checkout.order.id)),
     }, purchaseEventId(checkout, event));
 });
 
 analytics.subscribe('search_submitted', function (event) {
-    var query = event.data && event.data.searchResult && event.data.searchResult.query || event.data && event.data.search && event.data.search.query;
-    return sendDualChannelEvent('Search', event, { search_string: query });
+    var searchResult = event.data && event.data.searchResult || event.data && event.data.search || {};
+    var contents = (searchResult.productVariants || []).map(productVariantToContent).filter(function (item) { return item.id; });
+    return sendDualChannelEvent('Search', event, {
+        search_string: searchResult.query,
+        content_ids: contents.map(function (item) { return item.id; }),
+        contents: contents,
+        content_type: 'product',
+    });
+});
+
+analytics.subscribe('ui_extension_errored', function (event) {
+    var extensionError = event.data && (event.data.error || event.data.alert) || {};
+    var extensionLabel = [extensionError.appName, extensionError.extensionName]
+        .filter(function (value) { return String(value || '').trim(); })
+        .join(':');
+    return sendDualChannelEvent('ShopifyUiExtensionErrored', event, {
+        // Never transmit message or trace. They can expose stack details or
+        // customer data and are unnecessary for conversion diagnostics.
+        content_category: boundedDiagnosticLabel(extensionError.type, 'EXTENSION_ERROR'),
+        content_name: boundedDiagnosticLabel(extensionLabel, extensionError.extensionTarget || 'checkout_extension'),
+    });
+});
+
+// Shopify can add standard events over time. Keep explicit, schema-aware
+// handlers for data sent to Meta, and use the official aggregate subscription
+// only as a privacy-safe compatibility alarm for newly introduced names.
+analytics.subscribe('all_standard_events', function (event) {
+    var sourceName = String(event && event.name || '').trim();
+    if (!sourceName || SUPPORTED_SHOPIFY_STANDARD_EVENTS.has(sourceName)) return;
+    queueClientDiagnostic('UNSUPPORTED_SHOPIFY_STANDARD_EVENT', [{ event_name: sourceName }], 1);
 });
 `);
                 },

@@ -57,12 +57,14 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 
 ### Meta 自定义事件
 
+- `alert_displayed` → `ShopifyAlertDisplayed`（仅发送类型/字段目标，不发送提示原文或输入值）
 - `cart_viewed` → `CartView`
 - `collection_viewed` → `CollectionView`
 - `product_removed_from_cart` → `RemoveFromCart`
 - `checkout_contact_info_submitted` → `CheckoutContactInfoSubmitted`
 - `checkout_address_info_submitted` → `CheckoutAddressInfoSubmitted`
 - `checkout_shipping_info_submitted` → `CheckoutShippingInfoSubmitted`
+- `ui_extension_errored` → `ShopifyUiExtensionErrored`（仅发送扩展标签/错误类型，不发送消息或堆栈）
 
 ### TikTok 事件映射
 
@@ -78,9 +80,10 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 ## 准确性与可靠性说明
 
 - Meta 服务端去重依赖 Shopify Customer Events 和订单 webhook 之间保持一致的 `event_name` 与 `event_id`。
-- 新生成的 `shopify-pixel-v21` 会给所有事件 ID 及浏览器/CAPI `order_id` 加入店铺域名命名空间，并把完全相同的事件 ID 同时交给浏览器 Meta Pixel 与服务端 Meta CAPI。AddToCart、InitiateCheckout 和 AddPaymentInfo 以 Shopify 每次标准事件的 `event.id` 为动作粒度，重复进入同一 checkout 不再被 checkout token 错误吞并；Purchase 仍以 checkout/order 为订单粒度，与 `orders/paid` webhook 稳定合并。多个店铺共用同一个 Meta Dataset 时，即使 Shopify 局部 ID、订单号或顾客 ID 相同，也不会在 Dataset 侧互相去重或混淆。浏览器代码通过店铺采集 Token 获取服务器当前活动 Meta 路由，并每 60 秒刷新一次；新增、停用或重新分配 Pixel 不再要求为了路由列表单独重新粘贴代码。网络异常时使用生成时内嵌列表回退，服务端数据库路由始终是 CAPI 唯一投递权威。管理后台会在复制前移除缩进、注释和多余空行，保留全部逻辑并确保代码低于 Shopify 自定义像素 64,000 字符上限。
-- v21 在首次真实事件上用 Meta Pixel `fbq('init', pixelId, userData)` 发送官方高级匹配字段；浏览器由 Pixel 自行哈希，服务端仍发送规范化后的 SHA-256，双方 `external_id` 使用同一店铺命名空间。新客/老客状态只发送为官方 `custom_data.customer_segmentation` 枚举，不发送未定义的 ServerEvent 根字段。
-- v21 会在真实事件进入网关时更新不含客户信息的运行版本状态（同版本最多每 15 分钟写一次），后台可以确认每个店铺真正运行的像素版本而不额外向每位访客发送心跳。队列容量淘汰、本地存储失败、六天重试窗口到期、重试次数耗尽、服务器永久拒绝和批量请求中的单条拒绝都会写入独立诊断表；成功条目仍按响应顺序确认，不会因同批一条坏数据而重发或误删整批。批量响应不再在循环内声明捕获外层变量的函数，可通过 Shopify Customer Events 的静态检查。
+- 新生成的 `shopify-pixel-v25` 会给所有事件 ID 及浏览器/CAPI `order_id` 加入店铺域名命名空间。AddToCart、InitiateCheckout 和 AddPaymentInfo 使用同一个 Shopify `event.id` 同时发送浏览器 Pixel 与 CAPI；Purchase 只把浏览器数据保存为 `AWAITING_PAYMENT` 候选，待 `orders/paid` 确认后由服务端 CAPI 发送，避免无法撤回的浏览器 Purchase 提前计入未付款、延期付款或失败订单。Purchase 仍以 checkout/order 为订单粒度并使用持久别名稳定合并。多个店铺共用同一个 Meta Dataset 时，即使 Shopify 局部 ID、订单号或顾客 ID 相同，也不会在 Dataset 侧互相去重或混淆。浏览器代码通过店铺采集 Token 获取服务器当前活动 Meta 路由，并每 60 秒刷新一次；新增、停用或重新分配 Pixel 不再要求为了路由列表单独重新粘贴代码。网络异常时使用生成时内嵌列表回退，服务端数据库路由始终是 CAPI 唯一投递权威。v25 还按 Meta 官方 Parameter Builder 规则在落地页尽早捕获、续期并原样保留 `_fbp/_fbc`，仅用真实、大小写不变的 `fbclid` 更新 `_fbc`，并优先合并创建时间更新的 Cookie。管理后台会在复制前移除缩进、注释和多余空行，保留全部逻辑并确保代码低于 Shopify 自定义像素 64,000 字符上限。
+- v25 在首次真实的非 Purchase 浏览器事件上用 Meta Pixel `fbq('init', pixelId, userData)` 发送官方高级匹配字段；浏览器由 Pixel 自行哈希，服务端仍发送规范化后的 SHA-256，双方 `external_id` 使用同一店铺命名空间。服务端也原样接受 Meta Parameter Builder 生成的大小写敏感哈希附录，不再误删或二次哈希。新客/老客状态只发送为官方 `custom_data.customer_segmentation` 枚举，不发送未定义的 ServerEvent 根字段。
+- v25 会在真实事件进入网关时更新不含客户信息的运行版本状态（同版本最多每 15 分钟写一次），后台可以确认每个店铺真正运行的像素版本而不额外向每位访客发送心跳。队列容量淘汰、本地存储失败、六天重试窗口到期、重试次数耗尽、服务器永久拒绝和批量请求中的单条拒绝都会写入独立诊断表；成功条目仍按响应顺序确认，不会因同批一条坏数据而重发或误删整批。批量响应不再在循环内声明捕获外层变量的函数，可通过 Shopify Customer Events 的静态检查。
+- v25 通过 Shopify 官方 `all_standard_events` 聚合订阅监测未来新增事件；已支持的 15 个事件仍由逐项 schema 处理，新出现的事件名只写入脱敏兼容性诊断，不会盲目上传未知字段。Checkout Extensibility 的套装商品会按官方 `lineComponents` 映射真实组件 Variant；普通商品继续使用顶层 Variant。`npm run audit:shopify-pixel` 会验证纯 JavaScript、官方 Browser/Privacy API、事件覆盖、套装映射、语法和 64,000 字符限制。
 - TikTok 服务端投递保留相同的 `event_id`，并使用当前标准事件名 `Purchase`。
 - `Purchase` 使用持久化别名注册表：PostgreSQL 事务锁统一 checkout、order、cart 标识，即使 Redis 重启也不会丢失关联。浏览器和 webhook 数据在投递前会合并到准确的 `(shop_id, event_name, event_id)`；不存在可能与数据库权威状态分叉的只写 Redis 去重副本。
 - 重复事件在行锁事务内合并：邮箱、电话、姓名、地址和 `external_id` 哈希数组取并集并重新计算 EMQ；付款确认数据优先于未确认浏览器副本，晚到的重复请求不能降低已确认金额、订单号或付款时间。
@@ -91,7 +94,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - 多个店铺共用同一个 Meta Dataset 时，Meta 侧的报表、优化和受众本来就是该 Dataset 的汇总视图；本项目隔离店铺身份、事件标识、归因缓存、投递账本和故障状态，但不会把一个外部 Dataset 虚拟拆成多份 Meta 报表。需要完全独立的报表、优化或受众边界时，应为店铺配置不同的 Dataset。
 - 共享 Pixel 的 Access Token/限流组使用持久化 `credential_version` 栅栏。管理员轮换凭证时，旧 Worker 的失败结果不能覆盖新凭证状态；若请求已经被旧 Token 成功接收，稳定的店铺级事件 ID 仍允许安全确认。Token 修复后，系统只重新打开 401/403、10、102、190、200、463、467、803、2500 等凭证/权限类永久失败，并唤醒该 Pixel 当前绑定的全部店铺，不会重放已成功或商品数据本身无效的事件。
 - Meta Test Event Code 按店铺路由保存且仅用于该路由的服务端 CAPI 请求；默认 30 分钟自动失效，避免生产事件长期停留在测试链路。它不会影响共享 Pixel 下的其他店铺，也不能把浏览器 Pixel 调用切换为 CAPI 测试事件。
-- Meta Dataset Quality 拉取与正式 CAPI 投递使用同一个 Token/限流组租约和冷却作用域。请求使用 v26 官方 `fields=web{...}` 契约并显式拉取 `event_match_quality` 的分数、匹配键和官方 diagnostics，同时保存覆盖率、去重反馈、新鲜度和 ACR；即使暂时没有 EMQ 分数，只要存在这些事件级质量指标也不会标记为 `EMPTY`。如 Meta 已同意平台标识，可配置 `META_PARTNER_AGENT` 并用 `META_QUALITY_AGENT_NAME` 筛选该集成产生的质量数据；不能自行编造 partner agent。
+- Meta Dataset Quality 拉取与正式 CAPI 投递使用同一个 Token/限流组租约和冷却作用域。请求严格使用官方可执行示例中的 `dedupe_key_feedback{...}`（注意是 `dedupe`，不是会触发 `#100 Tried accessing nonexisting field (dedup_key_feedback)` 的 `dedup`），并显式拉取 EMQ、覆盖率、新鲜度、ACR 和潜在 ACR 提升；仍兼容解析历史响应中的两种拼写。若 Meta 灰度 schema 暂不提供某个可选投影，会自动用保守字段集重试，不让单个诊断字段导致整份质量快照失败。如 Meta 已同意平台标识，可配置 `META_PARTNER_AGENT` 并用 `META_QUALITY_AGENT_NAME` 筛选该集成产生的质量数据；不能自行编造 partner agent。
 - `event_deliveries` 是每个事件、每条路由的持久投递账本。Worker 首次处理事件时会在事务和店铺级咨询锁内保存 `delivery_route_snapshot`，父事件只有在该快照里的全部路由均有账本且到达终态后才能成功。投递中新增或重新启用的路由只影响尚未建立快照的积压和后续事件，不会让已处理事件的成功判定随配置漂移。唯一键 `(event_store_id, route_id)`、租约、尝试次数、重试时间和终态成功记录，可防止某个店铺或失败像素覆盖其他路由。即使未来应用代码出现缺陷，PostgreSQL 触发器也会拒绝跨店事件与路由组合。
 - 从共享凭证移除店铺时只会停用对应路由，不会删除历史投递证据；重新添加时会重新激活原路由。
 - 后台“归档” Pixel 会在一个事务中停用路由、把未完成投递终结为 `ROUTE_ARCHIVED`、清除不再需要的 Token，并保留凭证、路由和投递审计行。数据库外键也禁止物理删除 Pixel 或路由时级联抹掉历史账本。
@@ -107,7 +110,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - Shopify `orders/paid` 在 HMAC 验证后先持久化到 PostgreSQL 收件箱并立即确认，随后通过租约、指数退避和定时扫描生成 Purchase；外部平台或 Redis 短暂故障不会阻塞 Shopify 的确认窗口。
 - 系统会定时通过 Shopify Admin GraphQL 只读审计 `ORDERS_PAID` 的店铺级订阅，并在后台显示 `HEALTHY`、`MISSING`、`URI_MISMATCH` 或错误状态。管理员可点击“修复 Webhook”只在正确公网 URI 缺失时创建订阅；已有其他 URI 不会被自动删除，避免误改外部系统。
 - webhook 原始 JSON 会以大整数安全模式重新解析，Shopify 64 位订单、商品和变体 ID 不会先被 JavaScript 浮点数改写末位数字。
-- 店铺可选保存具备 `read_orders` 的 Admin API Token。系统按 Shopify 官方 `orders` 查询的 `updated_at`、`financial_status:paid` 过滤器分页对账，并继续分页读取每个订单的全部 line items；同时补充订单邮箱、电话、地址、客户/checkout/cart 标识、客户端 IP、成功交易与客户旅程。在当前 Admin GraphQL 订单结构没有可靠 User-Agent 时，只从该 checkout 的先前浏览器事件恢复真实 UA，绝不伪造；无法恢复的网站事件会进入本地校验诊断。Purchase 时间优先使用最后一笔成功 `SALE/CAPTURE` 的 `processedAt`，再回退订单更新时间/处理时间/创建时间；`updatedAt` 同时用于冻结扫描窗口。失效游标会在同一窗口内安全重扫一次，对账订单仍进入同一收件箱和 Purchase 去重事务。
+- 店铺可选保存具备 `read_orders` 的 Admin API Token。系统按 Shopify 官方 `orders` 查询的 `updated_at`、`financial_status:paid` 过滤器分页对账，并继续分页读取每个订单的全部 line items；同时补充订单邮箱、电话、地址、客户/checkout/cart 标识、客户端 IP、成功交易与客户旅程。在当前 Admin GraphQL 订单结构没有可靠 User-Agent 时，只从该 checkout 的先前浏览器事件恢复真实 UA，绝不伪造；无法恢复的网站事件会进入本地校验诊断。Purchase 时间优先使用最后一笔成功 `SALE/CAPTURE` 的 `processedAt`，无交易时间时只回退到稳定的订单 `processedAt`/`createdAt`；`updatedAt` 仅作为增量扫描游标，不能再把历史订单改写成最近转化。后台事件日志分别显示发生时间、收集时间及时间来源。失效游标会在同一窗口内安全重扫一次，对账订单仍进入同一收件箱和 Purchase 去重事务。
 - 后台已付款订单闭环按 `shop_id + order_identity` 隔离，分别显示符合网站来源、已进入 Purchase 台账、Meta 成功、待处理、永久失败、本地校验异常和未入台账数量；不同店铺碰巧使用相同订单号或标识时不会再被合并统计。
 - 平台回写以内部 `event_store.id` 为准，公开 `event_id` 只承担平台去重；即使不同事件名称偶然复用同一个公开 ID，也不会互相覆盖投递状态。
 - 相同平台访问令牌会映射到同一分布式凭据作用域，共享租约、请求节奏和冷却状态；作用域与冷却同时保存在 PostgreSQL，Redis 或进程重启后也不会让多个店铺/像素立即同时冲击同一平台额度。
@@ -127,16 +130,16 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
 - 重复付款 webhook 只能解锁 `AWAITING_PAYMENT` Purchase，不能复活 `SUCCESS`、`FAILED` 或 `PARTIAL_FAILED`，也不能重发已成功路由。
 - Redis 缓存、生产者和锁命令在网络分区时快速失败，独立 BullMQ Worker 连接继续重连，防止 HTTP 请求堆积在无限 Redis 离线队列后面。
 - 生成的 Shopify 像素会串行化本地存储写入，并在收到确认前保留发送中的批次。页面关闭最多造成使用相同稳定 ID 的安全重试，不会用新事件覆盖尚未确认的旧事件。
-- 离线队列遇到同一事件的后续完整副本时，会保留最早事件时间并合入更新的客户/商品字段；达到浏览器存储上限时优先保留 Purchase、AddPaymentInfo、InitiateCheckout 和 AddToCart，并优先淘汰较旧 PageView，避免流量峰值先挤掉高价值转化。
+- 离线队列遇到同一事件的后续完整副本时，会合入更新的客户/商品字段；未确认事件保留最早发生时间，付款确认副本则权威覆盖 Purchase 时间。达到浏览器存储上限时优先保留 Purchase、AddPaymentInfo、InitiateCheckout 和 AddToCart，并优先淘汰较旧 PageView，避免流量峰值先挤掉高价值转化。
 - 同秒调度任务如果碰到 BullMQ 中仍保留的已完成任务 ID，会自动创建唯一后续任务，避免新入库事件等待下一轮救援扫描。
 - `LEGACY_REDIS_DRAIN_ENABLED=false` 可避免为过时的 Redis 列表队列扫描所有店铺。只有升级仍含旧版 Redis 列表数据的部署时才临时启用。
 - Shopify 像素通过 Web Pixels `browser.cookie` API 保存真实 `_fbp`、`_fbc` 和点击 ID，不依赖 DOM。只有存在真实 `fbclid` 时才创建 `_fbc`；Meta `_fbp` 和 TikTok `_ttp` 只有在真实 Cookie 已存在时才转发，网关不会伪造浏览器标识。
 - 归因缓存按店铺和键类型隔离：浏览器/会话键只保存浏览器与点击信号，客户哈希和 checkout/cart 身份只允许进入交易键；顾客 `external_id` 不会被当作跨设备浏览器键，缓存新旧顺序由服务端时间决定。
 - Shopify `checkout_completed` 通常在感谢页对每次结账触发一次；加购后优惠流程可能更早触发，如果相关页面没有加载也可能缺失。因此必需的 `orders/paid` webhook 同时承担付款权威来源和服务端兜底职责。
 - App 未获得受保护客户数据权限时，Shopify 可能把客户字段返回为 `null`。生成像素能容忍缺失的邮箱、电话、姓名和地址。
-- 在权限允许时，组合 `_fbp`、`_fbc`、浏览器 User-Agent、服务端 IP、Shopify `clientId`、邮箱、电话、姓名和地址，可获得更好的事件匹配质量。显式哈希字段必须是有效的 64 位 SHA-256；无国际前缀的本地电话号码只有在 US/CA 且能可靠补齐国家码时才使用，其他无法确定国家码的号码会被省略而不是制造错误匹配。
+- 在权限允许时，组合 `_fbp`、`_fbc`、浏览器 User-Agent、服务端 IP、Shopify `clientId`、邮箱、电话、姓名和地址，可获得更好的事件匹配质量。显式哈希字段必须是有效的 64 位 SHA-256，或 Meta Parameter Builder 返回的完整“SHA-256 + 大小写敏感 8 字符/旧 2 字符附录”；无国际前缀的本地电话号码只有在 US/CA 且能可靠补齐国家码时才使用，其他无法确定国家码的号码会被省略而不是制造错误匹配。
 - Shopify 明确提供首次订单状态时，会在本系统私有 `_source.customer_lifecycle` 中保留新客/老客诊断信息；该信息不会作为未被官方 ServerEvent 定义的 Meta 根字段发送，未知状态也不会猜测。
-- 本项目生成代码已经包含浏览器 Meta Pixel。相同 Meta Dataset 不应再同时启用 Shopify Facebook & Instagram、GTM、主题 Meta Pixel 或另一套 CAPI，除非外部来源能严格复用本项目的 `event_name` 与 `eventID`。Meta 官方说明 CAPI→CAPI 重复不会依靠 `fbp`/`external_id` 去重；无法统一 ID 时必须停用重复事件源。
+- 本项目生成代码已经包含漏斗前置事件的浏览器 Meta Pixel，Purchase 则仅由付款确认后的 CAPI 发送。相同 Meta Dataset 不应再同时启用 Shopify Facebook & Instagram、GTM、主题 Meta Pixel 或另一套 CAPI；外部来源尤其可能在付款前发送 Purchase，且无法复用本项目的付款权威状态与稳定 ID。Meta CAPI→CAPI 重复不会依靠 `fbp`/`external_id` 去重；无法统一 ID 时必须停用重复事件源。
 - 浏览器拦截、用户同意、平台隐私规则和结账界面限制都可能抑制事件或标识，因此任何实现都无法诚实保证 100% 采集。本项目尽量覆盖官方事件，并使用订单 webhook 为 Purchase 提供服务端兜底。只有你拥有或已获授权的店铺才应共用 Business Tools/Dataset，并且每个店铺仍须独立满足适用的告知、同意和隐私义务。
 
 ## 安装与配置
@@ -217,7 +220,7 @@ curl -fsSL https://raw.githubusercontent.com/GUSHU101/Facebook-api/main/deploy/i
    ADMIN_PASSWORD=replace-with-a-strong-password
    ```
 
-   `AES_SECRET_KEY` 与 `INGEST_TOKEN_SECRET` 均至少需要 32 个字符，生产环境必须使用不同值并分别备份；后台密码必须至少 16 个字符且不能等于用户名。这些规则由运行时直接强制，即使跳过 `npm run doctor` 也会拒绝错误配置启动。`INGEST_TOKEN_PREVIOUS_SECRET` 可在轮换采集密钥时临时兼容已安装的旧像素代码。`CORS_ORIGIN` 接受 `*` 或以英文逗号分隔的准确 HTTP(S) Origin，不能包含路径或末尾斜杠。CORS 只对 `/api/pixel-event` 和 `/api/pixel-config` 开放，管理接口保持同源。Node 直接接收请求、前面没有反向代理时应设置 `TRUST_PROXY_HOPS=0`。
+   `AES_SECRET_KEY` 与 `INGEST_TOKEN_SECRET` 均至少需要 32 个字符，生产环境必须使用不同值并分别备份；后台密码必须至少 16 个字符且不能等于用户名。这些规则由运行时直接强制，即使跳过 `npm run doctor` 也会拒绝错误配置启动。`INGEST_TOKEN_PREVIOUS_SECRET` 可在轮换采集密钥时临时兼容已安装的旧像素代码。`SHOPIFY_RECONCILE_LOOKBACK_HOURS` 最大为 144 小时，给 Meta 的七天事件窗口保留一天用于持久队列、限流冷却和重试；更老的订单必须保留真实历史时间，不能伪造为当天转化。`CORS_ORIGIN` 接受 `*` 或以英文逗号分隔的准确 HTTP(S) Origin，不能包含路径或末尾斜杠。CORS 只对 `/api/pixel-event` 和 `/api/pixel-config` 开放，管理接口保持同源。Node 直接接收请求、前面没有反向代理时应设置 `TRUST_PROXY_HOPS=0`。
 
 4. 运行自检并启动 API 与 Worker：
 
@@ -270,7 +273,7 @@ npm run doctor
 
 水平扩容时逐步增加 `API_INSTANCES` 和 `WORKER_INSTANCES`。PostgreSQL 最大连接数近似为 `(API_INSTANCES + WORKER_INSTANCES) × DB_POOL_MAX`，必须低于数据库可用连接预算。逐店铺租约防止重复排空，共享凭证租约会串行调用同一个外部像素，逐次尝试隔离会拒绝过期结果。
 
-升级后打开管理后台，把最新生成的 Shopify Customer Events 代码（当前 `shopify-pixel-v21`）复制到每个已连接店铺。v21 使用 Shopify `event.id` 统计加购、发起结账和添加支付信息的每次真实动作，加入 Meta 浏览器高级匹配与官方客户分群字段，同时保留 Purchase 的订单级去重并监听 `visitorConsentCollected`；生成器会安全压缩空白和注释，使完整代码保持在 Shopify 64,000 字符限制以内。明确撤回营销或数据销售授权后，会停止浏览器 Pixel/CAPI 并清除未发送队列。普通 Pixel 路由变更会自动同步，但客户事件代码本身的版本升级仍需重新复制；旧代码不会自动改写。连接自定义像素时必须在 Shopify 界面声明营销、分析和数据销售用途，并按店铺所在地区配置客户隐私同意。生成代码包含店铺级采集 Token；默认 `REQUIRE_INGEST_TOKEN=true` 时，仅伪造其他 `shop_domain` 的事件会在路由前被拒绝。
+升级后打开管理后台，把最新生成的 Shopify Customer Events 代码（当前 `shopify-pixel-v25`）复制到每个已连接店铺。v25 覆盖 Shopify 当前 15 个标准 Customer Events；`alert_displayed` 和 `ui_extension_errored` 作为脱敏的 Meta 自定义诊断事件发送，不包含提示原文、客户输入值、错误消息或堆栈。它使用 Shopify `event.id` 统计每次真实动作，加入 Meta 浏览器高级匹配与官方客户分群字段，并停止在 `checkout_completed` 时直接发送无法撤回的浏览器 Purchase；Purchase 候选仍保留完整浏览器归因，只在付款 Webhook/对账确认后由 CAPI 发送。v25 还要求有效的 Shopify 原始事件 ID/时间戳，拒绝把无效时间伪造成收集时刻，通过 `all_standard_events` 对未来新增事件发出脱敏兼容性告警，并使用 Shopify `browser.cookie` 实现 Meta 官方 90 天 `_fbp/_fbc` 管理规则。生成器会安全压缩空白和注释，使完整代码保持在 Shopify 64,000 字符限制以内。明确撤回营销、分析或数据销售授权后，会停止浏览器 Pixel/CAPI 并清除未发送队列。普通 Pixel 路由变更会自动同步，但客户事件代码本身的版本升级仍需重新复制；旧代码不会自动改写。连接自定义像素时必须在 Shopify 界面声明营销、分析和数据销售用途，并按店铺所在地区配置客户隐私同意。生成代码包含店铺级采集 Token；默认 `REQUIRE_INGEST_TOKEN=true` 时，仅伪造其他 `shop_domain` 的事件会在路由前被拒绝。
 
 ## 使用教程
 
