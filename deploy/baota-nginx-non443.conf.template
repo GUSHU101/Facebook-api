@@ -11,7 +11,7 @@
 # Important:
 #   - Do not add "listen 443 ssl;".
 #   - Do not add "listen 443 quic;".
-#   - Open __PUBLIC_PORT__ in your server firewall/security group.
+#   - Open __PUBLIC_PORT__ TCP and UDP in your firewall/security group.
 #   - Node.js keeps using __INTERNAL_PORT__ internally.
 
 server
@@ -38,7 +38,9 @@ server
 server
 {
     listen __PUBLIC_PORT__ ssl;
+    listen __PUBLIC_PORT__ quic;
     http2 on;
+    http3 on;
     server_name __DOMAIN__;
     server_tokens off;
     index index.html index.htm default.htm default.html;
@@ -52,6 +54,13 @@ server
     ssl_prefer_server_ciphers on;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Alt-Svc 'h3=":__PUBLIC_PORT__"; ma=86400' always;
+    quic_retry on;
+    quic_gso on;
+
+    error_page 497 https://$host:__PUBLIC_PORT__$request_uri;
 
     client_max_body_size 2m;
 

@@ -37,7 +37,7 @@ Shopify Customer Events / Shopify Webhook / 管理员
 
 端口规则：
 
-- 公网只开放 `80/tcp` 和 `8443/tcp`。
+- 公网开放 `80/tcp`、`8443/tcp`；使用模板内 HTTP/3 时同时开放 `8443/udp`。
 - Node 保持 `PORT=3000`，不要改成 8443。
 - 不要向公网开放 `3000`、`5432`、`6379`。
 - Nginx 负责证书和 HTTPS，Node 只接收本机 HTTP。
@@ -348,10 +348,11 @@ systemctl status capi-baota-nginx-facebook-api-main.path
 curl -I https://pixel.atelierwrap.cc:8443/healthz
 ```
 
-云服务器安全组和本机防火墙必须开放 TCP 8443：
+云服务器安全组和本机防火墙必须开放 TCP/UDP 8443：
 
 ```bash
 ufw allow 8443/tcp
+ufw allow 8443/udp
 ```
 
 不要开放公网 3000。

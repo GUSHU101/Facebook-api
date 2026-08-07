@@ -2879,6 +2879,10 @@ test('deployment workflow preserves production secrets and verifies runtime read
         path.join(__dirname, '..', 'deploy', 'baota-nginx-non443.conf.template'),
         'utf8',
     );
+    const concreteBaota8443 = fs.readFileSync(
+        path.join(__dirname, '..', 'deploy', 'baota-server-8443.conf'),
+        'utf8',
+    );
     const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
     const backup = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'backup.sh'), 'utf8');
     const restore = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'restore.sh'), 'utf8');
@@ -2914,8 +2918,21 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaTemplate, /proxy_set_header Connection ""/);
     assert.match(baotaTemplate, /proxy_read_timeout 35s/);
     assert.match(baotaTemplate, /listen __PUBLIC_PORT__ ssl;/);
+    assert.match(baotaTemplate, /listen __PUBLIC_PORT__ quic;/);
     assert.match(baotaTemplate, /http2 on;/);
+    assert.match(baotaTemplate, /http3 on;/);
+    assert.match(baotaTemplate, /error_page 497 https:\/\/\$host:__PUBLIC_PORT__\$request_uri;/);
+    assert.doesNotMatch(baotaTemplate, /ssl_early_data on/);
     assert.doesNotMatch(baotaTemplate, /listen __PUBLIC_PORT__ ssl http2;/);
+    assert.match(concreteBaota8443, /listen 8443 ssl;/);
+    assert.match(concreteBaota8443, /listen 8443 quic;/);
+    assert.match(concreteBaota8443, /return 301 https:\/\/\$host:8443\$request_uri;/);
+    assert.match(concreteBaota8443, /error_page 497 https:\/\/\$host:8443\$request_uri;/);
+    assert.match(concreteBaota8443, /proxy_pass http:\/\/127\.0\.0\.1:3000;/);
+    assert.match(concreteBaota8443, /proxy_set_header X-Forwarded-Port 8443;/);
+    assert.doesNotMatch(concreteBaota8443, /listen 443\b/);
+    assert.doesNotMatch(concreteBaota8443, /TLSv1\.1/);
+    assert.doesNotMatch(concreteBaota8443, /ssl_early_data on/);
     assert.match(ci, /npm run build:admin/);
     assert.match(ci, /npm ci --omit=dev --ignore-scripts/);
     assert.match(ci, /scripts\/repair-db-ownership\.sh/);
