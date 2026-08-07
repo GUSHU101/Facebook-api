@@ -28,22 +28,34 @@ esac
 [ -f "${APP_DIR}/.env" ] || fail ".env not found in ${APP_DIR}"
 
 APP_USER="$(stat -c '%U' "$APP_DIR")"
-[ -n "$APP_USER" ] || fail "could not determine the project owner"
-APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
+[ -n "$APP_USER" ] && [ "$APP_USER" != "UNKNOWN" ] \
+  || fail "could not determine a named project owner for ${APP_DIR}"
+APP_HOME="$(getent passwd "$APP_USER" 2>/dev/null | cut -d: -f6 || true)"
 [ -n "$APP_HOME" ] || APP_HOME="$APP_DIR"
 
+log "resolving Baota runtimes for project owner ${APP_USER}"
 if ! command -v node >/dev/null 2>&1; then
-  baota_node_bin="$(find /www/server/nodejs -mindepth 3 -maxdepth 3 -type f -path '*/bin/node' -printf '%h\n' 2>/dev/null \
-    | sort -V \
-    | tail -n 1)"
+  # Baota has used more than one Node directory layout. Search its bounded
+  # server tree and include symlinked runtimes. `|| true` is intentional:
+  # under `set -e -o pipefail`, an absent legacy directory must reach the
+  # explicit error below instead of terminating this script without output.
+  baota_node_bin="$(
+    { find /www/server -maxdepth 6 \( -type f -o -type l \) \
+        -path '*/bin/node' -printf '%h\n' 2>/dev/null || true; } \
+      | sort -uV \
+      | tail -n 1
+  )"
   if [ -n "$baota_node_bin" ] && [ -x "${baota_node_bin}/node" ]; then
     export PATH="${baota_node_bin}:${PATH}"
   fi
 fi
 if ! command -v pg_dump >/dev/null 2>&1; then
-  pg_bin="$(find /www/server/pgsql /usr/lib/postgresql -type f -name pg_dump -printf '%h\n' 2>/dev/null \
-    | sort -V \
-    | tail -n 1)"
+  pg_bin="$(
+    { find /www/server/pgsql /usr/lib/postgresql -type f -name pg_dump \
+        -printf '%h\n' 2>/dev/null || true; } \
+      | sort -uV \
+      | tail -n 1
+  )"
   if [ -n "$pg_bin" ]; then export PATH="${pg_bin}:${PATH}"; fi
 fi
 

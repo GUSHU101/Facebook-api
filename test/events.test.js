@@ -2951,6 +2951,10 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaConfigurator, /kill -HUP "\$nginx_master_pid"/);
     assert.doesNotMatch(baotaConfigurator, /systemctl reload nginx/);
     assert.match(baotaUpdater, /npm ci --omit=dev/);
+    assert.match(baotaUpdater, /resolving Baota runtimes for project owner/);
+    assert.match(baotaUpdater, /find \/www\/server -maxdepth 6/);
+    assert.match(baotaUpdater, /sort -uV/);
+    assert.match(baotaUpdater, /getent passwd .*\|\| true/);
     assert.match(baotaUpdater, /bash scripts\/repair-db-ownership\.sh/);
     assert.match(baotaUpdater, /pm2 start .*src\/worker\.js/);
     assert.match(baotaUpdater, /run_as_app bash scripts\/backup\.sh/);

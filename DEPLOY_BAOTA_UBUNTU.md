@@ -219,7 +219,8 @@ cd /www/wwwroot/Facebook-api-main
 sudo bash deploy/update_baota.sh
 ```
 
-不要在命令前手工添加 Node 或 PostgreSQL 路径。脚本会自动：
+不要再单独执行 `npm ci`，也不要在命令前手工添加 Node 或 PostgreSQL 路径。脚本会先输出
+`[baota-update] resolving Baota runtimes ...`；若工具不存在会返回明确错误，不会静默退出。脚本会自动：
 
 1. 找到宝塔安装的最新 Node.js、npm 与 PostgreSQL 工具。
 2. 按项目目录所有者确定 Node/PM2 运行用户，避免 root 与 `www` 各启动一个 Worker。

@@ -263,7 +263,11 @@ npm audit --omit=dev --audit-level=moderate
 
 ### 升级已有部署
 
-停止 API 和 Worker，备份 PostgreSQL，拉取新代码后执行：
+宝塔部署不要直接执行下面的 `npm ci`，也不要以 root 手工寻找 npm；请按
+[宝塔完整部署指南](DEPLOY_BAOTA_UBUNTU.md)只运行 `sudo bash deploy/update_baota.sh`，
+脚本会识别宝塔不同版本的 Node 安装目录并使用项目所有者执行安装。
+
+以下命令只适用于 Node/npm 已在当前用户 `PATH` 中的非宝塔部署。停止 API 和 Worker、备份 PostgreSQL并拉取新代码后执行：
 
 ```bash
 npm ci --omit=dev
