@@ -30,8 +30,17 @@ esac
 APP_USER="$(stat -c '%U' "$APP_DIR")"
 [ -n "$APP_USER" ] && [ "$APP_USER" != "UNKNOWN" ] \
   || fail "could not determine a named project owner for ${APP_DIR}"
+APP_GROUP="$(stat -c '%G' "$APP_DIR")"
+[ -n "$APP_GROUP" ] && [ "$APP_GROUP" != "UNKNOWN" ] \
+  || fail "could not determine a named project group for ${APP_DIR}"
 APP_HOME="$(getent passwd "$APP_USER" 2>/dev/null | cut -d: -f6 || true)"
 [ -n "$APP_HOME" ] || APP_HOME="$APP_DIR"
+NPM_CACHE_DIR="${NPM_CACHE_DIR:-/www/server/nodejs/cache-${APP_USER}-capi-saas-pro}"
+case "$NPM_CACHE_DIR" in
+  /www/server/nodejs/cache-*) ;;
+  *) fail "NPM_CACHE_DIR must be a dedicated directory below /www/server/nodejs" ;;
+esac
+install -d -m 0750 -o "$APP_USER" -g "$APP_GROUP" "$NPM_CACHE_DIR"
 
 log "resolving Baota runtimes for project owner ${APP_USER}"
 if ! command -v node >/dev/null 2>&1; then
@@ -69,9 +78,11 @@ node_major="$(node -p 'Number(process.versions.node.split(`.`)[0])')"
 
 run_as_app() {
   if [ "$APP_USER" = "root" ]; then
-    env HOME="$APP_HOME" PATH="$PATH" NODE_ENV=production "$@"
+    env HOME="$APP_HOME" PATH="$PATH" NODE_ENV=production \
+      NPM_CONFIG_CACHE="$NPM_CACHE_DIR" "$@"
   else
-    runuser -u "$APP_USER" -- env HOME="$APP_HOME" PATH="$PATH" NODE_ENV=production "$@"
+    runuser -u "$APP_USER" -- env HOME="$APP_HOME" PATH="$PATH" NODE_ENV=production \
+      NPM_CONFIG_CACHE="$NPM_CACHE_DIR" "$@"
   fi
 }
 

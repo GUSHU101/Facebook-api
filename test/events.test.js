@@ -2955,6 +2955,9 @@ test('deployment workflow preserves production secrets and verifies runtime read
     assert.match(baotaUpdater, /find \/www\/server -maxdepth 6/);
     assert.match(baotaUpdater, /sort -uV/);
     assert.match(baotaUpdater, /getent passwd .*\|\| true/);
+    assert.match(baotaUpdater, /NPM_CACHE_DIR=.*\/www\/server\/nodejs\/cache-/);
+    assert.match(baotaUpdater, /NPM_CONFIG_CACHE="\$NPM_CACHE_DIR"/);
+    assert.match(baotaUpdater, /install -d -m 0750 -o "\$APP_USER" -g "\$APP_GROUP"/);
     assert.match(baotaUpdater, /bash scripts\/repair-db-ownership\.sh/);
     assert.match(baotaUpdater, /pm2 start .*src\/worker\.js/);
     assert.match(baotaUpdater, /run_as_app bash scripts\/backup\.sh/);
